@@ -47,6 +47,7 @@ DECODE_KERNELS = {
     "sampled": "flint_decode_resident_sampled_bf16",
     "reference": "flint_decode_resident_reference_bf16",
 }
+VERIFY_ROWS = (2, 3, 4)   # rows of the verification step (the last token plus up to three draft tokens)
 
 
 class FlintPipelineMps:
@@ -77,6 +78,31 @@ class FlintPipelineMps:
             (b["noise"], 0, READ),
             (b["logits"], 0, WRITE),
             (b["trace"], 0, WRITE),
+            (b["packet"], 0, WRITE),
+            (b["workspace"], 0, READ_WRITE),
+            (b["partials"], 0, READ_WRITE),
+            (b["statistics"], 0, READ_WRITE),
+            (b["routing"], 0, READ_WRITE),
+            (b["control"], 0, READ_WRITE),
+            (b["diagnostic"], 0, WRITE),
+        ], (WORKERS, 1, 1), THREADS, label=kernel)
+        return program
+
+    def record_verify(self, rows: int) -> int:
+        """The verification step over ``rows`` consecutive positions (tokens in ``verify_tokens``)."""
+        if rows not in VERIFY_ROWS:
+            raise ValueError(f"verification rows must be one of {VERIFY_ROWS}")
+        b = self.buf
+        program = self.plan.program()
+        kernel = f"flint_decode_verify{rows}_bf16"
+        self.plan.dispatch(kernel, [
+            (b["weights"], 0, READ),
+            (b["layers"], 0, READ),
+            (b["kv"], 0, READ_WRITE),
+            (b["params"], 0, READ),
+            (b["verify_tokens"], 0, READ),
+            (b["verify_logits"], 0, WRITE),
+            (b["verify_side"], 0, READ_WRITE),
             (b["packet"], 0, WRITE),
             (b["workspace"], 0, READ_WRITE),
             (b["partials"], 0, READ_WRITE),

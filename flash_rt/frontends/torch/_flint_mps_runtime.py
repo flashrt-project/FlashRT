@@ -26,8 +26,8 @@ from flash_rt.models.flint.mlx_checkpoint import AffineMatrix, MLXCheckpoint, bf
 from flash_rt.models.flint.pipeline_mps import (
     ATTENTION, BLOCK, D_BIAS, D_DOWN, D_EMBED, D_FINAL_NORM, D_FLAGS, D_GATE, D_HEAD, D_IN_NORM, D_K, D_K_NORM,
     D_KV, D_KV_CAP, D_O, D_POST_NORM, D_Q, D_Q_NORM, D_ROUTER, D_SH_DOWN, D_SH_GATE, D_SH_UP, D_SINKS, D_UP, D_V,
-    DECODE_KERNELS, DESCRIPTOR, GROUPED_TM, SMALL_ROWS, STATE_WORDS, WORKERS, FlintPipelineMps, FlintPrefillMps,
-    check_geometry)
+    DECODE_KERNELS, DESCRIPTOR, GROUPED_TM, SMALL_ROWS, STATE_WORDS, VERIFY_ROWS, WORKERS, FlintPipelineMps,
+    FlintPrefillMps, check_geometry)
 
 ALIGN = 256
 MAX_CHUNK = 2048                # prefill chunk limit (router split-K and expert tiling rules assume <= 2048 rows)
@@ -79,20 +79,24 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 32768, library: Optional[str] = None,
                  prefill_chunk: int = MAX_CHUNK, prefill_layers: int = 0, layer_programs=(),
-                 prefill_attention: Optional[str] = None, wide_chunks: int = WIDE_CHUNKS):
+                 prefill_attention: Optional[str] = None, wide_chunks: int = WIDE_CHUNKS, verify_rows: int = 0):
         """``prefill_chunk``: rows per prefill chunk (the reference engine uses 2048 on M4 Pro / M4 Max; a
         different value changes the chunking and hence the rounding). ``wide_chunks``: up to this many
         consecutive full chunks run their row-wise operations (products, routing, experts) as one program,
         with attention still per chunk; the result is the same, the larger expert blocks are faster.
         ``prefill_attention``: key of ``pipeline_mps.ATTENTION``. ``prefill_layers`` / ``layer_programs``:
         diagnostics (prefill only the first layers; extra single-layer programs over the residual stream in
-        ``h``)."""
+        ``h``). ``verify_rows``: record the verification steps up to this many rows (2..4; 0: none) for
+        ``verify``."""
         if max_seq < 1:
             raise ValueError("max_seq must be positive")
         if not 1 <= prefill_chunk <= MAX_CHUNK:
             raise ValueError(f"prefill_chunk must be in [1, {MAX_CHUNK}]")
         if wide_chunks < 1 or (wide_chunks > 1 and prefill_chunk < SMALL_ROWS):
             raise ValueError("wide_chunks must be >= 1, and 1 for chunks below the large-row paths")
+        if verify_rows and verify_rows not in VERIFY_ROWS:
+            raise ValueError(f"verify_rows must be 0 or one of {VERIFY_ROWS}")
+        self.verify_rows = int(verify_rows)
         if prefill_attention is not None and prefill_attention not in ATTENTION:
             raise ValueError(f"prefill_attention must be one of {sorted(ATTENTION)}")
         self.ckpt = MLXCheckpoint(checkpoint_dir)
@@ -115,6 +119,8 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
         self.vocab_param = self.param("uint", value=self.cfg.vocab_size)
         self.programs = {name: self.record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
         self.programs["noise"] = self.record_noise()
+        for rows in range(2, self.verify_rows + 1):
+            self.programs[f"verify{rows}"] = self.record_verify(rows)
         self.programs["prefill"] = self.record_prefill(self.prefill_chunk, prefill_layers)
         self.programs["prefill_small"] = self.record_prefill(self.prefill_chunk, prefill_layers, small=True)
         if self.wide_chunks > 1:
@@ -132,6 +138,9 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
         self._packet = self.plan.view(self.buf["packet"], np.uint32, 17)
         self._diagnostic = self.plan.view(self.buf["diagnostic"], np.uint32, WORKERS)
         self._control = self.plan.view(self.buf["control"], np.uint32, CONTROL)
+        self.verify_stats = [0, 0, 0]   # verification steps, draft tokens, accepted drafts
+        if self.verify_rows:
+            self._verify_tokens = self.plan.view(self.buf["verify_tokens"], np.uint32, 4)
         self.load_seconds = time.perf_counter() - started
         self.pos = 0
         self.initial = 0        # sliding-ring layout (prompt length of the last prefill)
@@ -230,6 +239,7 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
     # -------------------------------------------------------------------- state
     def _allocate_state(self):
         v = self.cfg.vocab_size
+        rows = max(1, self.verify_rows)
         sizes = {
             "kv": self.kv_elements * 2,
             "params": 64,
@@ -237,13 +247,19 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
             "logits": BLOCK * v * 2,
             "trace": BLOCK * (self.cfg.num_layers + 1) * self.cfg.hidden_size * 2,
             "packet": 17 * 4,
-            "workspace": WORKSPACE * 2,
-            "partials": PARTIALS * 4,
-            "statistics": STATISTICS * 4,
+            "workspace": rows * WORKSPACE * 2,
+            "partials": rows * PARTIALS * 4,
+            "statistics": rows * STATISTICS * 4,
             "routing": ROUTING * 4,
             "control": CONTROL * 4,
             "diagnostic": WORKERS * 4,
         }
+        if self.verify_rows:
+            sizes["verify_tokens"] = 16
+            sizes["verify_logits"] = self.verify_rows * v * 2
+            # sliding-layer K/V of draft rows: [layer][row - 1][K, V][KV heads][head dim] (BF16)
+            sizes["verify_side"] = (self.cfg.num_layers * (self.verify_rows - 1) * 2 * self.cfg.num_kv_heads
+                                    * self.cfg.head_dim * 2)
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
 
@@ -425,6 +441,43 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
         self.pos = position + produced
         self.swa_kv_start = max(self.swa_kv_start, self.pos - self.cfg.sliding_window)
         return pairs[1::2]
+
+    def verify(self, tokens: Sequence[int], position: int) -> List[int]:
+        """One verification step: ``tokens[0]`` is the last produced token (at ``position``, not yet in the
+        cache) and ``tokens[1:]`` are draft tokens for the following positions (1 to ``verify_rows`` - 1 of
+        them). Every row is computed as the greedy decode step at its position would compute it. Returns the
+        greedy tokens of row 0 and of every row whose draft equals the previous row's token (accepted drafts),
+        i.e. 1 to len(tokens) tokens; the cache then holds the positions of row 0 and the accepted rows."""
+        rows = len(tokens)
+        if not 2 <= rows <= self.verify_rows:
+            raise ValueError(f"verification needs 2..{self.verify_rows} tokens (verify_rows={self.verify_rows})")
+        if position + rows > self.max_seq:
+            raise ValueError(f"verification range [{position}, {position + rows}) exceeds max_seq {self.max_seq}")
+        if any(t < 0 or t >= self.cfg.vocab_size for t in tokens):
+            raise ValueError("token id outside the checkpoint vocabulary")
+        self._params[:] = self._decode_params(int(tokens[0]), position, rows, (), 0, 1.0, 1.0, None)
+        self._verify_tokens[:rows] = np.asarray(tokens, dtype=np.uint32)
+        self._control[:] = 0
+        self._diagnostic[:] = 0
+        timing = self.plan.run(self.programs[f"verify{rows}"])
+        if self._diagnostic.any() or self._control[2]:
+            raise RuntimeError(f"verification step barrier timed out (diagnostic {self._diagnostic.tolist()}, flag "
+                               f"{int(self._control[2])}); the GPU did not keep all threadgroups resident")
+        accepted = int(self._packet[0])
+        if not 0 <= accepted < rows or int(self._packet[16]) != accepted + 1:
+            raise RuntimeError(f"invalid verification packet {self._packet.tolist()}")
+        self.last_timing = timing
+        self.verify_stats[0] += 1
+        self.verify_stats[1] += rows - 1
+        self.verify_stats[2] += accepted
+        self.pos = position + accepted + 1
+        self.swa_kv_start = max(self.swa_kv_start, self.pos - self.cfg.sliding_window)
+        return self._packet[1:2 + accepted].tolist()
+
+    def verify_logits(self, row: int) -> np.ndarray:
+        """BF16 logits (raw uint16) of ``row`` of the last verification step."""
+        v = self.cfg.vocab_size
+        return self.plan.read(self.buf["verify_logits"], row * v * 2, np.uint16, v)
 
     def logits(self, step: int = 0) -> np.ndarray:
         """BF16 logits (raw uint16) of ``step`` in the last decode block."""

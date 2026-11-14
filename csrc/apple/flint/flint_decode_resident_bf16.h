@@ -14,6 +14,10 @@
 // default attention path replaces the global-layer partial attention above 1024 keys with an 8x8 FP32
 // simdgroup-MMA kernel.
 //
+// verify_rows > 0 builds the verification step instead (flint_decode_verify_bf16): one dispatch computes 2..4
+// consecutive positions (the last produced token and draft tokens), each row with the arithmetic of the greedy
+// resident step at its position, reading every weight word once for all rows; see the kernel's comment.
+//
 // Geometry, fixed in this source and checked against the checkpoint by the Flint Apple runtime
 // (flash_rt.models.flint.pipeline_mps.check_geometry) before compilation: 49 layers, hidden 2048, 32 query /
 // 4 KV heads of 128, 256 experts top-6 of width 512, shared expert 1024, dense layers 6144, vocabulary
@@ -25,6 +29,7 @@ struct FlintDecodeOptions {
     bool sampled = false;         // fused top-k/top-p gumbel selection instead of greedy argmax
     bool exact_attention = false; // rec's partial-attention algorithm for every layer and length
     bool trace = false;           // write the residual stream after the embedding and every layer
+    int verify_rows = 0;          // > 0: the verification step over this many consecutive rows instead
 };
 
 inline std::string flint_decode_resident_bf16_source(const FlintDecodeOptions& o = {}) {
@@ -33,7 +38,8 @@ inline std::string flint_decode_resident_bf16_source(const FlintDecodeOptions& o
     std::string defines = std::string("\n#define FRT_WORKERS 36u\n#define FRT_MMA_MIN_KEYS 1024u") +
         "\n#define FRT_SAMPLED " + std::to_string(o.sampled ? 1 : 0) +
         "\n#define FRT_EXACT_ATTENTION " + std::to_string(o.exact_attention ? 1 : 0) +
-        "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) + "\n";
+        "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) +
+        "\n#define FRT_VERIFY_ROWS " + std::to_string(o.verify_rows) + "\n";
     return std::string(metal_preamble) + defines + R"MSL(
 typedef bfloat bfloat16_t;
 constant constexpr uint FRT_GROUPS=FRT_WORKERS*8u;        // SIMD groups in the grid
@@ -155,7 +161,15 @@ inline bool expert_handoff(device uint* routing,device atomic_uint* control,uint
 // hardware float->bfloat conversion and widens the result immediately. No 16-bit value stays in a
 // register: packing two BF16 values into one register is miscompiled in this kernel by the macOS 26 GPU
 // compiler (odd/even element corruption).
+#if FRT_VERIFY_ROWS
+// The verification step rounds in integer arithmetic (nearest even): the hardware conversion's 16-bit temporaries
+// of different rows get packed into one register and corrupted. Every rounded value is an FP32 arithmetic result,
+// which this GPU flushes to zero below the normal range, so this equals the hardware conversion bit for bit
+// (NaN payloads aside).
+inline float rb(float v){uint u=as_type<uint>(v);return as_type<float>((u+0x7fffu+((u>>16)&1u))&0xffff0000u);}
+#else
 inline float rb(float v){return as_type<float>(uint(as_type<ushort>(bfloat16_t(v)))<<16);}
+#endif
 inline float bf16_f(bfloat16_t x){return as_type<float>(uint(as_type<ushort>(x))<<16);}
 inline float lo_f(uint w){return as_type<float>(w<<16);}
 inline float hi_f(uint w){return as_type<float>(w&0xffff0000u);}
@@ -277,16 +291,30 @@ inline void head_norm(device bfloat16_t* p,const device bfloat16_t* w,bool rotar
 }
 
 // --------------------------------------------------------------------------------------- attention
+// Sliding-ring slots [lo, lo + n) (mod cap) whose keys and values are read from `side` ([n][K, V][4 heads][128])
+// instead of the ring: a verification step's later rows, before they are committed.
+struct SideKV {
+    const device bfloat16_t* side;
+    uint lo, n, cap;
+};
 // Partial attention (one KV team per KV head): each task covers `parts`-strided keys for HEADS query heads.
-// ROUNDED stores BF16 partial numerators (global layers from 1024 keys), otherwise FP32.
-template<uint HEADS,bool ROUNDED>
+// ROUNDED stores BF16 partial numerators (global layers from 1024 keys), otherwise FP32. SIDE reads the slots
+// of `sk` from its side buffer.
+template<uint HEADS,bool ROUNDED,bool SIDE=false>
 inline void attention_partial(const device bfloat16_t* q,KVView k,KVView v,const device bfloat16_t* sinks,
-                              device float* partial,device float* stats,uint count,uint parts,uint lane,uint sg) {
+                              device float* partial,device float* stats,uint count,uint parts,uint lane,uint sg,
+                              SideKV sk={nullptr,0u,0u,1u}) {
     for(uint task=(sg/FRT_TEAM_SIMDS)*((8/HEADS)*parts)+sg%FRT_TEAM_SIMDS;
         task<(sg/FRT_TEAM_SIMDS+1)*((8/HEADS)*parts);task+=FRT_TEAM_SIMDS) {
         uint kv=task/((8/HEADS)*parts),part=(task/(8/HEADS))%parts,first=kv*8+(task%(8/HEADS))*HEADS;
         KVView key_base=k.head(kv,lane*4);
         KVView value_base=v.head(kv,lane*4);
+#define FRT_KV_LOAD(dk,dv,tok) { \
+            uint frt_t=(tok),frt_rel=frt_t>=sk.lo?frt_t-sk.lo:frt_t+sk.cap-sk.lo; \
+            if(SIDE && frt_rel<sk.n) { \
+                const device bfloat16_t* frt_s=sk.side+(frt_rel*8u+kv)*128u+lane*4u; \
+                dk=*((const device uint2*)frt_s);dv=*((const device uint2*)(frt_s+512u)); \
+            } else {dk=key_base.load4(frt_t*128u);dv=value_base.load4(frt_t*128u);} }
         const device bfloat16_t* query_base=q+first*128+lane*4;
         float query[HEADS][4],acc[HEADS][4];
         float hi=part==0 && lane<HEADS?bf16_f(sinks[first+lane]):-3.402823466e+38f;
@@ -294,8 +322,8 @@ inline void attention_partial(const device bfloat16_t* q,KVView k,KVView v,const
         for(uint h=0;h<HEADS;++h)for(uint j=0;j<4;++j){query[h][j]=bf16_f(query_base[h*128+j])*0.08838834764831845f;acc[h][j]=0.0f;}
         uint token=part;
         if(ROUNDED && part!=0 && token<count) {
-            uint at=uint(token)*128;
-            uint2 pk=key_base.load4(at),pv=value_base.load4(at);
+            uint2 pk,pv;
+            FRT_KV_LOAD(pk,pv,token)
             float key[4]={lo_f(pk.x),hi_f(pk.x),lo_f(pk.y),hi_f(pk.y)},value[4]={lo_f(pv.x),hi_f(pv.x),lo_f(pv.y),hi_f(pv.y)};
             for(uint h=0;h<HEADS;++h) {
                 float score=0.0f;for(uint j=0;j<4;++j)score+=query[h][j]*key[j];
@@ -305,13 +333,12 @@ inline void attention_partial(const device bfloat16_t* q,KVView k,KVView v,const
             token+=parts;
         }
         uint2 next_key=uint2(0),next_value=uint2(0);
-        if(token<count){next_key=key_base.load4(uint(token)*128);next_value=value_base.load4(uint(token)*128);}
+        if(token<count)FRT_KV_LOAD(next_key,next_value,token)
         #pragma clang loop unroll_count(1)
         for(;token<count;token+=parts) {
-            uint at=uint(token)*128;
             float key[4]={lo_f(next_key.x),hi_f(next_key.x),lo_f(next_key.y),hi_f(next_key.y)};
             float value[4]={lo_f(next_value.x),hi_f(next_value.x),lo_f(next_value.y),hi_f(next_value.y)};
-            if(token+parts<count){next_key=key_base.load4(at+parts*128);next_value=value_base.load4(at+parts*128);}
+            if(token+parts<count)FRT_KV_LOAD(next_key,next_value,token+parts)
             float scores[HEADS];
             for(uint h=0;h<HEADS;++h){float score=0.0f;for(uint j=0;j<4;++j)score+=query[h][j]*key[j];scores[h]=simd_sum(score);}
             float old=0.0f,add=0.0f;
@@ -339,6 +366,7 @@ inline void attention_partial(const device bfloat16_t* q,KVView k,KVView v,const
         }
     }
 }
+#undef FRT_KV_LOAD
 // Merge the partitions of each head (team-local: 8 heads x 8 dimension slices of 16).
 template<bool ROUNDED>
 inline void attention_merge(device bfloat16_t* out,device float* partial,device float* stats,uint parts,uint lane,uint sg) {
@@ -527,11 +555,266 @@ inline void expert_down(const device uchar* weights,const threadgroup ulong* d,c
     }
 }
 
+
+#if FRT_VERIFY_ROWS
+// ------------------------------------------------------------------- multi-row products (verification)
+// Each weight word is read once for FRT_ROWS activation rows; every row's sums are those of q4 / q4_local
+// (dot16 on the same codes), so a row's result equals the single-row product bit for bit.
+#define FRT_UNROLL _Pragma("clang loop unroll(full)")
+constant constexpr uint FRT_ROWS=FRT_VERIFY_ROWS;
+constant constexpr uint FRT_ROW_WS=78848u;               // workspace elements per row
+constant constexpr uint FRT_ROW_PARTIALS=32u*1024u*64u;  // partial floats per row
+constant constexpr uint FRT_ROW_STATS=32u*1024u*2u;      // statistic floats per row
+// The codes become the same exact FP32 integers as dot16's through integer conversion: with the 2^23 constant,
+// fast math factors x * 2^23 out of the rows that share x (wrong sums with three or more rows).
+inline float dot16_words(uint2 c,thread float* x,float s,float b,float sum) {
+    const uint p[4]={c.x&0xffffu,c.x>>16,c.y&0xffffu,c.y>>16};
+    float a=0.0f;
+    for(uint j=0;j<4;++j)
+        a+=x[4*j]*float(p[j]&15u)+x[4*j+1]*float(p[j]&240u)+x[4*j+2]*float(p[j]&3840u)+x[4*j+3]*float(p[j]&61440u);
+    return s*a+sum*b;
+}
+inline const device uint2* words(const device bfloat16_t* p){return (const device uint2*)p;}
+inline const threadgroup uint2* words(const threadgroup bfloat16_t* p){return (const threadgroup uint2*)p;}
+// Sum of 16 activations as load16 forms it (four groups of four, each rounded to BF16 per add).
+template<typename P>
+inline float sum16_words(P x) {
+    float sum=0.0f;
+    for(uint i=0;i<16;i+=4) {
+        const uint2 w=x[i/4];
+        sum+=rb(rb(rb(lo_f(w.x)+hi_f(w.x))+lo_f(w.y))+hi_f(w.y));
+    }
+    return sum;
+}
+// The 16 activations, pre-divided like load16's.
+template<typename P>
+inline void values16_words(P x,thread float* v) {
+    for(uint i=0;i<16;i+=4) {
+        const uint2 w=x[i/4];
+        v[i]=lo_f(w.x);v[i+1]=hi_f(w.x)/16.0f;v[i+2]=lo_f(w.y)/256.0f;v[i+3]=hi_f(w.y)/4096.0f;
+    }
+}
+// Sums table of every row (rows XS elements apart, K inputs): sums[r * K / 16 + i] = sum16 of inputs 16i..16i+15.
+template<uint K,typename P>
+inline void sums_table(P x,uint xs,threadgroup float* sums,uint tid) {
+    for(uint i=tid;i<FRT_ROWS*(K/16u);i+=256u)
+        sums[i]=sum16_words(words(x+(i/(K/16u))*xs+(i%(K/16u))*16u));
+}
+inline void codes16(uint2 c,thread float* q) {
+    const uint p[4]={c.x&0xffffu,c.x>>16,c.y&0xffffu,c.y>>16};
+    for(uint j=0;j<4;++j){q[4*j]=float(p[j]&15u);q[4*j+1]=float(p[j]&240u);q[4*j+2]=float(p[j]&3840u);q[4*j+3]=float(p[j]&61440u);}
+}
+// dot16's sums with the codes as FP32 integers (q) and the pre-divided activations (x).
+inline float dot16_f(thread const float* q,thread const float* x,float s,float b,float sum) {
+    float a=0.0f;
+    for(uint j=0;j<4;++j)a+=x[4*j]*q[4*j]+x[4*j+1]*q[4*j+1]+x[4*j+2]*q[4*j+2]+x[4*j+3]*q[4*j+3];
+    return s*a+sum*b;
+}
+// Four output rows starting at `first` for every activation row (x: rows XS apart, `sums` its sums table;
+// out: rows OS apart). Each code word is converted once for all rows.
+template<uint K,typename P,typename S>
+inline void q4_rows_block(Matrix m,P x,uint xs,S sums,uint ss,device bfloat16_t* out,uint os,uint lane,uint first) {
+    float a[FRT_ROWS][4];
+    FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)FRT_UNROLL for(uint r=0;r<4;++r)a[j][r]=0.0f;
+    for(uint block=0;block<K;block+=512) {
+        uint scalar=block+lane*16;
+        uint2 c[4];float sc[4],bi[4];
+        FRT_UNROLL for(uint r=0;r<4;++r) {
+            uint row=first+r;uint gi=row*(K/64)+scalar/64;
+            c[r]=*((const device uint2*)(m.w+size_t(row)*(K/2)+scalar/2));sc[r]=float(m.s[gi]);bi[r]=float(m.b[gi]);
+        }
+        float v[FRT_ROWS][16],sum[FRT_ROWS];
+        FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j){values16_words(words(x+j*xs+scalar),v[j]);sum[j]=sums[j*ss+scalar/16u];}
+        FRT_UNROLL for(uint r=0;r<4;++r) {
+            float q[16];codes16(c[r],q);
+            FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)a[j][r]+=dot16_f(q,v[j],sc[r],bi[r],sum[j]);
+        }
+    }
+    FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)FRT_UNROLL for(uint r=0;r<4;++r) {
+        float v=simd_sum(a[j][r]);if(lane==0)out[j*os+first+r]=bfloat16_t(v);
+    }
+}
+template<uint K,typename P,typename S>
+inline void q4_rows(Matrix m,P x,uint xs,S sums,uint ss,device bfloat16_t* out,uint os,uint lane,uint sg,uint groups) {
+    for(uint first=sg*4;first<m.n;first+=groups*4)q4_rows_block<K>(m,x,xs,sums,ss,out,os,lane,first);
+}
+// rms_2048 that also writes the sums table of its output (load16's group sums of every 16 outputs): a group's
+// 16 outputs are four consecutive threads' four.
+inline void rms_2048_table(const thread float* x,const device bfloat16_t* w,threadgroup bfloat16_t* out,
+                           threadgroup float* table,uint tid,uint lane,uint sg,threadgroup float* temp) {
+    float sums[2];
+    for(uint leaf=0;leaf<2;++leaf) {
+        float squared=0.0f;
+        for(uint j=0;j<4;++j){float v=x[leaf*4+j];squared+=v*v;}
+        sums[leaf]=simd_sum(squared);
+    }
+    if(lane==0){temp[sg]=sums[0];temp[sg+8]=sums[1];}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float leaf=lane<16?temp[lane]:0.0f;
+    float total=simd_sum(leaf);
+    float inverse=metal::precise::rsqrt(total/2048.0f+FRT_EPS);
+    float y[8];
+    for(uint j=0;j<8;++j){uint i=(tid+(j/4)*256)*4+j%4;y[j]=rb(bf16_f(w[i])*rb(x[j]*inverse));out[i]=bfloat16_t(y[j]);}
+    for(uint hf=0;hf<2;++hf) {
+        const float part=rb(rb(rb(y[hf*4]+y[hf*4+1])+y[hf*4+2])+y[hf*4+3]);
+        const float p1=simd_shuffle_down(part,ushort(1)),p2=simd_shuffle_down(part,ushort(2)),p3=simd_shuffle_down(part,ushort(3));
+        if(lane%4u==0u)table[hf*64u+tid/4u]=(((0.0f+part)+p1)+p2)+p3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// attention_merge that also writes the sums table of its output (each task's 16 outputs are one group).
+template<bool ROUNDED>
+inline void attention_merge_table(device bfloat16_t* out,device float* partial,device float* stats,uint parts,
+                                  device float* table,uint lane,uint sg) {
+    for(uint task=(sg/FRT_TEAM_SIMDS)*64+sg%FRT_TEAM_SIMDS;task<(sg/FRT_TEAM_SIMDS+1)*64;task+=FRT_TEAM_SIMDS) {
+        uint h=task/8,dim=(task%8)*16;
+        float top=-3.402823466e+38f;
+        for(uint p=lane;p<parts;p+=32)top=max(top,stats[(h*parts+p)*2]);
+        top=simd_max(top);
+        float z=0.0f;
+        float4 a[4]={float4(0),float4(0),float4(0),float4(0)};
+        for(uint p=lane;p<parts;p+=32) {
+            uint row=h*parts+p;
+            float factor=metal::fast::exp(stats[row*2]-top);
+            z+=factor*stats[row*2+1];
+            for(uint tile=0;tile<4;++tile) {
+                float4 value;
+                if(ROUNDED) {
+                    uint at=((h*32+dim/4+tile)*parts+p)*4;
+                    uint2 raw=*((const device uint2*)(((const device bfloat16_t*)partial)+at));
+                    value=float4(lo_f(raw.x),hi_f(raw.x),lo_f(raw.y),hi_f(raw.y));
+                } else {
+                    value=*((const device float4*)(partial+(h*parts+p)*128+dim+tile*4));
+                }
+                a[tile]+=factor*value;
+            }
+        }
+        z=simd_sum(z);
+        float owned[2]={};
+        for(uint tile=0;tile<4;++tile)for(uint component=0;component<4;++component) {
+            uint j=tile*4+component;
+            float total=simd_sum(a[tile][component]);
+            if(lane==j/2)owned[j%2]=total;
+        }
+        float val[2];
+        for(uint t=0;t<2;++t)val[t]=rb(z==0.0f?owned[t]:owned[t]/z);
+        if(lane<8)for(uint t=0;t<2;++t){uint j=lane*2+t;out[h*128+dim+j]=bfloat16_t(val[t]);}
+        // lanes 0..7 hold outputs 2l, 2l+1: groups of four on lanes 2m, 2m+1
+        const float n0=simd_shuffle_down(val[0],ushort(1)),n1=simd_shuffle_down(val[1],ushort(1));
+        const float part=rb(rb(rb(val[0]+val[1])+n0)+n1);
+        const float g1=simd_shuffle_down(part,ushort(2)),g2=simd_shuffle_down(part,ushort(4)),g3=simd_shuffle_down(part,ushort(6));
+        if(lane==0)table[h*8u+dim/16u]=(((0.0f+part)+g1)+g2)+g3;
+    }
+}
+// Router scores for every row (probs: rows FRT_ROW_STATS apart).
+inline void route_dot_rows(const threadgroup bfloat16_t* x,const device bfloat16_t* w,device float* probs,uint lane,uint sg) {
+    for(uint row=sg;row<256;row+=FRT_GROUPS) {
+        float a[FRT_ROWS];
+        FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)a[j]=0.0f;
+        for(uint b=0;b<16;++b) {
+            uint at=b*128+lane*4;
+            const uint2 packed=*((const device uint2*)(w+row*2048+at));
+            const float4 weights=float4(lo_f(packed.x),hi_f(packed.x),lo_f(packed.y),hi_f(packed.y));
+            FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)for(uint i=0;i<4;++i)a[j]+=weights[i]*bf16_f(x[j*2048+at+i]);
+        }
+        FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j) {
+            float v=a[j];
+            for(ushort d=16;d>=1;d>>=1)v+=simd_shuffle_down(v,d);
+            v=rb(v);
+            if(lane==0){float tail=1.0f/(1.0f+metal::precise::exp(metal::abs(v)));probs[j*FRT_ROW_STATS+row]=v<0?tail:1.0f-tail;}
+        }
+    }
+}
+// Shared expert for every row (weights read once).
+// Top-6 experts of one row (route_own_rank's selection for every rank) into threadgroup memory.
+inline void route_all(const device float* bias,const device float* probs,threadgroup uint* ids,threadgroup float* chosen,
+                      uint lane) {
+    float p[8],b[8];for(uint j=0;j<8;++j){p[j]=probs[lane+32*j];b[j]=p[j]+bias[lane+32*j];}
+    for(uint rank=0;rank<6;++rank) {
+        float best=-3.402823466e+38f;uint idx=0;
+        for(uint j=0;j<8;++j){uint i=lane+32*j;if(b[j]>best||(b[j]==best&&i<idx)){best=b[j];idx=i;}}
+        float peak=simd_max(best);uint selected=simd_min(best==peak?idx:0xffffffffu);
+        float value=simd_shuffle(p[selected/32],selected%32);
+        if(lane==0){ids[rank]=selected;chosen[rank]=value;}
+        for(uint j=0;j<8;++j)if(lane+32*j==selected)b[j]=-3.402823466e+38f;
+    }
+}
+// One routed expert's gate/up row pair `local` for one activation row x (expert_gateup's sums; `sums`: x's table).
+inline void routed_gateup_pair(const device uchar* weights,const threadgroup ulong* d,const threadgroup bfloat16_t* x,
+                               const threadgroup float* sums,uint expert,uint local,device bfloat16_t* out,uint lane) {
+    Matrix g=weight_matrix(weights,d+D_GATE),u=weight_matrix(weights,d+D_UP);
+    float ga[2]={0.0f,0.0f},ua[2]={0.0f,0.0f};
+    for(uint b=0;b<2048;b+=512) {
+        uint scalar=b+lane*16;
+        float v[16];values16_words(words(x+scalar),v);
+        const float sum=sums[scalar/16u];
+        FRT_UNROLL for(uint j=0;j<2;++j) {
+            uint row=expert*g.n+local+j,gi=row*32+scalar/64;
+            float q[16];
+            codes16(*((const device uint2*)(g.w+size_t(row)*1024+scalar/2)),q);
+            ga[j]+=dot16_f(q,v,float(g.s[gi]),float(g.b[gi]),sum);
+            codes16(*((const device uint2*)(u.w+size_t(row)*1024+scalar/2)),q);
+            ua[j]+=dot16_f(q,v,float(u.s[gi]),float(u.b[gi]),sum);
+        }
+    }
+    for(uint j=0;j<2;++j) {
+        float2 val=simd_sum(float2(ga[j],ua[j]));
+        if(lane==0)out[local+j]=bfloat16_t(swiglu_bf16(rb(val.x),rb(val.y),true));
+    }
+}
+// One routed expert's down rows local..local+3 for one activation row (expert_down's sums; `sums`: input's table).
+inline void routed_down_quad(const device uchar* weights,const threadgroup ulong* d,const device bfloat16_t* input,
+                             const threadgroup float* sums,uint expert,uint local,device bfloat16_t* out,uint lane) {
+    Matrix m=weight_matrix(weights,d+D_DOWN);
+    float a[4]={0.0f,0.0f,0.0f,0.0f};
+    for(uint b=0;b<512;b+=512) {
+        uint scalar=b+lane*16;
+        float v[16];values16_words(words(input+scalar),v);
+        const float sum=sums[scalar/16u];
+        FRT_UNROLL for(uint j=0;j<4;++j) {
+            uint row=expert*2048+local+j,gi=row*8+scalar/64;
+            float q[16];codes16(*((const device uint2*)(m.w+size_t(row)*256+scalar/2)),q);
+            a[j]+=dot16_f(q,v,float(m.s[gi]),float(m.b[gi]),sum);
+        }
+    }
+    for(uint j=0;j<4;++j){float v=simd_sum(a[j]);if(lane==0)out[local+j]=bfloat16_t(v);}
+}
+// The shared expert's gate/up row pair `local` for every row (weights read once).
+inline void shared_gateup_pair(const device uchar* weights,const threadgroup ulong* d,const threadgroup bfloat16_t* x,
+                               const threadgroup float* sums,uint local,device bfloat16_t* out,uint lane) {
+    Matrix g=weight_matrix(weights,d+D_SH_GATE),u=weight_matrix(weights,d+D_SH_UP);
+    float ga[FRT_ROWS][2],ua[FRT_ROWS][2];
+    FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j){ga[j][0]=ga[j][1]=ua[j][0]=ua[j][1]=0.0f;}
+    for(uint b=0;b<2048;b+=512) {
+        uint scalar=b+lane*16;
+        uint2 cg[2],cu[2];float sg_[2],bg[2],su[2],bu[2];
+        FRT_UNROLL for(uint i=0;i<2;++i) {
+            uint row=local+i,gi=row*32+scalar/64;
+            cg[i]=*((const device uint2*)(g.w+size_t(row)*1024+scalar/2));sg_[i]=float(g.s[gi]);bg[i]=float(g.b[gi]);
+            cu[i]=*((const device uint2*)(u.w+size_t(row)*1024+scalar/2));su[i]=float(u.s[gi]);bu[i]=float(u.b[gi]);
+        }
+        float v[FRT_ROWS][16],sum[FRT_ROWS];
+        FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j){values16_words(words(x+j*2048+scalar),v[j]);sum[j]=sums[j*128u+scalar/16u];}
+        FRT_UNROLL for(uint i=0;i<2;++i) {
+            float q[16];
+            codes16(cg[i],q);
+            FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)ga[j][i]+=dot16_f(q,v[j],sg_[i],bg[i],sum[j]);
+            codes16(cu[i],q);
+            FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)ua[j][i]+=dot16_f(q,v[j],su[i],bu[i],sum[j]);
+        }
+    }
+    FRT_UNROLL for(uint j=0;j<FRT_ROWS;++j)FRT_UNROLL for(uint i=0;i<2;++i) {
+        float2 val=simd_sum(float2(ga[j][i],ua[j][i]));
+        if(lane==0)out[j*FRT_ROW_WS+6*512+local+i]=bfloat16_t(swiglu_bf16(rb(val.x),rb(val.y),true));
+    }
+}
+#endif
 // ------------------------------------------------------------------------------------------ kernel
 #define FRT_FAIL() {if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);return;}
 #define SYNC() if(!grid_sync(control,tid,phase,ready))FRT_FAIL()
 #define TEAM_SYNC() if(!team_sync(control,tid,team_phase,ready,group))FRT_FAIL()
 
+#if !FRT_VERIFY_ROWS
 kernel void flint_decode_resident_bf16(
     const device uchar* weights [[buffer(0)]],
     const device ulong* layers [[buffer(1)]],
@@ -847,6 +1130,307 @@ kernel void flint_decode_resident_bf16(
     }
     if(tid==0)diagnostic[group]=0;
 }
+#endif
+#if FRT_VERIFY_ROWS
+// Verification step: FRT_ROWS consecutive positions in one pass (row 0 = the last produced token, rows 1.. =
+// draft tokens), every row's arithmetic that of the resident step at its position. Global-layer K/V of every
+// row go to their cache slots; sliding-layer K/V of rows 1.. go to `side` ([layer][row - 1][K, V][4][128]) and
+// attention reads them from there in place of the ring slots they will occupy, so earlier rows still see the
+// ring as it was. Greedy choice per row; accepted = number of leading drafts equal to the previous row's choice;
+// the sliding K/V of accepted rows are then committed to the ring. packet: [0] accepted, [1 + i] choice of row i.
+kernel void flint_decode_verify_bf16(
+    const device uchar* weights [[buffer(0)]],
+    const device ulong* layers [[buffer(1)]],
+    device bfloat16_t* kv [[buffer(2)]],
+    constant DecodeParams& params [[buffer(3)]],
+    const device uint* tokens [[buffer(4)]],
+    device bfloat16_t* row_logits [[buffer(5)]],
+    device bfloat16_t* side [[buffer(6)]],
+    device uint* packet [[buffer(7)]],
+    device bfloat16_t* workspace [[buffer(8)]],
+    device float* partials [[buffer(9)]],
+    device float* statistics [[buffer(10)]],
+    device uint* routing [[buffer(11)]],
+    device uint* private_control [[buffer(12)]],
+    device uint* diagnostic [[buffer(13)]],
+    uint3 group3 [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+    const uint group=group3.x,sg=group*8+simd,index=group*256+tid;
+    device atomic_uint* control=(device atomic_uint*)private_control;
+    threadgroup uint ready[1];
+    uint phase=0,team_phase=0,qkv_base=0;
+    threadgroup float reduction[33];
+    threadgroup ulong layer_descriptor[64];
+    threadgroup float frt_qs[1024];
+    threadgroup uint choice[FRT_ROWS];
+    threadgroup uint vids[FRT_ROWS*8];       // every row's six experts
+    threadgroup float vchosen[FRT_ROWS*8];   // and their router scores
+    float h[FRT_ROWS][8];
+    alignas(8) threadgroup bfloat16_t n[FRT_ROWS*2048];
+    threadgroup float nsum[FRT_ROWS*128];   // sums table of n
+    threadgroup float xsum[FRT_ROWS*384];   // sums tables of device inputs (expert and dense down products)
+    device bfloat16_t* q=workspace+4096;
+    device bfloat16_t* k=workspace+8192;
+    device bfloat16_t* v=workspace+8704;
+    device bfloat16_t* a=workspace+9216;
+    device bfloat16_t* o=workspace+13312;
+    device bfloat16_t* gate=workspace+15360;
+    device bfloat16_t* up=workspace+31744;
+    device bfloat16_t* act=workspace+48128;
+    device bfloat16_t* down=workspace+64512;
+    const device ulong* final=layers+49*64;
+    const Matrix embedding=weight_matrix(weights,final+D_EMBED);
+    const uint position=params.position;
+    FRT_UNROLL for(uint r=0;r<FRT_ROWS;++r) {
+        const uint token=tokens[r];
+        for(uint j=0;j<8;++j) {
+            uint i=(tid+(j/4)*256)*4+j%4;
+            size_t row=token;uint code=embedding.w[row*2048+i];
+            uint gi=row*32+i/64;
+            h[r][j]=rb(metal::fma(bf16_f(embedding.s[gi]),float(code),bf16_f(embedding.b[gi])));
+        }
+    }
+    SYNC();
+    for(uint layer=0;layer<FRT_LAYERS;++layer) {
+        if(tid<64)layer_descriptor[tid]=layers[layer*64+tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup ulong* d=layer_descriptor;
+        const bool global=(d[D_FLAGS]&1)!=0,sparse=(d[D_FLAGS]&2)!=0;
+        FRT_UNROLL for(uint r=0;r<FRT_ROWS;++r)
+            rms_2048_table(h[r],(const device bfloat16_t*)(weights+d[D_IN_NORM]),n+r*2048,nsum+r*128,tid,lane,simd,reduction);
+        const uint cap=uint(d[D_KV_CAP]);
+        KVView keys={kv,d[D_KV],cap};
+        KVView vals=keys.value();
+        device bfloat16_t* layer_side=side+size_t(layer)*(FRT_ROWS-1)*1024u;
+        const uint kv_team=group/FRT_TEAM_GROUPS,kv_member=group%FRT_TEAM_GROUPS;
+        for(;;) {
+            uint ticket=0;
+            if(lane==0)ticket=atomic_fetch_add_explicit(control+40+kv_team,1u,memory_order_relaxed);
+            ticket=simd_broadcast(ticket,0);
+            if(ticket>=qkv_base+320u)break;
+            uint unit=ticket-qkv_base,member=unit/32u;
+            uint head=member<8?kv_team*8+member:member==8?32+kv_team:36+kv_team;
+            uint local=head<32?head:head<36?head-32:head-36;
+            Matrix m=weight_matrix(weights,d+(head<32?D_Q:head<36?D_K:D_V));
+            m.w+=size_t(local)*128*1024;m.s+=local*128*32;m.b+=local*128*32;m.n=128;
+            q4_rows_block<2048>(m,(const threadgroup bfloat16_t*)n,2048u,(const threadgroup float*)nsum,128u,
+                                (head<32?q:head<36?k:v)+local*128,FRT_ROW_WS,lane,(unit%32u)*4u);
+        }
+        qkv_base+=320u+FRT_TEAM_GROUPS*8u;
+        TEAM_SYNC();
+        for(uint member=kv_member;member<10;member+=FRT_TEAM_GROUPS) {
+            uint head=member<8?kv_team*8+member:member==8?32+kv_team:36+kv_team;
+            uint local=head<32?head:head<36?head-32:head-36;
+            device bfloat16_t* out=(head<32?q:head<36?k:v)+local*128;
+            if(simd<FRT_ROWS && head<36)
+                head_norm(out+simd*FRT_ROW_WS,(const device bfloat16_t*)(weights+d[head<32?D_Q_NORM:D_K_NORM]),
+                          !global,position+simd,lane);
+            threadgroup_barrier(mem_flags::mem_device);
+            if(head>=32) {
+                KVView target=head<36?keys:vals;
+                for(uint i=tid;i<FRT_ROWS*128u;i+=256) {
+                    uint r=i/128u,dim=i%128u,pos=position+r;
+                    bfloat16_t value=out[r*FRT_ROW_WS+dim];
+                    if(global || r==0) {
+                        uint insert=global?pos:(params.initial>=cap?(pos%cap+cap-params.initial%cap)%cap:pos%cap);
+                        target.store(local,insert,dim,value);
+                    } else layer_side[((r-1)*2u+(head<36?0u:1u))*512u+local*128u+dim]=value;
+                }
+            }
+        }
+        TEAM_SYNC();
+        const device bfloat16_t* sinks=(const device bfloat16_t*)(weights+d[D_SINKS]);
+        const uint slot1=params.initial>=cap?((position+1)%cap+cap-params.initial%cap)%cap:(position+1)%cap;
+        bool row_rounded[FRT_ROWS];uint row_parts[FRT_ROWS];
+        for(uint r=0;r<FRT_ROWS;++r) {
+            const uint pos=position+r,count=global?pos+1:min(pos+1,cap);
+            bool rounded=global&&count>=1024;
+            uint parts=rounded?(count==1024?64:count<=8192?128:(count<=32768?256:(count<=65536?512:1024))):32;
+            const bool use_mma=global&&count>FRT_MMA_MIN_KEYS;
+            if(use_mma){rounded=false;parts=FRT_TEAM_SIMDS;}
+            row_rounded[r]=rounded;row_parts[r]=parts;
+            const device bfloat16_t* qr=q+r*FRT_ROW_WS;
+            device float* pr=partials+r*FRT_ROW_PARTIALS;
+            device float* st=statistics+r*FRT_ROW_STATS;
+            SideKV sk={layer_side,slot1,r,cap};
+            if(use_mma) attention_mma(qr,keys,vals,sinks,pr,st,count,lane,sg,tid,frt_qs);
+            else if(global && count>1024) {
+                if(rounded) attention_partial<8,true>(qr,keys,vals,sinks,pr,st,count,parts,lane,sg);
+                else attention_partial<8,false>(qr,keys,vals,sinks,pr,st,count,parts,lane,sg);
+            } else if(global) {
+                if(rounded) attention_partial<4,true>(qr,keys,vals,sinks,pr,st,count,parts,lane,sg);
+                else attention_partial<4,false>(qr,keys,vals,sinks,pr,st,count,parts,lane,sg);
+            } else if(r==0) attention_partial<4,false>(qr,keys,vals,sinks,pr,st,count,parts,lane,sg);
+            else attention_partial<4,false,true>(qr,keys,vals,sinks,pr,st,count,parts,lane,sg,sk);
+            threadgroup_barrier(mem_flags::mem_threadgroup);   // frt_qs is reused by the next row
+        }
+        TEAM_SYNC();
+        for(uint r=0;r<FRT_ROWS;++r) {
+            device float* pr=partials+r*FRT_ROW_PARTIALS;
+            device float* st=statistics+r*FRT_ROW_STATS;
+            device float* table=(device float*)(workspace+r*FRT_ROW_WS);   // a's sums table (workspace row head)
+            if(row_rounded[r]) attention_merge_table<true>(a+r*FRT_ROW_WS,pr,st,row_parts[r],table,lane,sg);
+            else attention_merge_table<false>(a+r*FRT_ROW_WS,pr,st,row_parts[r],table,lane,sg);
+        }
+        SYNC();
+        q4_rows<4096>(weight_matrix(weights,d+D_O),(const device bfloat16_t*)a,FRT_ROW_WS,(const device float*)workspace,
+                      FRT_ROW_WS/2u,o,FRT_ROW_WS,lane,sg,FRT_GROUPS);
+        SYNC();
+        FRT_UNROLL for(uint r=0;r<FRT_ROWS;++r) {
+            for(uint j=0;j<8;++j){uint i=(tid+(j/4)*256)*4+j%4;h[r][j]=rb(h[r][j]+bf16_f(o[r*FRT_ROW_WS+i]));}
+            rms_2048_table(h[r],(const device bfloat16_t*)(weights+d[D_POST_NORM]),n+r*2048,nsum+r*128,tid,lane,simd,reduction);
+        }
+        if(sparse) {
+            route_dot_rows(n,(const device bfloat16_t*)(weights+d[D_ROUTER]),statistics,lane,sg);
+            SYNC();
+            // Every threadgroup selects every row's six experts (SIMD group r: row r); then all SIMD groups share one
+            // list of gate/up row pairs (each row's six experts, then the shared expert for all rows) and, after a
+            // barrier, one list of down row quads. Each item's arithmetic is that of the resident step.
+            if(simd<FRT_ROWS)
+                route_all((const device float*)(weights+d[D_BIAS]),statistics+simd*FRT_ROW_STATS,vids+simd*8,vchosen+simd*8,lane);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                constexpr uint units=6u*FRT_ROWS;
+                for(uint item=sg;item<units*256u+512u;item+=FRT_GROUPS) {
+                    if(item<units*256u) {
+                        const uint unit=item/256u,r=unit/6u,rank=unit%6u;
+                        routed_gateup_pair(weights,d,n+r*2048,nsum+r*128,vids[r*8+rank],(item%256u)*2u,
+                                           act+r*FRT_ROW_WS+rank*512,lane);
+                    } else shared_gateup_pair(weights,d,n,nsum,(item-units*256u)*2u,act,lane);
+                }
+                SYNC();
+                // sums tables of the down inputs: routed (row, rank) at xsum[(r * 6 + rank) * 32], shared after them
+                for(uint i=tid;i<units*32u;i+=256u) {
+                    const uint unit=i/32u,r=unit/6u,rank=unit%6u;
+                    xsum[i]=sum16_words(words((const device bfloat16_t*)(act+r*FRT_ROW_WS+rank*512+(i%32u)*16u)));
+                }
+                sums_table<1024>((const device bfloat16_t*)(act+6*512),FRT_ROW_WS,xsum+units*32u,tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const Matrix sd=weight_matrix(weights,d+D_SH_DOWN);
+                for(uint item=sg;item<units*512u+512u;item+=FRT_GROUPS) {
+                    if(item<units*512u) {
+                        const uint unit=item/512u,r=unit/6u,rank=unit%6u;
+                        routed_down_quad(weights,d,act+r*FRT_ROW_WS+rank*512,xsum+unit*32u,vids[r*8+rank],(item%512u)*4u,
+                                         down+r*FRT_ROW_WS+rank*2048,lane);
+                    } else q4_rows_block<1024>(sd,(const device bfloat16_t*)(act+6*512),FRT_ROW_WS,
+                                               (const threadgroup float*)(xsum+units*32u),64u,down+6*2048,FRT_ROW_WS,lane,
+                                               (item-units*512u)*4u);
+                }
+            }
+            SYNC();
+            FRT_UNROLL for(uint r=0;r<FRT_ROWS;++r) {
+                const device bfloat16_t* dr=down+r*FRT_ROW_WS;
+                float chosen=lane<6?vchosen[r*8+lane]:0.0f;
+                float total=0.0f;
+                for(uint j=0;j<6;++j)total=simd_shuffle(chosen,j)+total;
+                total+=1.0e-20f;
+                float weight=lane<6?chosen/total:0.0f;
+                float sums[8];
+                for(uint j=0;j<8;++j) {
+                    uint i=(tid+(j/4)*256)*4+j%4;
+                    sums[j]=rb(bf16_f(dr[i])*rb(simd_shuffle(weight,ushort(0))))+0.0f;
+                }
+                for(uint j=0;j<8;++j)for(uint e=1;e<6;++e) {
+                    uint i=(tid+(j/4)*256)*4+j%4;
+                    sums[j]=rb((rb(bf16_f(dr[e*2048+i])*rb(simd_shuffle(weight,ushort(e))))+0.0f)+sums[j]);
+                }
+                for(uint j=0;j<8;++j) {
+                    uint i=(tid+(j/4)*256)*4+j%4;
+                    float mlp=rb(rb(sums[j])+bf16_f(dr[6*2048+i]));
+                    h[r][j]=rb(h[r][j]+mlp);
+                }
+            }
+        } else {
+            Matrix gm=weight_matrix(weights,d+D_GATE),um=weight_matrix(weights,d+D_UP),dm=weight_matrix(weights,d+D_DOWN);
+            q4_rows<2048>(gm,(const threadgroup bfloat16_t*)n,2048u,(const threadgroup float*)nsum,128u,gate,FRT_ROW_WS,lane,sg,FRT_GROUPS);
+            q4_rows<2048>(um,(const threadgroup bfloat16_t*)n,2048u,(const threadgroup float*)nsum,128u,up,FRT_ROW_WS,lane,sg,FRT_GROUPS);
+            SYNC();
+            for(uint r=0;r<FRT_ROWS;++r)for(uint i=index;i<gm.n;i+=FRT_THREADS) {
+                act[r*FRT_ROW_WS+i]=bfloat16_t(swiglu_bf16(bf16_f(gate[r*FRT_ROW_WS+i]),bf16_f(up[r*FRT_ROW_WS+i]),false));
+            }
+            SYNC();
+            sums_table<6144>((const device bfloat16_t*)act,FRT_ROW_WS,xsum,tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            q4_rows<6144>(dm,(const device bfloat16_t*)act,FRT_ROW_WS,(const threadgroup float*)xsum,384u,down,FRT_ROW_WS,lane,sg,
+                          FRT_GROUPS);
+            SYNC();
+            FRT_UNROLL for(uint r=0;r<FRT_ROWS;++r)for(uint j=0;j<8;++j) {
+                uint i=(tid+(j/4)*256)*4+j%4;
+                h[r][j]=rb(h[r][j]+bf16_f(down[r*FRT_ROW_WS+i]));
+            }
+        }
+    }
+    FRT_UNROLL for(uint r=0;r<FRT_ROWS;++r)
+        rms_2048_table(h[r],(const device bfloat16_t*)(weights+final[D_FINAL_NORM]),n+r*2048,nsum+r*128,tid,lane,simd,reduction);
+    if(group<32) q4_rows<2048>(weight_matrix(weights,final+D_HEAD),(const threadgroup bfloat16_t*)n,2048u,
+                               (const threadgroup float*)nsum,128u,row_logits,FRT_VOCAB,lane,sg,256);
+    SYNC();
+    // Greedy choice per row: group maxima (ties: lowest id), one barrier, then every group picks the same tokens.
+    threadgroup uint* words=(threadgroup uint*)frt_qs;
+    for(uint r=0;r<FRT_ROWS;++r) {
+        const device bfloat16_t* logits=row_logits+r*FRT_VOCAB;
+        float best=-as_type<float>(0x7f800000u);
+        uint selected=0xffffffffu;
+        for(uint word=index;word<FRT_VOCAB;word+=FRT_THREADS) {
+            float value=float(logits[word]);
+            if(value>best || (value==best && word<selected)){best=value;selected=word;}
+        }
+        float peak=simd_max(best);
+        uint first=simd_min(best==peak?selected:0xffffffffu);
+        if(lane==0){reduction[simd]=peak;words[simd]=first;}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(simd==0) {
+            float value=lane<8?reduction[lane]:-as_type<float>(0x7f800000u);
+            uint word=lane<8?words[lane]:0xffffffffu;
+            float maximum=simd_max(value);
+            uint pick=simd_min(value==maximum?word:0xffffffffu);
+            device float* st=statistics+r*FRT_ROW_STATS;
+            if(lane==0){st[group*2]=maximum;((device uint*)st)[group*2+1]=pick;}
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    SYNC();
+    if(simd==0) {
+        for(uint r=0;r<FRT_ROWS;++r) {
+            const device float* st=statistics+r*FRT_ROW_STATS;
+            float value=-as_type<float>(0x7f800000u);
+            uint word=0xffffffffu;
+            for(uint peer=lane;peer<FRT_WORKERS;peer+=32) {
+                float other=st[peer*2];
+                uint other_word=((const device uint*)st)[peer*2+1];
+                if(other>value || (other==value && other_word<word)){value=other;word=other_word;}
+            }
+            float maximum=simd_max(value);
+            uint pick=simd_min(value==maximum?word:0xffffffffu);
+            if(lane==0)choice[r]=pick;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint accepted=0;
+    while(accepted+1<FRT_ROWS && tokens[accepted+1]==choice[accepted])++accepted;
+    if(index==0) {
+        packet[0]=accepted;
+        for(uint r=0;r<FRT_ROWS;++r)packet[1+r]=choice[r];
+        packet[16]=accepted+1;
+    }
+    // Commit the sliding-layer K/V of accepted draft rows to their ring slots.
+    const uint per_layer=accepted*1024u;
+    for(uint i=index;i<FRT_LAYERS*per_layer;i+=FRT_THREADS) {
+        const uint layer=i/per_layer,rest=i%per_layer,r=1+rest/1024u,e=rest%1024u;
+        const device ulong* ld=layers+layer*64;
+        if((ld[D_FLAGS]&1)!=0)continue;
+        const uint cap=uint(ld[D_KV_CAP]),pos=position+r;
+        const uint insert=params.initial>=cap?(pos%cap+cap-params.initial%cap)%cap:pos%cap;
+        const uint sel=e/512u,head=(e%512u)/128u,dim=e%128u;
+        KVView keys={kv,ld[D_KV],cap};
+        KVView target=sel==0?keys:keys.value();
+        target.store(head,insert,dim,side[(size_t(layer)*(FRT_ROWS-1)+(r-1))*1024u+e]);
+    }
+    if(tid==0)diagnostic[group]=0;
+}
+#endif
 )MSL";
 }
 
