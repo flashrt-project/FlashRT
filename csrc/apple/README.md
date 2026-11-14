@@ -8,6 +8,10 @@ filenames, not in a model-stage bundle such as "vision" or "transformer".
 common/source.h                  Metal / TensorOps include preambles
 gemm/bf16_tensor_ops.h            GEMM core, bias and strided-output epilogues
 gemm/int8_tensor_ops.h            opt-in W8A8, INT32 accumulation, BF16 output
+gemm/w4a16_affine_tensor_ops.h    affine int4 (g64) x BF16: residual / SwiGLU epilogues,
+                                  expert-grouped blocks, MLX split-K partitioning
+gemm/w4a16_affine_qmv.h           affine int4 (g64) x BF16 row vectors (MLX qmv_fast /
+                                  qmv_wide arithmetic)
 quantize/bf16_int8_rowwise.h      dynamic per-token scale, nearest-even packing
 quantize/amax_channel_bf16.h      setup-only BF16 channel maxima for SmoothQuant
 quantize/gelu_mul_int8_rowwise.h  BF16 GELU multiply + SmoothQuant row packing
@@ -17,6 +21,8 @@ attention/
   gqa_online_bf16.h               online-softmax GQA
   gqa_split_bf16.h                BF16 Q/K/V -> FP32 partials and statistics
   gqa_merge_fp32_bf16.h           FP32 partials -> BF16 output
+  gqa8_causal_prefill_bf16.h      GQA-8 causal / sliding-window prefill with sinks (TensorOps)
+  gqa8_causal_prefill_mma_bf16.h  the same on 8x8 SIMD-group MMAs (default prefill path)
 conv/
   patch_pack_bf16.h               NHWC patch extraction
   patch_probe_bf16.h              diagnostic NCHW patch view
@@ -30,6 +36,7 @@ kernels/
   residual_bf16.h
   rope_bf16.h
   position_add_bf16.h
+  gumbel_noise_f32.h              counter-based Gumbel noise rows for sampling
 kernel_registry.h                dispatch name -> source builder / entry point
 ```
 
@@ -57,6 +64,13 @@ to write KV at a uniform-controlled element offset; buffer bindings stay fixed.
 The ICB remains unchanged. Whole surplus threadgroups return before GEMM,
 RMSNorm and GQA work; every per-token producer uses the actual row extent.
 Weight packing, buffer allocation and compilation stay in setup.
+
+The w4a16 affine GEMM / row-vector kernels, the GQA-8 prefill attention and the
+Gumbel noise rows are model independent (shape constraints stated in each
+header). The affine kernels keep MLX affine int4 weights and reproduce MLX's
+arithmetic for each operation, including the reduction orders MLX uses for a
+given row count (split-K partitions, vector paths); the headers state the
+reproduced rule.
 
 ## Adding a precision or implementation
 

@@ -1,16 +1,21 @@
 #pragma once
 #include "attention/attention_d72_bf16.h"
 #include "attention/attention_simd_bf16.h"
+#include "attention/gqa8_causal_prefill_bf16.h"
+#include "attention/gqa8_causal_prefill_mma_bf16.h"
 #include "attention/gqa_merge_fp32_bf16.h"
 #include "attention/gqa_online_bf16.h"
 #include "attention/gqa_split_bf16.h"
 #include "conv/patch_pack_bf16.h"
 #include "conv/patch_probe_bf16.h"
 #include "gemm/bf16_tensor_ops.h"
+#include "gemm/w4a16_affine_qmv.h"
+#include "gemm/w4a16_affine_tensor_ops.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
 #include "kernels/gelu_bf16.h"
 #include "kernels/gelu_mul_bf16.h"
+#include "kernels/gumbel_noise_f32.h"
 #include "kernels/layer_norm_bf16.h"
 #include "kernels/position_add_bf16.h"
 #include "kernels/residual_bf16.h"
@@ -79,6 +84,49 @@ inline constexpr KernelSource kernel_registry[] = {
     {"tr_residual", "tr_residual", residual_bf16_source},
     {"tr_rope", "tr_rope", [] { return rope_bf16_source(); }},
     {"tr_rope_offsets", "tr_rope_offsets", [] { return rope_bf16_source(true); }},
+    // Affine int4 (group 64) weights x BF16 activations, TensorOps: plain, residual add, SwiGLU of two
+    // matrices, and expert-grouped variants (rows grouped by expert, stacked weights).
+    {"gemm_w4a16_affine", "gemm_w4a16_affine", [] { return gemm_w4a16_affine_source(); }},
+    {"gemm_w4a16_affine_residual", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.epilogue = 1; return gemm_w4a16_affine_source(o); }},
+    {"gemm_w4a16_affine_swiglu", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+    {"gemm_w4a16_affine_grouped", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.grouped = true; o.simdgroups = 4; return gemm_w4a16_affine_source(o); }},
+    {"gemm_w4a16_affine_grouped_swiglu", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.grouped = true; o.simdgroups = 4; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+    {"gemm_w4a16_affine_splitk", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.splitk = true; return gemm_w4a16_affine_source(o); }},
+    {"gemm_w4a16_affine_splitk_residual", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.splitk = true; o.epilogue = 1; return gemm_w4a16_affine_source(o); }},
+    {"gemm_w4a16_affine_splitk_swiglu", "gemm_w4a16_affine",
+     [] { W4A16Options o; o.splitk = true; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+    // Affine int4 (group 64) matrix x BF16 row vectors (MLX qmv_fast arithmetic): one vector, and the
+    // chunk-row variants used where MLX's matmul takes its vector path (plain, residual, SwiGLU, grouped).
+    {"qmv_w4a16_affine", "qmv_w4a16_affine", [] { return qmv_w4a16_affine_source(); }},
+    {"qmv_w4a16_affine_rows", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_rows_residual", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.epilogue = 1; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_rows_swiglu", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.epilogue = 2; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_wide", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.wide = true; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_wide_residual", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.wide = true; o.epilogue = 1; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_wide_swiglu", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.wide = true; o.epilogue = 2; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_rows_grouped", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.grouped = true; return qmv_w4a16_affine_source(o); }},
+    {"qmv_w4a16_affine_rows_grouped_swiglu", "qmv_w4a16_affine",
+     [] { QmvOptions o; o.rows = true; o.grouped = true; o.epilogue = 2; return qmv_w4a16_affine_source(o); }},
+    // GQA-8 causal / sliding-window prefill attention with sinks (MLX fused-attention arithmetic):
+    // SIMD-group MMAs and TensorOps.
+    {"gqa8_causal_prefill_bf16", "gqa8_causal_prefill_bf16", [] { return gqa8_causal_prefill_bf16_source(); }},
+    {"gqa8_causal_prefill_mma_bf16", "gqa8_causal_prefill_mma_bf16",
+     [] { return gqa8_causal_prefill_mma_bf16_source(); }},
+    // Counter-based Gumbel noise rows for sampling.
+    {"gumbel_noise_f32", "gumbel_noise_f32", gumbel_noise_f32_source},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {
