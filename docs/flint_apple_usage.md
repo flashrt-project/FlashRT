@@ -61,6 +61,14 @@ the same tokens; the reference engine's prompt cache instead re-prefills
 generated tokens in the background, so the two caches are not bit-identical
 either.
 
+Lookup decoding (greedy only): build the frontend with `lookup_rows=3` and pass
+`lookup=True` to `stream` / `generate`. Draft tokens come from earlier
+occurrences of the sequence's last 6..4 tokens in the prompt and the generated
+text; one verification step computes the last token and up to `lookup_rows - 1`
+drafts as consecutive positions and keeps the drafts that equal greedy's
+choice. The tokens are exactly plain greedy decoding's (see *Lookup decoding*
+under *M4 Pro numbers*).
+
 ### OpenAI-compatible server
 
 ```bash
@@ -80,6 +88,7 @@ with `--mlx-dir` it also accepts `temperature`, `top_p`, `top_k` and `seed`.
 | Programs (decode, chunked prefill, LM head, noise) | `flash_rt/models/flint/pipeline_mps.py` |
 | Runtime (weights, buffers, KV, parameter blocks) | `flash_rt/frontends/torch/_flint_mps_runtime.py` |
 | Frontend (tokenizer, streaming, prefix reuse) | `flash_rt/frontends/torch/flint_mps.py` |
+| Lookup decoding (n-gram drafts, verification policy) | `flash_rt/models/flint/lookup.py` |
 | Flint kernels (geometry-specialized) | `csrc/apple/flint/`: resident decode step, prefill rows, router and expert placement |
 | Model-independent kernels | `csrc/apple/gemm/w4a16_affine_*`, `csrc/apple/attention/gqa8_causal_prefill_mma_bf16.h` (and the TensorOps variant `gqa8_causal_prefill_bf16.h`), `csrc/apple/kernels/gumbel_noise_f32.h` |
 | Benchmark drivers | `examples/apple/flint_benchmark.py`, `examples/apple/flint_rec_benchmark.py` (reference engine, optional) |
@@ -129,6 +138,13 @@ chunk's start, row count and ring layout are read from a state buffer.
   keys; global layers with more keys use an MMA attention schedule whose
   reordering stays within the reference engine's own reordering band (see
   *Validation*).
+* Verification step (lookup decoding): every row's logits are bit-identical to
+  the `greedy` step at its position. Sliding-layer K/V of draft rows stay in a
+  side buffer until accepted, so rejected drafts leave the cache as `greedy`
+  would. The step rounds to BF16 in integer arithmetic (equal to the hardware
+  conversion for every FP32 arithmetic result, which this GPU flushes to zero
+  below the normal range) because the compiler packs the hardware conversion's
+  16-bit results of different rows into one register and corrupts one.
 
 ## Validation
 
@@ -244,6 +260,30 @@ first token to the last.
 | 64K | 50.1 | 63.5 (+27%) | 49.3 | 64.0 (+30%) |
 | 128K | 29.7 | 42.0 (+41%) | 29.5 | 41.9 (+42%) |
 
+### Lookup decoding
+
+Greedy decoding with verification steps (`--lookup 3` in the FlashRT driver:
+up to two drafts per step), same session and prompts as plain greedy, 1024
+output tokens; the generated tokens' SHA256 equals plain greedy's at every
+prompt.
+
+| Context | Greedy, FlashRT | Lookup, FlashRT | Drafts accepted (1K) |
+|---|---|---|---|
+| 1K | 138.3 | 158.2 (+14%) | 510 of 607 |
+| 4K | 131.5 | 154.3 (+17%) | |
+| 8K | 124.2 | 141.5 (+14%) | |
+| 16K | 111.5 | 122.2 (+10%) | |
+| 32K | 91.6 | 102.5 (+12%) | |
+
+The gain depends on how often the continuation repeats earlier text: these
+prompts are Python source, whose greedy continuations repeat a lot (50-95% of
+drafts accepted). Without matching n-grams the policy runs plain resident steps
+(1, 2, 4, then 8 per dispatch), so non-repeating text decodes at plain greedy's
+speed. A step costs more than one greedy step because every row reads its own
+six routed experts and attends over its own keys (1K: 1.6 greedy steps for two
+rows, 2.2 for three, 3.0 for four); the policy grows the draft only after a
+fully accepted step.
+
 ### Reproduce
 
 Build the plan library (*Requirements*) and create the token fixtures once:
@@ -275,6 +315,9 @@ PYTHONPATH=. python examples/apple/flint_benchmark.py --mlx-dir "<path-to-flint-
 # 16K and longer: one prefill per prompt.
 PYTHONPATH=. python examples/apple/flint_benchmark.py --mlx-dir "<path-to-flint-int4>" \
     --prefill-reps 0 --tokens $P-16384.i32 $P-32768.i32 $P-65536.i32 $P-131072.i32
+# Lookup decoding next to plain greedy (decode only).
+PYTHONPATH=. python examples/apple/flint_benchmark.py --mlx-dir "<path-to-flint-int4>" \
+    --phase decode --sampling greedy --lookup 3 --tokens $P-1024.i32 $P-4096.i32 $P-8192.i32
 "<rec-python>" examples/apple/flint_rec_benchmark.py --model-dir "<rec-model-dir>" \
     --prefill-reps 0 --tokens $P-16384.i32 $P-32768.i32 $P-65536.i32 $P-131072.i32
 ```
@@ -290,6 +333,8 @@ before every decode run, so each run continues the same prompt.
 ## Limitations
 
 * Batch size 1; one cached sequence for prefix reuse.
+* Lookup decoding: greedy only (sampling would need draft acceptance by
+  probability, not equality); one verification step per dispatch.
 * Checkpoint: the kernels hard-code Flint's geometry; any other geometry is
   rejected with `FlintConfigError` before compilation.
 * Device: the decode step needs its 36 threadgroups of 256 threads resident at
