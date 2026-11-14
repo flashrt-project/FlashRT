@@ -66,11 +66,24 @@ Run timing without Metal validation or Instruments; use a separate process
 for tracing. No CMake or offline shader compiler is required by the build script.
 
 Both build paths hide C++ implementation symbols and use the same Mach-O
-allowlists: [`plan.exports`](plan.exports) (13 private plan C entry points)
+allowlists: [`plan.exports`](plan.exports) (16 private plan C entry points)
 and [`signpost.exports`](signpost.exports) (2 tracing entry points). Every link
 runs [`check_exports.sh`](../../scripts/apple/check_exports.sh), which fails
 on missing or extra exports. These are Apple adapter interfaces, separate
 from the frozen deployment runtime ABI.
+
+One plan can hold several programs over the same buffers and kernels.
+Operations recorded before the first `frt_apple_plan_program` call form
+program 0 (the single program of the Pi0.5 plans, run by
+`frt_apple_plan_run_timed`); each `frt_apple_plan_program` call starts program
+1, 2, ... and later dispatches and copies append to it. `frt_apple_plan_finish`
+seals every non-empty program into its own ICB (an empty additional program is
+an error), residency covers all of them, and
+`frt_apple_plan_run_program(plan, id, ...)` runs one as a command buffer;
+program 0 is unknown when nothing was recorded before the first additional
+program. `frt_apple_plan_profile_program` is the per-operation diagnostic of an
+additional program. The torch-free `flash_rt.hardware.apple_native.native.NativePlan`
+binding records only additional programs.
 
 ### Fixed vision + prefix + decoder replay
 

@@ -19,6 +19,9 @@ FRT_APPLE_PLAN_API int frt_apple_plan_copy(void*, uint32_t source, size_t source
 FRT_APPLE_PLAN_API int frt_apple_plan_dispatch(void*, const char* kernel, const uint32_t* buffers,
     const size_t* offsets, const uint32_t* access, size_t count,
     const size_t* groups, size_t threads, const char* label);
+// Start recording an additional program (ids 1, 2, ...); later dispatch/copy calls append to it.
+// Programs share the plan's buffers. Operations recorded before the first call form program 0.
+FRT_APPLE_PLAN_API int64_t frt_apple_plan_program(void*);
 FRT_APPLE_PLAN_API int frt_apple_plan_finish(void*);
 FRT_APPLE_PLAN_API int frt_apple_plan_residency(void*, uint32_t enabled);
 typedef struct frt_apple_plan_timing {
@@ -27,8 +30,14 @@ typedef struct frt_apple_plan_timing {
     double submit_host_s, gpu_start_s, gpu_end_s, return_host_s;
 } frt_apple_plan_timing;
 FRT_APPLE_PLAN_API int frt_apple_plan_run_timed(void*, uint32_t execution, frt_apple_plan_timing*);
+// Run one sealed program (0 = operations recorded before frt_apple_plan_program) as one command buffer.
+FRT_APPLE_PLAN_API int frt_apple_plan_run_program(void*, uint32_t program, uint32_t execution,
+    frt_apple_plan_timing*);
 // Diagnostic only: one synchronous command buffer per operation, in plan order.
 FRT_APPLE_PLAN_API int frt_apple_plan_profile(void*, frt_apple_plan_timing*, size_t count);
+// Diagnostic only: the same for program ids >= 1 (count = operations recorded into that program).
+FRT_APPLE_PLAN_API int frt_apple_plan_profile_program(void*, uint32_t program, frt_apple_plan_timing*,
+    size_t count);
 #ifdef __cplusplus
 }
 #endif
