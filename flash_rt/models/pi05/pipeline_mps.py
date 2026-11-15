@@ -28,8 +28,9 @@ class Pi05PipelineMps(Pi05TorchPipeline):
         Set dynamic_prompt=False for exact-shape diagnostics. Use forward_native
         for CPU inputs and CPU actions without MPS input/output staging.
         fused=False selects the original unfused BF16 lowering for A/B checks.
-        neural_engine=dict(...) opts into splitting each prefix FFN with a Core ML
-        program on the Neural Engine (FP16 share, needs coremltools to build).
+        neural_engine=True (or a dict of FusedPlan coprocessor overrides) opts into
+        splitting the vision and prefix FFNs with Core ML programs on the Neural Engine
+        (FP16 shares, needs coremltools to build).
         """
         from flash_rt.models.pi05.native_plan_mps import NativePi05Plan
         native = NativePi05Plan(self, prompt_len, library=library,

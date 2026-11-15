@@ -279,8 +279,9 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
             if (!copy) ++p->dispatch_count;
             p->nodes.push_back(std::move(node));
         }
+        // Task ids are plan-wide; a program contains a subset of them, each signalled then waited.
         for (int state : task_state)
-            require(state == 2, "external task needs one signal followed by one wait");
+            require(state != 1, "external task needs one signal followed by one wait");
         if (!p->signal_order.empty()) {
             p->event = [impl_->device newSharedEvent];
             if (!p->event) throw failure("create shared event", nil);

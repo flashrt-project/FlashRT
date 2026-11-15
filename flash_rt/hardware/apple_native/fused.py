@@ -59,8 +59,9 @@ class FusedPlan(Plan):
         super().__init__(library)
         self.fuse_epilogues = fuse_epilogues
         self.tune_tiles = tune_tiles
-        # coprocessor: dict(hidden=channels per FFN on the Neural Engine (default: 5/8 of the
-        #                   FFN, the measured M4 Pro balance with the GPU share), stages=("prefix",),
+        # coprocessor: dict(hidden=channels per FFN on the Neural Engine, an int or {stage: int}
+        #                   (default: 5/8 of the FFN rounded to 512, the measured M4 Pro balance
+        #                   with the GPU share), stages=("prefix",),
         #                   spatial=4, cache_dir=None, compute_units="cpu_and_ne")
         self.coprocessor = None
         if coprocessor is not None:
@@ -69,7 +70,8 @@ class FusedPlan(Plan):
             if unknown:
                 raise ValueError(f"Unknown coprocessor options: {sorted(unknown)}")
             cfg.update(coprocessor)
-            if (cfg["hidden"] is not None and cfg["hidden"] <= 0) or cfg["spatial"] <= 0:
+            sizes = cfg["hidden"].values() if isinstance(cfg["hidden"], dict) else [cfg["hidden"]]
+            if any(h is not None and h <= 0 for h in sizes) or cfg["spatial"] <= 0:
                 raise ValueError("Coprocessor hidden channels and spatial rows must be positive")
             self.coprocessor = cfg
         self.coprocessor_tasks = []
@@ -82,12 +84,13 @@ class FusedPlan(Plan):
     # ------------------------------------------------------------------ recording
     def linear(self, out, x, w, bias=None):
         held = self._pending
-        if (held is not None and "ffn" in held and "down" not in held and bias is None
+        if (held is not None and "ffn" in held and "down" not in held
+                and (bias is None or not held["ffn"]["gated"])
                 and self.bind(out, allow_strided=True).contiguous()
                 and _same(self.bind(x), held["ffn"]["hidden"]) and w.shape[-1] == held["ffn"]["gemm"]["k"]):
             x, out = self.bind(x), self.bind(out)
             m, k, n = math.prod(x.shape[:-1]), x.shape[-1], w.shape[-1]
-            down = dict(out=out, x=x, w=w, bias=None, m=m, n=n, k=k, stage=self.stage, small=False)
+            down = dict(out=out, x=x, w=w, bias=bias, m=m, n=n, k=k, stage=self.stage, small=False)
             self._pending = dict(held, down=down)
             return
         self._flush()
@@ -108,7 +111,7 @@ class FusedPlan(Plan):
         if pending is not None and "ffn" in pending:
             if "down" in pending and self._coprocess(pending, name, tensors, params):
                 return
-            self._emit_gelu_mul(pending["ffn"]["gemm"], pending["ffn"]["hidden"])
+            self._emit_ffn_gpu(pending["ffn"])
             pending = pending.get("down")
         if pending is not None:
             if pending.get("residual") is not None:
@@ -133,7 +136,7 @@ class FusedPlan(Plan):
     def _flush(self):
         pending, self._pending = self._pending, None
         if pending is not None and "ffn" in pending:
-            self._emit_gelu_mul(pending["ffn"]["gemm"], pending["ffn"]["hidden"])
+            self._emit_ffn_gpu(pending["ffn"])
             pending = pending.get("down")
         if pending is not None and pending.get("residual") is not None:
             self._emit_splitk_residual(pending, None)
@@ -179,6 +182,14 @@ class FusedPlan(Plan):
             finally:
                 self.stage = current
 
+    def _emit_ffn_gpu(self, ffn):
+        if ffn["gated"]:
+            self._emit_gelu_mul(ffn["gemm"], ffn["hidden"])
+        else:
+            p = ffn["gemm"]
+            self._gemm("_bias_gelu", p, ffn["hidden"], p["w"], p["n"], (p["bias"],))
+            self.fused.append(("bias_gelu", p["stage"], (p["m"], p["n"], p["k"])))
+
     def _emit_gelu_mul(self, p, out):
         tm, tn, sg = self._tile(p["m"], p["n"], p["k"])
         weight = self._packed_gelu_mul(p["w"], tn // 2)
@@ -186,38 +197,48 @@ class FusedPlan(Plan):
         self.fused.append(("gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))
 
     # ------------------------------------------------------------- coprocessor FFN
-    def _coprocessor_share(self, p):
-        """(gpu_hidden, coprocessor_hidden) for an eligible gated FFN GEMM, else None."""
+    def _coprocessor_share(self, p, *, gated):
+        """(gpu_hidden, coprocessor_hidden) for an eligible FFN up-projection GEMM, else None."""
         cfg = self.coprocessor
         if cfg is None or p["stage"] not in cfg["stages"]:
             return None
-        hidden = p["n"] // 2
-        share = cfg["hidden"] if cfg["hidden"] is not None else hidden * 5 // 8 // 512 * 512
+        hidden = p["n"] // 2 if gated else p["n"]
+        share = cfg["hidden"].get(p["stage"]) if isinstance(cfg["hidden"], dict) else cfg["hidden"]
+        if share is None:
+            share = hidden * 5 // 8 // 512 * 512
         share = min(share, hidden)
         gpu = hidden - share
         if gpu <= 0:
             return None
+        if not gated:
+            return gpu, share
         tm, tn, sg = self._tile(p["m"], 2 * gpu, p["k"])
         return (gpu, share) if gpu % (tn // 2) == 0 else None
 
     def _coprocess(self, pending, name, tensors, params):
         if not (name == "tr_residual" and len(params) == 3 and params[2] == 0):
             return False
-        g, d = pending["ffn"]["gemm"], pending["down"]
+        g, d, gated = pending["ffn"]["gemm"], pending["down"], pending["ffn"]["gated"]
         residual, update, out = (self.bind(t) for t in tensors[:3])
         if not (_same(update, d["out"]) and _same(out, residual)):
             return False
         from . import neural_engine
 
         cfg = self.coprocessor
-        gpu, share = self._coprocessor_share(g)
-        m, channels, hidden = g["m"], g["k"], g["n"] // 2
+        gpu, share = self._coprocessor_share(g, gated=gated)
+        m, channels = g["m"], g["k"]
+        hidden = g["n"] // 2 if gated else g["n"]
         spatial = cfg["spatial"]
         capacity = (int(m) + spatial - 1) // spatial * spatial
         w, wd = g["w"].tensor, d["w"].tensor
-        model, input_name, output_name, shape = neural_engine.gated_ffn_share(
-            w[:, gpu:hidden], w[:, hidden + gpu:], wd[gpu:], rows=capacity, spatial=spatial,
-            cache_dir=cfg["cache_dir"])
+        if gated:
+            model, input_name, output_name, shape = neural_engine.gated_ffn_share(
+                w[:, gpu:hidden], w[:, hidden + gpu:], wd[gpu:], rows=capacity, spatial=spatial,
+                cache_dir=cfg["cache_dir"])
+        else:
+            model, input_name, output_name, shape = neural_engine.gelu_ffn_share(
+                w[:, gpu:], g["bias"].tensor[gpu:], wd[gpu:], rows=capacity, spatial=spatial,
+                cache_dir=cfg["cache_dir"])
         current = self.stage
         try:
             self.stage = g["stage"]
@@ -228,25 +249,33 @@ class FusedPlan(Plan):
             Plan.dispatch(self, "pack_channels_f16", [g["x"], packed_in], {1}, [m, channels, capacity],
                           ((capacity + 31) // 32, (channels + 31) // 32), 256)
             self.external(task, wait=False)
-            # GPU share: leading hidden channels of gate and up, then K-range [0, gpu) of down.
-            tm, tn, sg = self._tile(m, 2 * gpu, channels)
-            key = ("ffn_share", w.untyped_storage().data_ptr(), w.storage_offset(), gpu, tn // 2)
-            if key not in self._repacked:
-                block = tn // 2
-                source = w.detach().to("cpu")
-                gate, up = source[:, :gpu], source[:, hidden:hidden + gpu]
-                packed = torch.stack((gate.reshape(channels, -1, block), up.reshape(channels, -1, block)), 2)
-                self._repacked[key] = Weight(packed.reshape(channels, 2 * gpu).contiguous(),
-                                             g["w"].name + f".gelu_mul{block}.share{gpu}")
+            # GPU share: leading hidden channels of the up projection(s), then K-range [0, gpu) of down.
             hidden_gpu = self.allocate((int(m), gpu))
-            self._gemm("_gelu_mul", dict(g, n=2 * gpu), hidden_gpu, self._repacked[key], 2 * gpu)
+            if gated:
+                tm, tn, sg = self._tile(m, 2 * gpu, channels)
+                key = ("ffn_share", w.untyped_storage().data_ptr(), w.storage_offset(), gpu, tn // 2)
+                if key not in self._repacked:
+                    block = tn // 2
+                    source = w.detach().to("cpu")
+                    gate, up = source[:, :gpu], source[:, hidden:hidden + gpu]
+                    packed = torch.stack((gate.reshape(channels, -1, block), up.reshape(channels, -1, block)), 2)
+                    self._repacked[key] = Weight(packed.reshape(channels, 2 * gpu).contiguous(),
+                                                 g["w"].name + f".gelu_mul{block}.share{gpu}")
+                self._gemm("_gelu_mul", dict(g, n=2 * gpu), hidden_gpu, self._repacked[key], 2 * gpu)
+            else:
+                up = Weight(w[:, :gpu].contiguous(), g["w"].name + f".share{gpu}")
+                up_bias = Weight(g["bias"].tensor[:gpu].contiguous(), g["bias"].name + f".share{gpu}")
+                self._repacked[("ffn_up", w.untyped_storage().data_ptr(), w.storage_offset(), gpu)] = (up, up_bias)
+                self._gemm("_bias_gelu", dict(g, n=gpu), hidden_gpu, up, gpu, (up_bias,))
             # The local down product needs only the GPU share; it runs before waiting.
             down = Weight(wd[:gpu], d["w"].name + f".share{gpu}")
             self._repacked[("ffn_down", wd.untyped_storage().data_ptr(), wd.storage_offset(), gpu)] = down
             local = self.allocate((int(m), d["n"]), itemsize=4)
             self._gemm("_f32", dict(d, x=hidden_gpu, k=gpu), local, down, d["n"])
             self.external(task, wait=True)
-            Plan.dispatch(self, "residual_add_partials_bf16", [local, partial, out], {2}, [m, d["n"], capacity],
+            bias = d["bias"] if d["bias"] is not None else out
+            Plan.dispatch(self, "residual_add_partials_bf16", [local, partial, out, bias], {2},
+                          [m, d["n"], capacity, int(d["bias"] is not None)],
                           ((capacity + 31) // 32, (d["n"] + 31) // 32), 256)
         finally:
             self.stage = current
@@ -356,9 +385,9 @@ class FusedPlan(Plan):
             tm, tn, sg = self._tile(p["m"], p["n"], p["k"])
             if (p["n"] // 2) % (tn // 2):
                 return False
-            if self._coprocessor_share(p) is not None:
+            if self._coprocessor_share(p, gated=True) is not None:
                 # Hold until the down projection and its residual show the whole FFN.
-                self._pending = dict(ffn=dict(gemm=p, hidden=out))
+                self._pending = dict(ffn=dict(gemm=p, hidden=out, gated=True))
                 return True
             self._emit_gelu_mul(p, out)
             return True
@@ -375,6 +404,9 @@ class FusedPlan(Plan):
             (target,) = (self.bind(t) for t in tensors)
             if not _same(target, p["out"]):
                 return False
+            if self._coprocessor_share(p, gated=False) is not None:
+                self._pending = dict(ffn=dict(gemm=p, hidden=target, gated=False))
+                return True
             self._gemm("_bias_gelu", p, target, p["w"], p["n"], (p["bias"],))
             self.fused.append(("bias_gelu", p["stage"], (p["m"], p["n"], p["k"])))
             return True

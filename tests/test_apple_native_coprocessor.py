@@ -81,3 +81,43 @@ def test_coprocessor_ffn_matches_gpu_lowering(tmp_path, m):
 def test_coprocessor_rejects_unknown_options():
     with pytest.raises(ValueError, match="Unknown coprocessor options"):
         FusedPlan(coprocessor=dict(width=1))
+
+
+def test_coprocessor_ungated_ffn_with_biases(tmp_path):
+    torch.manual_seed(8)
+    m, channels, hidden = 48, 192, 1536
+    up, up_bias = (torch.randn(channels, hidden) / channels ** 0.5).bfloat16(), (torch.randn(hidden) * 0.1).bfloat16()
+    down, down_bias = (torch.randn(hidden, channels) / hidden ** 0.5).bfloat16(), (torch.randn(channels) * 0.1).bfloat16()
+    x, residual = torch.randn(m, channels).bfloat16(), torch.randn(m, channels).bfloat16()
+
+    def build(plan):
+        plan.stage = "vision"
+        t = dict(x=plan.allocate((m, channels)), res=plan.allocate((m, channels)),
+                 hidden=plan.allocate((m, hidden)), out=plan.allocate((m, channels)))
+        plan.linear(t["hidden"], t["x"], Weight(up, "up"), Weight(up_bias, "up_b"))
+        plan.ops.gelu(t["hidden"], t["hidden"])
+        plan.linear(t["out"], t["hidden"], Weight(down, "down"), Weight(down_bias, "down_b"))
+        plan.ops.residual(t["res"], t["out"], t["res"])
+        plan.finish()
+        plan.set_resident(True)
+
+        def run(mode):
+            plan.write(t["x"], x)
+            plan.write(t["res"], residual)
+            plan.run(mode)
+            return plan.read(t["res"])
+        return run
+
+    gpu = FusedPlan()
+    split = FusedPlan(coprocessor=dict(hidden=512, stages=("vision",), cache_dir=tmp_path))
+    try:
+        reference = build(gpu)("icb")
+        run = build(split)
+        assert [f[0] for f in split.fused] == ["coprocessor_ffn"]
+        outputs = [run(mode) for mode in ("direct", "icb")]
+        np.testing.assert_array_equal(outputs[0], outputs[1])
+        error = np.linalg.norm(outputs[0] - reference) / np.linalg.norm(reference)
+        assert error < 0.01, error
+    finally:
+        gpu.close()
+        split.close()

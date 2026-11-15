@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 COMPUTE_UNITS = {"cpu_and_ne": 0, "all": 1, "cpu_and_gpu": 2, "cpu": 3}
-DOWN_CHUNKS = (2048, 1024, 512)   # input channels per down convolution, first that divides
+DOWN_CHUNKS = (2048, 1280, 1024, 512)   # input channels per down convolution, first that divides
 FORMAT_VERSION = "gated-ffn-share-1"
 
 
@@ -27,26 +27,41 @@ def default_cache_dir():
 
 
 def gated_ffn_share(gate, up, down, *, rows, spatial, cache_dir=None):
-    """Return (compiled model path, input name, output name, shape) for one FFN share.
+    """Return (compiled model path, input name, output name, shape) for one gated FFN share.
 
     gate/up: [channels, hidden] and down: [hidden, channels] tensors (any float dtype; CPU or device).
     rows must be a multiple of spatial; the program is fixed-shape.
     """
+    return _ffn_share(dict(gate=gate, up=up), down, rows=rows, spatial=spatial, cache_dir=cache_dir)
+
+
+def gelu_ffn_share(up, up_bias, down, *, rows, spatial, cache_dir=None):
+    """The same for an ungated FFN: down^T gelu_tanh(up^T x + up_bias); the down bias stays outside."""
+    return _ffn_share(dict(up=up, up_bias=up_bias), down, rows=rows, spatial=spatial, cache_dir=cache_dir)
+
+
+def _ffn_share(weights, down, *, rows, spatial, cache_dir):
     try:
         import coremltools as ct
         from coremltools.converters.mil import Builder as mb
         from coremltools.converters.mil.mil import types
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("Neural Engine FFN shares need coremltools (pip install coremltools)") from exc
-    channels, hidden = gate.shape
-    if up.shape != gate.shape or down.shape != (hidden, channels) or rows % spatial:
-        raise ValueError(f"Invalid FFN share shapes: gate={tuple(gate.shape)}, up={tuple(up.shape)}, "
-                         f"down={tuple(down.shape)}, rows={rows}, spatial={spatial}")
-    arrays = [t.detach().to("cpu").float().numpy().astype(np.float16) for t in (gate, up, down)]
+    gated = "gate" in weights
+    up = weights["up"]
+    channels, hidden = up.shape
+    if (gated and weights["gate"].shape != up.shape) or down.shape != (hidden, channels) or rows % spatial \
+            or (not gated and tuple(weights["up_bias"].shape) != (hidden,)):
+        raise ValueError(f"Invalid FFN share shapes: up={tuple(up.shape)}, down={tuple(down.shape)}, "
+                         f"rows={rows}, spatial={spatial}")
+    names_in = ("gate", "up") if gated else ("up", "up_bias")
+    arrays = [weights[k].detach().to("cpu").float().numpy().astype(np.float16) for k in names_in]
+    arrays.append(down.detach().to("cpu").float().numpy().astype(np.float16))
     if not all(np.isfinite(a).all() for a in arrays):
         raise ValueError("FFN share weights must be finite in FP16")
     shape = (1, channels, spatial, rows // spatial)
     digest = hashlib.sha256()
+    digest.update(b"gated" if gated else b"gelu")
     for a in arrays:
         digest.update(np.ascontiguousarray(a).tobytes())
     chunk = next((c for c in DOWN_CHUNKS if hidden % c == 0), hidden)
@@ -58,15 +73,22 @@ def gated_ffn_share(gate, up, down, *, rows, spatial, cache_dir=None):
     if compiled.is_dir() and meta.is_file():
         names = json.loads(meta.read_text())
         return str(compiled), names["input"], names["output"], shape
-    wg = np.ascontiguousarray(arrays[0].T)[:, :, None, None]
-    wu = np.ascontiguousarray(arrays[1].T)[:, :, None, None]
+    if gated:
+        wg = np.ascontiguousarray(arrays[0].T)[:, :, None, None]
+        wu = np.ascontiguousarray(arrays[1].T)[:, :, None, None]
+    else:
+        wu = np.ascontiguousarray(arrays[0].T)[:, :, None, None]
+        bu = arrays[1]
     wd = np.ascontiguousarray(arrays[2].T)[:, :, None, None]            # [channels, hidden, 1, 1]
     parts = hidden // chunk
     chunks = np.split(wd, parts, axis=1)
 
     @mb.program(input_specs=[mb.TensorSpec(shape=shape, dtype=types.fp16)], opset_version=ct.target.macOS15)
     def program(x):
-        h = mb.mul(x=mb.gelu(x=mb.conv(x=x, weight=wg), mode="TANH_APPROXIMATION"), y=mb.conv(x=x, weight=wu))
+        if gated:
+            h = mb.mul(x=mb.gelu(x=mb.conv(x=x, weight=wg), mode="TANH_APPROXIMATION"), y=mb.conv(x=x, weight=wu))
+        else:
+            h = mb.gelu(x=mb.conv(x=x, weight=wu, bias=bu), mode="TANH_APPROXIMATION")
         pieces = mb.split(x=h, num_splits=parts, axis=1) if parts > 1 else [h]
         y = None
         for piece, weight in zip(pieces, chunks):

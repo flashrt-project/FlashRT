@@ -30,9 +30,11 @@ kernel void pack_channels_f16(device const bfloat* x [[buffer(0)]], device half*
 }
 // Completes a residual GEMM whose K range was split between an FP32 row-major partial G
 // [rows, channels] and a channel-major FP16 partial P [channels, capacity] from the other
-// engine: R = BF16(R + BF16(G + P)), in place, with P transposed through threadgroup tiles.
+// engine: R = BF16(R + BF16(G + P)), or with a bias R = BF16(R + BF16(BF16(G + P) + b)) (the
+// GEMM -> BF16 -> bias -> BF16 rule), in place, with P transposed through threadgroup tiles.
+struct PartialSum { uint rows, channels, capacity, bias; };
 kernel void residual_add_partials_bf16(device const float* g [[buffer(0)]], device const half* q [[buffer(1)]],
-    device bfloat* r [[buffer(2)]], constant ChannelPack& p [[buffer(3)]],
+    device bfloat* r [[buffer(2)]], device const bfloat* bias [[buffer(3)]], constant PartialSum& p [[buffer(4)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float tile[32][33];
     uint lx = tid % 32, ly = tid / 32;
@@ -46,7 +48,9 @@ kernel void residual_add_partials_bf16(device const float* g [[buffer(0)]], devi
         uint row = row0 + i, channel = channel0 + lx;
         if (row < p.rows && channel < p.channels) {
             uint at = row * p.channels + channel;
-            r[at] = bfloat(float(r[at]) + float(bfloat(g[at] + tile[i][lx])));
+            float value = float(bfloat(g[at] + tile[i][lx]));
+            if (p.bias) value = float(bfloat(value + float(bias[channel])));
+            r[at] = bfloat(float(r[at]) + value);
         }
     }
 }

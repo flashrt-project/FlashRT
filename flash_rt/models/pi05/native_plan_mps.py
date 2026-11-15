@@ -6,6 +6,10 @@ import time
 from flash_rt.hardware.apple_native.plan import Attention, Plan, UIntParameter, Weight
 from flash_rt.models.pi05.torch_pipeline import PATCHES_PER_VIEW, Pi05TorchPipeline
 
+# Neural Engine shares of the SigLIP and Gemma-2B FFNs (hidden channels per layer), the
+# measured GPU/ANE balance on M4 Pro. neural_engine=True uses these; a dict overrides them.
+NEURAL_ENGINE_DEFAULTS = dict(stages=("vision", "prefix"), hidden=dict(vision=2048, prefix=10240))
+
 
 class NativePi05Plan:
     """Reuse one plan across prompt lengths within the declared capacity."""
@@ -36,8 +40,12 @@ class NativePi05Plan:
             raise ValueError("pad_prompt requires dynamic_prompt=True")
         if dynamic_prompt and int8_options is not None and int8_options.get("observe"):
             raise ValueError("Calibration requires dynamic_prompt=False to observe only real tokens")
-        if neural_engine is not None and (not fused or int8_options is not None):
-            raise ValueError("neural_engine requires the fused BF16 plan")
+        if neural_engine is not None and neural_engine is not False:
+            if not fused or int8_options is not None:
+                raise ValueError("neural_engine requires the fused BF16 plan")
+            neural_engine = dict(NEURAL_ENGINE_DEFAULTS, **({} if neural_engine is True else neural_engine))
+        else:
+            neural_engine = None
         if int8_options is None:
             # fused=False reproduces the original one-dispatch-per-operation lowering.
             # neural_engine (opt-in) splits each prefix FFN between GPU and a Core ML
