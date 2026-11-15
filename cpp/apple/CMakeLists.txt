@@ -21,8 +21,11 @@ set_target_properties(flashrt_apple PROPERTIES OBJCXX_STANDARD 17
   OBJCXX_STANDARD_REQUIRED YES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(flashrt_apple PRIVATE -fobjc-arc)
 target_link_libraries(flashrt_apple PUBLIC "-framework Foundation" "-framework Metal")
-add_library(flashrt_apple_plan SHARED src/plan.cpp)
-target_link_libraries(flashrt_apple_plan PRIVATE flashrt_apple)
+add_library(flashrt_apple_plan SHARED src/plan.cpp src/coreml.mm)
+set_target_properties(flashrt_apple_plan PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED YES)
+target_compile_options(flashrt_apple_plan PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+# Core ML runs the optional external tasks (Neural Engine shares) recorded in a plan.
+target_link_libraries(flashrt_apple_plan PRIVATE flashrt_apple "-framework CoreML")
 add_library(flashrt_apple_signpost SHARED src/signpost.mm)
 set_target_properties(flashrt_apple_signpost PROPERTIES OBJCXX_STANDARD 17
   OBJCXX_STANDARD_REQUIRED YES)

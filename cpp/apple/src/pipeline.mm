@@ -26,8 +26,11 @@ struct Node {
     std::vector<std::size_t> offsets;
     MTLSize groups{}, threads{};
     std::size_t copy_bytes = 0;
+    int external = 0;               // 1: ExternalSignal, 2: ExternalWait
+    std::uint32_t task = 0;
 };
-struct Batch { std::size_t begin, count, icb_begin; bool copy; };
+enum class BatchKind { compute, copy, signal, wait };
+struct Batch { std::size_t begin, count, icb_begin; BatchKind kind; };
 struct Pipeline {
     NSString* label = nil;
     std::shared_ptr<Context> context;
@@ -37,6 +40,11 @@ struct Pipeline {
     std::map<id<MTLBuffer>, MTLResourceUsage> resources;
     id<MTLIndirectCommandBuffer> icb = nil;
     id<MTLResidencySet> residency API_AVAILABLE(macos(15.0)) = nil;
+    // External tasks: one shared event; per run, task t is signalled at base+2t+1 and
+    // released at base+2t+2. Bases grow monotonically across runs.
+    id<MTLSharedEvent> event = nil;
+    std::vector<std::uint32_t> signal_order;
+    std::uint64_t event_base = 0;
     ~Pipeline() {
         if (@available(macOS 15.0, *)) {
             if (residency) {
@@ -194,8 +202,26 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
         p->context = impl_;
         p->label = [NSString stringWithUTF8String:label.c_str()];
         std::size_t max_bindings = 0;
+        std::vector<int> task_state;   // 0 unseen, 1 signalled, 2 waited
         for (const auto& operation : operations) {
             detail::Node node;
+            const ExternalSignal* signal = std::get_if<ExternalSignal>(&operation);
+            const ExternalWait* wait = std::get_if<ExternalWait>(&operation);
+            if (signal || wait) {
+                const std::uint32_t task = signal ? signal->task : wait->task;
+                if (task_state.size() <= task) task_state.resize(task + 1, 0);
+                require(signal ? task_state[task] == 0 : task_state[task] == 1,
+                        "external task needs one signal followed by one wait");
+                task_state[task] = signal ? 1 : 2;
+                if (signal) p->signal_order.push_back(task);
+                node.label = [NSString stringWithUTF8String:(signal ? signal->label : wait->label).c_str()];
+                node.external = signal ? 1 : 2;
+                node.task = task;
+                p->batches.push_back({p->nodes.size(), 1, p->dispatch_count,
+                                      signal ? detail::BatchKind::signal : detail::BatchKind::wait});
+                p->nodes.push_back(std::move(node));
+                continue;
+            }
             if (const auto* copy = std::get_if<BufferCopy>(&operation)) {
                 require(copy->bytes > 0, "buffer copy must be nonempty");
                 const auto& src = copy->source;
@@ -246,11 +272,19 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
                 max_bindings = std::max(max_bindings, d.bindings.size());
             }
             const bool copy = node.copy_bytes != 0;
-            if (p->batches.empty() || p->batches.back().copy != copy)
-                p->batches.push_back({p->nodes.size(), 0, p->dispatch_count, copy});
+            const auto kind = copy ? detail::BatchKind::copy : detail::BatchKind::compute;
+            if (p->batches.empty() || p->batches.back().kind != kind)
+                p->batches.push_back({p->nodes.size(), 0, p->dispatch_count, kind});
             ++p->batches.back().count;
             if (!copy) ++p->dispatch_count;
             p->nodes.push_back(std::move(node));
+        }
+        for (int state : task_state)
+            require(state == 2, "external task needs one signal followed by one wait");
+        if (!p->signal_order.empty()) {
+            p->event = [impl_->device newSharedEvent];
+            if (!p->event) throw failure("create shared event", nil);
+            p->event.label = p->label;
         }
         if (p->dispatch_count) {
             MTLIndirectCommandBufferDescriptor* descriptor = [MTLIndirectCommandBufferDescriptor new];
@@ -265,9 +299,9 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
             std::size_t command_index = 0;
             for (std::size_t i = 0; i < p->nodes.size(); ++i) {
                 const auto& n = p->nodes[i];
-                if (n.copy_bytes) continue;
+                if (n.copy_bytes || n.external) continue;
                 id<MTLIndirectComputeCommand> command = [p->icb indirectComputeCommandAtIndex:command_index++];
-                if (i && !p->nodes[i - 1].copy_bytes) [command setBarrier];
+                if (i && !p->nodes[i - 1].copy_bytes && !p->nodes[i - 1].external) [command setBarrier];
                 [command setComputePipelineState:n.kernel->value];
                 for (std::size_t j = 0; j < n.buffers.size(); ++j)
                     [command setKernelBuffer:n.buffers[j]->value offset:n.offsets[j] atIndex:j];
@@ -278,19 +312,52 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
     }
 }
 std::size_t Pipeline::dispatch_count() const { return impl_->dispatch_count; }
-Timing Pipeline::run(Execution mode) const {
+std::size_t Pipeline::external_tasks() const { return impl_->signal_order.size(); }
+Timing Pipeline::run(Execution mode) const { return run(mode, ExternalTask{}); }
+Timing Pipeline::run(Execution mode, const ExternalTask& external) const {
     require(mode == Execution::direct || mode == Execution::icb, "invalid execution mode");
+    require(impl_->signal_order.empty() || external, "program with external operations needs an executor");
     std::lock_guard<std::mutex> lock(impl_->context->mutex);
+    const std::uint64_t tasks = impl_->signal_order.size();
+    const std::uint64_t base = impl_->event_base;
+    impl_->event_base += tasks ? 2 * tasks + 2 : 0;
     @autoreleasepool {
         const auto start = Clock::now();
-        id<MTLCommandBuffer> command = [impl_->context->queue commandBuffer];
-        if (!command) throw failure("create command buffer", nil);
-        command.label = [impl_->label stringByAppendingString:
-                         mode == Execution::icb ? @" / ICB" : @" / direct"];
+        // An ExternalSignal ends the current command buffer, which is committed at once: its
+        // completion (a reliable GPU->host notification) tells the host the task may start,
+        // while the GPU continues with the next, already committed command buffer. The host
+        // releases the matching ExternalWait through the shared event.
+        std::vector<id<MTLCommandBuffer>> commands;
+        std::vector<id<MTLCommandBuffer>> signalled(tasks ? *std::max_element(impl_->signal_order.begin(),
+                                                                              impl_->signal_order.end()) + 1 : 0);
+        double submitted = 0;
+        auto begin = [&]() {
+            id<MTLCommandBuffer> next = [impl_->context->queue commandBuffer];
+            if (!next) throw failure("create command buffer", nil);
+            next.label = [impl_->label stringByAppendingString:
+                          mode == Execution::icb ? @" / ICB" : @" / direct"];
+            commands.push_back(next);
+            return next;
+        };
+        auto commit = [&](id<MTLCommandBuffer> buffer) {
+            if (!submitted) submitted = host_seconds();
+            [buffer commit];
+        };
+        id<MTLCommandBuffer> command = begin();
         // Batches are fixed at construction. The production compute-only plan
         // still executes one ICB range in one encoder; snapshots add blit passes.
         for (const auto& batch : impl_->batches) {
-            if (batch.copy) {
+            if (batch.kind == detail::BatchKind::signal) {
+                signalled[impl_->nodes[batch.begin].task] = command;
+                commit(command);
+                command = begin();
+                continue;
+            }
+            if (batch.kind == detail::BatchKind::wait) {
+                [command encodeWaitForEvent:impl_->event value:base + 2 * impl_->nodes[batch.begin].task + 2];
+                continue;
+            }
+            if (batch.kind == detail::BatchKind::copy) {
                 id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
                 if (!blit) throw failure("create blit encoder", nil);
                 blit.label = @"FlashRT buffer copies";
@@ -326,18 +393,37 @@ Timing Pipeline::run(Execution mode) const {
             [encoder endEncoding];
         }
         const auto encoded = Clock::now();
-        const double submitted = host_seconds();
-        [command commit];
+        commit(command);
         const auto committed = Clock::now();
-        [command waitUntilCompleted];
+        bool failed = false;
+        std::string message;
+        for (std::uint32_t task : impl_->signal_order) {
+            id<MTLCommandBuffer> ready = signalled[task];
+            [ready waitUntilCompleted];
+            if (ready.status != MTLCommandBufferStatusCompleted) {
+                failed = true; message = "GPU work before external task failed"; break;
+            }
+            std::string error;
+            if (!external(task, error)) { failed = true; message = error.empty() ? "external task failed" : error; }
+            impl_->event.signaledValue = base + 2 * task + 2;
+            if (failed) break;
+        }
+        // Release every remaining wait so the GPU never blocks on a skipped task.
+        if (failed && tasks) impl_->event.signaledValue = base + 2 * tasks + 2;
+        id<MTLCommandBuffer> first = commands.front(), last = commands.back();
+        [last waitUntilCompleted];
         const double returned = host_seconds();
         const auto end = Clock::now();
-        if (command.status != MTLCommandBufferStatusCompleted) throw failure("execute pipeline", command.error);
-        return {elapsed(start, encoded), (command.GPUEndTime-command.GPUStartTime)*1e6,
+        for (id<MTLCommandBuffer> buffer : commands) {
+            [buffer waitUntilCompleted];
+            if (buffer.status != MTLCommandBufferStatusCompleted) throw failure("execute pipeline", buffer.error);
+        }
+        if (failed) throw std::runtime_error("external task: " + message);
+        return {elapsed(start, encoded), (last.GPUEndTime-first.GPUStartTime)*1e6,
                 elapsed(start, end), elapsed(encoded, committed), elapsed(committed, end),
-                (command.GPUStartTime-submitted)*1e6, (returned-command.GPUEndTime)*1e6,
-                (command.kernelEndTime-command.kernelStartTime)*1e6,
-                submitted, command.GPUStartTime, command.GPUEndTime, returned};
+                (first.GPUStartTime-submitted)*1e6, (returned-last.GPUEndTime)*1e6,
+                (last.kernelEndTime-first.kernelStartTime)*1e6,
+                submitted, first.GPUStartTime, last.GPUEndTime, returned};
     }
 }
 } // namespace flashrt::apple

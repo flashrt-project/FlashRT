@@ -28,11 +28,15 @@ xcrun clang++ -std=c++17 -O2 -fobjc-arc -mmacosx-version-min=14.0 \
   -I "$root/cpp/apple/include" -I "$root/csrc/apple" -c "$root/cpp/apple/src/pipeline.mm" \
   -o "$build/pipeline.o"
 xcrun ar rcs "$build/libflashrt_apple.a" "$build/pipeline.o"
+# Core ML external tasks (optional Neural Engine shares) live in the plan library only.
+xcrun clang++ -std=c++17 -O2 -fobjc-arc -mmacosx-version-min=14.0 \
+  -fvisibility=hidden -fvisibility-inlines-hidden \
+  -I "$root/cpp/apple/include" -c "$root/cpp/apple/src/coreml.mm" -o "$build/coreml.o"
 xcrun clang++ -std=c++17 -O2 -mmacosx-version-min=14.0 \
   -fvisibility=hidden -fvisibility-inlines-hidden \
-  "${precision_flags[@]}" -I "$root/cpp/apple/include" -I "$root/csrc/apple" -dynamiclib "$root/cpp/apple/src/plan.cpp" "$build/pipeline.o" \
+  "${precision_flags[@]}" -I "$root/cpp/apple/include" -I "$root/csrc/apple" -dynamiclib "$root/cpp/apple/src/plan.cpp" "$build/pipeline.o" "$build/coreml.o" \
   "-Wl,-exported_symbols_list,$root/cpp/apple/plan.exports" \
-  -framework Foundation -framework Metal \
+  -framework Foundation -framework Metal -framework CoreML \
   -o "$build/libflashrt_apple_plan.dylib"
 bash "$root/scripts/apple/check_exports.sh" "$build/libflashrt_apple_plan.dylib" "$root/cpp/apple/plan.exports"
 xcrun clang++ -std=c++17 -O2 -mmacosx-version-min=14.0 \

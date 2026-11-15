@@ -19,6 +19,15 @@ FRT_APPLE_PLAN_API int frt_apple_plan_copy(void*, uint32_t source, size_t source
 FRT_APPLE_PLAN_API int frt_apple_plan_dispatch(void*, const char* kernel, const uint32_t* buffers,
     const size_t* offsets, const uint32_t* access, size_t count,
     const size_t* groups, size_t threads, const char* label);
+// Register a fixed-shape Core ML model (single FP16 input/output, both views of plan buffers);
+// returns its external task id. compute_units: 0 CPU+Neural Engine, 1 all, 2 CPU+GPU, 3 CPU.
+FRT_APPLE_PLAN_API int64_t frt_apple_plan_coreml(void*, const char* model, const char* input,
+    uint32_t input_buffer, size_t input_offset, const char* output, uint32_t output_buffer,
+    size_t output_offset, const int64_t* shape, size_t rank, uint32_t compute_units);
+// Record an external task boundary in the current program: wait=0 signals that operations so far
+// completed and the host may run the task; wait=1 blocks later operations until it finished.
+// Each task is signalled once and then waited once per program; runs execute tasks in signal order.
+FRT_APPLE_PLAN_API int frt_apple_plan_external(void*, uint32_t task, uint32_t wait);
 // Start recording an additional program (ids 1, 2, ...); later dispatch/copy calls append to it.
 // Programs share the plan's buffers. Operations recorded before the first call form program 0.
 FRT_APPLE_PLAN_API int64_t frt_apple_plan_program(void*);

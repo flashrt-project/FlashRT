@@ -517,6 +517,33 @@ class Plan:
         )
         return patch
 
+    def coreml_task(self, model, inputs, outputs, shape, *, input_name, output_name, compute_units=0):
+        """Register a fixed-shape Core ML model over two FP16 plan tensors; returns its task id."""
+        lib = self.lib
+        if not hasattr(self, "_coreml_bound"):
+            lib.frt_apple_plan_coreml.argtypes = [
+                C.c_void_p, C.c_char_p, C.c_char_p, C.c_uint32, C.c_size_t, C.c_char_p,
+                C.c_uint32, C.c_size_t, C.POINTER(C.c_int64), C.c_size_t, C.c_uint32]
+            lib.frt_apple_plan_coreml.restype = C.c_int64
+            lib.frt_apple_plan_external.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32]
+            lib.frt_apple_plan_external.restype = C.c_int
+            self._coreml_bound = True
+        inputs, outputs = self.bind(inputs), self.bind(outputs)
+        if math.prod(shape) != inputs.numel() or math.prod(shape) != outputs.numel():
+            raise ValueError("Core ML task shape must match its FP16 input and output tensors")
+        dims = (C.c_int64 * len(shape))(*shape)
+        task = lib.frt_apple_plan_coreml(self.handle, str(model).encode(), input_name.encode(),
+                                         inputs.buffer, inputs.offset, output_name.encode(),
+                                         outputs.buffer, outputs.offset, dims, len(shape), compute_units)
+        if task < 0:
+            self.check(-1)
+        return int(task)
+
+    def external(self, task, *, wait):
+        """Record a boundary of external task `task`: its start signal or its completion wait."""
+        self.check(self.lib.frt_apple_plan_external(self.handle, task, int(bool(wait))))
+        self.operations.append(dict(kind="external", stage=self.stage, task=task, wait=bool(wait)))
+
     def finish(self):
         self.check(self.lib.frt_apple_plan_finish(self.handle))
 

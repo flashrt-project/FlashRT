@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <variant>
@@ -54,7 +56,22 @@ struct BufferCopy {
     std::size_t bytes;
     std::string label;
 };
-using Operation = std::variant<Dispatch, BufferCopy>;
+// Host-executed work inside one command buffer (for example a Core ML prediction on
+// another engine). Operations before an ExternalSignal complete before the host is
+// told that `task` may start; operations after the matching ExternalWait start only
+// after the host reports it finished. Tasks run in signal order on the submitting thread.
+struct ExternalSignal {
+    std::uint32_t task;
+    std::string label;
+};
+struct ExternalWait {
+    std::uint32_t task;
+    std::string label;
+};
+using Operation = std::variant<Dispatch, BufferCopy, ExternalSignal, ExternalWait>;
+// Runs external task `task`; returns false (with a message) on failure. The GPU is
+// always released afterwards, and a failure is reported once the command buffer completes.
+using ExternalTask = std::function<bool(std::uint32_t task, std::string& error)>;
 enum class Execution { direct, icb };
 struct Timing {
     double encode_us = 0;
@@ -77,6 +94,9 @@ public:
     // Sequential dependencies are enforced between operations. Buffer copies
     // use blit encoders; compute spans reuse ranges of the recorded ICB.
     Timing run(Execution mode = Execution::direct) const;
+    // Required for programs containing external operations.
+    Timing run(Execution mode, const ExternalTask& external) const;
+    std::size_t external_tasks() const;
     // Keep this fixed plan's resources resident between submissions (macOS 15+).
     void set_resident(bool enabled) const;
     std::size_t dispatch_count() const;
