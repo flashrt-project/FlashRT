@@ -29,6 +29,7 @@ class NativePi05Plan:
         pad_prompt=False,
         fused=True,
         neural_engine=None,
+        decode_weights=None,
     ):
         if not source.compact_encoder or not source.precompute_modulation:
             raise ValueError(
@@ -46,13 +47,17 @@ class NativePi05Plan:
             neural_engine = dict(NEURAL_ENGINE_DEFAULTS, **({} if neural_engine is True else neural_engine))
         else:
             neural_engine = None
+        if decode_weights is not None and (not fused or int8_options is not None):
+            raise ValueError("decode_weights requires the fused BF16 plan")
         if int8_options is None:
             # fused=False reproduces the original one-dispatch-per-operation lowering.
             # neural_engine (opt-in) splits each prefix FFN between GPU and a Core ML
             # program; see FusedPlan for the contract and options.
             if fused:
                 from flash_rt.hardware.apple_native.fused import FusedPlan
-                self.plan = FusedPlan(library, coprocessor=neural_engine)
+                # decode_weights="int8" | "int4" (opt-in): weight-only quantized denoising
+                # projections; activations and rounding boundaries stay BF16.
+                self.plan = FusedPlan(library, coprocessor=neural_engine, decode_weights=decode_weights)
             else:
                 self.plan = Plan(library)
         else:

@@ -20,7 +20,7 @@ class Pi05PipelineMps(Pi05TorchPipeline):
 
     def enable_native_pipeline(self, prompt_len, *, library=None, capture_probes=False, residency=True,
                                split_decode=True, merged_encoder_ffn=True, dynamic_prompt=True,
-                               pad_prompt=False, fused=True, neural_engine=None):
+                               pad_prompt=False, fused=True, neural_engine=None, decode_weights=None):
         """Build one ICB for patch + blocks + projector + prefix + denoising.
 
         By default all prompt lengths up to max_prompt_len reuse this compact plan.
@@ -30,7 +30,8 @@ class Pi05PipelineMps(Pi05TorchPipeline):
         fused=False selects the original unfused BF16 lowering for A/B checks.
         neural_engine=True (or a dict of FusedPlan coprocessor overrides) opts into
         splitting the vision and prefix FFNs with Core ML programs on the Neural Engine
-        (FP16 shares, needs coremltools to build).
+        (FP16 shares, needs coremltools to build). decode_weights="int8" or "int4"
+        stores the denoising projections weight-only quantized (BF16 activations).
         """
         from flash_rt.models.pi05.native_plan_mps import NativePi05Plan
         native = NativePi05Plan(self, prompt_len, library=library,
@@ -38,7 +39,8 @@ class Pi05PipelineMps(Pi05TorchPipeline):
                                split_decode=split_decode,
                                merged_encoder_ffn=merged_encoder_ffn,
                                dynamic_prompt=dynamic_prompt, pad_prompt=pad_prompt,
-                               fused=fused, neural_engine=neural_engine)
+                               fused=fused, neural_engine=neural_engine,
+                               decode_weights=decode_weights)
         previous = self._native_pipeline
         self._native_pipeline = native
         if previous is not None:

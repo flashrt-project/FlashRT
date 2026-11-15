@@ -25,20 +25,53 @@ Every fused form keeps the BF16 rounding boundaries of the separate dispatches;
 split-K sums its partials in a fixed order, so replay stays deterministic. Any
 other operation, copy or finish first emits the held work unchanged, so the
 recorded order is the semantic order.
+
+``decode_weights="int8" | "int4"`` stores the weights of the few-row projections (and
+only those) quantized: int8 with one FP32 scale per output channel, or unsigned 4-bit
+affine codes with a BF16 scale and bias per 64 inputs of a channel. Activations,
+accumulation (FP32) and every rounding boundary stay those of the BF16 lowering; the
+kernels dequantize weight tiles to BF16 in threadgroup memory. Quantization uses the
+weights alone and happens once at recording.
 """
 
 from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 
 from .dimensions import uniform_key
-from .plan import Plan, Weight
+from .plan import Plan, Tensor, Weight
+
+WEIGHT_BITS = {"int8": 8, "int4": 4}
+
+
+def quantize_columns(weight, bits):
+    """[K, N] weight -> (codes [N, ...] uint8/int8, scales, biases or None) per output channel."""
+    w = weight.detach().to("cpu", torch.float32).T.contiguous()
+    n, k = w.shape
+    if not torch.isfinite(w).all():
+        raise ValueError("Quantized weights must be finite")
+    if bits == 8:
+        scale = (w.abs().amax(1) / 127).clamp_min(1e-12)
+        codes = (w / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+        return codes.numpy(), scale.numpy().astype(np.float32), None
+    if k % 64:
+        raise ValueError("int4 weights need K divisible by 64")
+    g = w.view(n, k // 64, 64)
+    lo, hi = g.amin(-1), g.amax(-1)
+    scale = ((hi - lo) / 15).clamp_min(1e-12).bfloat16().float()
+    bias = lo.bfloat16().float()
+    q = ((g - bias[..., None]) / scale[..., None]).round().clamp(0, 15).to(torch.uint8).view(n, k)
+    codes = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()
+    as_bits = lambda t: t.bfloat16().view(torch.int16).numpy().view(np.uint16)
+    return codes.numpy(), as_bits(scale), as_bits(bias)
 
 # (tile_m, tile_n, simdgroups) -> registry suffix. The production default tile is 64x64/2.
 TILES = {(64, 64, 2): "", (32, 128, 2): "_32x128", (16, 64, 2): "_16x64"}
 SPLITK_CHUNK = 256
+FMA_ROWS, FMA_CHUNK = 10, 512   # exact-row scalar kernels for quantized few-row projections
 
 
 def select_tile(m, n, k):
@@ -55,8 +88,13 @@ def _same(a, b):
 
 
 class FusedPlan(Plan):
-    def __init__(self, library=None, *, fuse_epilogues=True, tune_tiles=True, coprocessor=None):
+    def __init__(self, library=None, *, fuse_epilogues=True, tune_tiles=True, coprocessor=None,
+                 decode_weights=None):
         super().__init__(library)
+        if decode_weights is not None and decode_weights not in WEIGHT_BITS:
+            raise ValueError(f"decode_weights must be one of {sorted(WEIGHT_BITS)} or None")
+        self.decode_bits = WEIGHT_BITS.get(decode_weights)
+        self._quantized = {}
         self.fuse_epilogues = fuse_epilogues
         self.tune_tiles = tune_tiles
         # coprocessor: dict(hidden=channels per FFN on the Neural Engine, an int or {stage: int}
@@ -297,6 +335,38 @@ class FusedPlan(Plan):
         return self._repacked[key]
 
     # ------------------------------------------------------------- few-row split-K
+    def raw(self, array):
+        array = np.ascontiguousarray(array)
+        bid = self.lib.frt_apple_plan_buffer(self.handle, array.nbytes)
+        if bid < 0:
+            self.check(-1)
+        self.check(self.lib.frt_apple_plan_write(self.handle, bid, 0, array.ctypes.data, array.nbytes))
+        self.weight_bytes += array.nbytes
+        return Tensor(self, array.shape, bid, itemsize=array.dtype.itemsize)
+
+    def _quantized_weight(self, w, packing=None, interleaved=False):
+        """(codes, scales, biases) plan tensors of a few-row projection weight, packed once.
+
+        interleaved=True stores uint32 code words input-block-major ([K/8][N] int4, [K/4][N] int8)
+        and int4 scales/biases [K/64][N], the layout of the exact-row FMA kernels.
+        """
+        t = w.tensor
+        key = (t.untyped_storage().data_ptr(), t.storage_offset(), tuple(t.shape), tuple(t.stride()), packing,
+               interleaved)
+        if key not in self._quantized:
+            source = t
+            if packing is not None:
+                source = self._packed_gelu_mul(w, packing).tensor
+            codes, scales, biases = quantize_columns(source, self.decode_bits)
+            if interleaved:
+                codes = np.ascontiguousarray(codes.view(np.uint32).T)
+                if biases is not None:
+                    scales, biases = np.ascontiguousarray(scales.T), np.ascontiguousarray(biases.T)
+            self._quantized[key] = (self.raw(codes), self.raw(scales),
+                                    self.raw(biases) if biases is not None else None, w)
+        codes, scales, biases, _ = self._quantized[key]
+        return codes, scales, biases if biases is not None else codes
+
     def _splitk(self, p):
         """FP32 partials [splits, M, N] of the held few-row GEMM in a shared workspace."""
         splits = (p["k"] + SPLITK_CHUNK - 1) // SPLITK_CHUNK
@@ -307,12 +377,32 @@ class FusedPlan(Plan):
         current = self.stage
         try:
             self.stage = p["stage"]
-            Plan.dispatch(self, "gemm_splitk_f32_bf16", [p["x"], p["w"], partial], {2},
-                          [p["m"], p["n"], p["k"], SPLITK_CHUNK],
-                          ((p["n"] + 63) // 64, (p["m"] + 15) // 16, splits), 64)
+            grid = ((p["n"] + 63) // 64, (p["m"] + 15) // 16, splits)
+            if self._fma_rows(p):
+                splits = (p["k"] + FMA_CHUNK - 1) // FMA_CHUNK
+                need = splits * p["m"] * p["n"]
+                if self._workspace.numel() < need:
+                    self._workspace = self.allocate((need,), itemsize=4)
+                partial = self._workspace if self._workspace.numel() == need else self._workspace[:need]
+                codes, scales, biases = self._quantized_weight(p["w"], interleaved=True)
+                Plan.dispatch(self, f"gemm_rows{FMA_ROWS}_splitk_w{self.decode_bits}_f32_bf16",
+                              [p["x"], codes, scales, biases, partial], {4},
+                              [p["m"], p["n"], p["k"], FMA_CHUNK], (p["n"] // 64, 1, splits), 128)
+            elif self.decode_bits:
+                codes, scales, biases = self._quantized_weight(p["w"])
+                Plan.dispatch(self, f"gemm_splitk_w{self.decode_bits}_f32_bf16",
+                              [p["x"], codes, scales, biases, partial], {4},
+                              [p["m"], p["n"], p["k"], SPLITK_CHUNK], grid, 64)
+            else:
+                Plan.dispatch(self, "gemm_splitk_f32_bf16", [p["x"], p["w"], partial], {2},
+                              [p["m"], p["n"], p["k"], SPLITK_CHUNK], grid, 64)
         finally:
             self.stage = current
         return partial, splits
+
+    def _fma_rows(self, p):
+        return (self.decode_bits is not None and p["m"] == FMA_ROWS and p["n"] % 64 == 0
+                and p["k"] % 64 == 0)
 
     def _residual_norm(self, p, name, tensors):
         """The AdaRMS dispatch immediately following a held split-K residual, if it reads that row."""
@@ -363,12 +453,25 @@ class FusedPlan(Plan):
             merged, out = (self.bind(t) for t in tensors)
             if not _same(merged, p["out"]):
                 return False
-            weight = self._packed_gelu_mul(p["w"], 32)
+            if self._fma_rows(p):
+                partial, splits = self._splitk(p)
+                rows, hidden = p["m"], p["n"] // 2
+                self.dispatch_raw("splitk_gelu_mul_bf16", [partial, out], {1}, [rows, hidden, splits],
+                                  ((rows * hidden + 63) // 64,), 64, p["stage"])
+                self.fused.append(("splitk_gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))
+                return True
             current = self.stage
             try:
                 self.stage = p["stage"]
-                Plan.dispatch(self, "gemm_gelu_mul_bf16_16x64", [p["x"], weight, out], {2},
-                              [p["m"], p["n"], p["k"]], (p["n"] // 64, (p["m"] + 15) // 16), 64)
+                grid = (p["n"] // 64, (p["m"] + 15) // 16)
+                if self.decode_bits:
+                    codes, scales, biases = self._quantized_weight(p["w"], packing=32)
+                    Plan.dispatch(self, f"gemm_gelu_mul_w{self.decode_bits}_bf16",
+                                  [p["x"], codes, scales, biases, out], {4}, [p["m"], p["n"], p["k"], 0], grid, 64)
+                else:
+                    weight = self._packed_gelu_mul(p["w"], 32)
+                    Plan.dispatch(self, "gemm_gelu_mul_bf16_16x64", [p["x"], weight, out], {2},
+                                  [p["m"], p["n"], p["k"]], grid, 64)
             finally:
                 self.stage = current
             self.fused.append(("gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))

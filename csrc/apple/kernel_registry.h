@@ -15,6 +15,8 @@
 #include "gemm/bf16_tensor_ops_epilogue.h"
 #include "gemm/bf16_tensor_ops_splitk.h"
 #include "gemm/w4a16_affine_qmv.h"
+#include "gemm/wq_tensor_ops.h"
+#include "gemm/wq_rows_fma.h"
 #include "gemm/w4a16_affine_tensor_ops.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
@@ -94,6 +96,15 @@ inline constexpr KernelSource kernel_registry[] = {
     {"gemm_splitk_f32_bf16", "gemm_splitk_f32_bf16", [] { return gemm_splitk_bf16_source(); }},
     {"splitk_rope_bf16", "splitk_rope_bf16", splitk_reduce_bf16_source},
     {"splitk_residual_adarms_bf16", "splitk_residual_adarms_bf16", splitk_reduce_bf16_source},
+    // Few-row weight-only quantized projections (int8 per channel / int4 affine group 64), BF16 activations.
+    {"gemm_splitk_w8_f32_bf16", "gemm_rows_wq_bf16", [] { return gemm_rows_wq_source(8, 0); }},
+    {"gemm_splitk_w4_f32_bf16", "gemm_rows_wq_bf16", [] { return gemm_rows_wq_source(4, 0); }},
+    {"gemm_gelu_mul_w8_bf16", "gemm_rows_wq_bf16", [] { return gemm_rows_wq_source(8, 1); }},
+    {"gemm_gelu_mul_w4_bf16", "gemm_rows_wq_bf16", [] { return gemm_rows_wq_source(4, 1); }},
+    // Exactly-10-row variants with scalar FP32 FMAs (no row padding), split-K partials.
+    {"gemm_rows10_splitk_w8_f32_bf16", "gemm_rows_fma_wq", [] { return gemm_rows_fma_wq_source(8, 10); }},
+    {"gemm_rows10_splitk_w4_f32_bf16", "gemm_rows_fma_wq", [] { return gemm_rows_fma_wq_source(4, 10); }},
+    {"splitk_gelu_mul_bf16", "splitk_gelu_mul_bf16", splitk_reduce_bf16_source},
     // Exchange with a fixed-shape channel-major FP16 engine (Core ML): pack activations; FP32 partial
     // GEMM over the local K range; add both partials with one BF16 rounding into the residual.
     {"pack_channels_f16", "pack_channels_f16", channel_pack_f16_source},
