@@ -3,8 +3,8 @@
 A share computes, for hidden channels [h0, h1) of an FFN, the FP16 partial product of the
 down projection: down[h0:h1]^T (gelu_tanh(gate[:, h0:h1]^T x) * (up[:, h0:h1]^T x)). Inputs and
 outputs use the channel-major (1, C, S, rows / S) layout; the down projection is split into
-2048-input-channel convolutions, which the Neural Engine executes far faster than one
-convolution with a long input-channel axis. Compiled models are cached by content.
+convolutions of at most 2048 input channels, which the Neural Engine executes far faster than
+one convolution with a long input-channel axis. Compiled models are cached by content.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 COMPUTE_UNITS = {"cpu_and_ne": 0, "all": 1, "cpu_and_gpu": 2, "cpu": 3}
-DOWN_CHUNK = 2048
+DOWN_CHUNKS = (2048, 1024, 512)   # input channels per down convolution, first that divides
 FORMAT_VERSION = "gated-ffn-share-1"
 
 
@@ -49,7 +49,8 @@ def gated_ffn_share(gate, up, down, *, rows, spatial, cache_dir=None):
     digest = hashlib.sha256()
     for a in arrays:
         digest.update(np.ascontiguousarray(a).tobytes())
-    digest.update(repr((FORMAT_VERSION, shape, DOWN_CHUNK, ct.__version__)).encode())
+    chunk = next((c for c in DOWN_CHUNKS if hidden % c == 0), hidden)
+    digest.update(repr((FORMAT_VERSION, shape, chunk, ct.__version__)).encode())
     root = Path(cache_dir) if cache_dir is not None else default_cache_dir()
     root.mkdir(parents=True, exist_ok=True)
     key = digest.hexdigest()[:24]
@@ -60,7 +61,7 @@ def gated_ffn_share(gate, up, down, *, rows, spatial, cache_dir=None):
     wg = np.ascontiguousarray(arrays[0].T)[:, :, None, None]
     wu = np.ascontiguousarray(arrays[1].T)[:, :, None, None]
     wd = np.ascontiguousarray(arrays[2].T)[:, :, None, None]            # [channels, hidden, 1, 1]
-    parts = hidden // DOWN_CHUNK if hidden % DOWN_CHUNK == 0 else 1
+    parts = hidden // chunk
     chunks = np.split(wd, parts, axis=1)
 
     @mb.program(input_specs=[mb.TensorSpec(shape=shape, dtype=types.fp16)], opset_version=ct.target.macOS15)

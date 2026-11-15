@@ -43,7 +43,7 @@ SPLITK_CHUNK = 256
 
 def select_tile(m, n, k):
     """Measured M4 Pro tiles for M > 16 (geometry only, never model names)."""
-    if n >= 8192 or k >= 8192:
+    if n >= 8192 or k >= 4096:
         return 32, 128, 2
     return 64, 64, 2
 
@@ -59,16 +59,17 @@ class FusedPlan(Plan):
         super().__init__(library)
         self.fuse_epilogues = fuse_epilogues
         self.tune_tiles = tune_tiles
-        # coprocessor: dict(hidden=channels per FFN on the Neural Engine, stages=("prefix",),
+        # coprocessor: dict(hidden=channels per FFN on the Neural Engine (default: 5/8 of the
+        #                   FFN, the measured M4 Pro balance with the GPU share), stages=("prefix",),
         #                   spatial=4, cache_dir=None, compute_units="cpu_and_ne")
         self.coprocessor = None
         if coprocessor is not None:
-            cfg = dict(hidden=8192, stages=("prefix",), spatial=4, cache_dir=None, compute_units="cpu_and_ne")
+            cfg = dict(hidden=None, stages=("prefix",), spatial=4, cache_dir=None, compute_units="cpu_and_ne")
             unknown = set(coprocessor) - set(cfg)
             if unknown:
                 raise ValueError(f"Unknown coprocessor options: {sorted(unknown)}")
             cfg.update(coprocessor)
-            if cfg["hidden"] <= 0 or cfg["spatial"] <= 0:
+            if (cfg["hidden"] is not None and cfg["hidden"] <= 0) or cfg["spatial"] <= 0:
                 raise ValueError("Coprocessor hidden channels and spatial rows must be positive")
             self.coprocessor = cfg
         self.coprocessor_tasks = []
@@ -191,7 +192,8 @@ class FusedPlan(Plan):
         if cfg is None or p["stage"] not in cfg["stages"]:
             return None
         hidden = p["n"] // 2
-        share = min(cfg["hidden"], hidden)
+        share = cfg["hidden"] if cfg["hidden"] is not None else hidden * 5 // 8 // 512 * 512
+        share = min(share, hidden)
         gpu = hidden - share
         if gpu <= 0:
             return None
@@ -238,13 +240,14 @@ class FusedPlan(Plan):
                                              g["w"].name + f".gelu_mul{block}.share{gpu}")
             hidden_gpu = self.allocate((int(m), gpu))
             self._gemm("_gelu_mul", dict(g, n=2 * gpu), hidden_gpu, self._repacked[key], 2 * gpu)
-            self.external(task, wait=True)
+            # The local down product needs only the GPU share; it runs before waiting.
             down = Weight(wd[:gpu], d["w"].name + f".share{gpu}")
             self._repacked[("ffn_down", wd.untyped_storage().data_ptr(), wd.storage_offset(), gpu)] = down
-            tm, tn, sg = self._tile(m, d["n"], gpu)
-            Plan.dispatch(self, f"gemm_residual_partial_bf16{TILES[(tm, tn, sg)]}",
-                          [hidden_gpu, down, out, partial], {2}, [m, d["n"], gpu, capacity],
-                          ((d["n"] + tn - 1) // tn, (m + tm - 1) // tm), sg * 32)
+            local = self.allocate((int(m), d["n"]), itemsize=4)
+            self._gemm("_f32", dict(d, x=hidden_gpu, k=gpu), local, down, d["n"])
+            self.external(task, wait=True)
+            Plan.dispatch(self, "residual_add_partials_bf16", [local, partial, out], {2}, [m, d["n"], capacity],
+                          ((capacity + 31) // 32, (d["n"] + 31) // 32), 256)
         finally:
             self.stage = current
         self.coprocessor_tasks.append(dict(task=task, stage=g["stage"], gpu_hidden=gpu, coprocessor_hidden=share,

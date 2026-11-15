@@ -13,21 +13,19 @@ namespace flashrt::apple::shaders {
 //   bias_gelu:     C = BF16(gelu_tanh(BF16(BF16(A*B) + bias))).
 //   bias_residual: C = BF16(C + BF16(BF16(A*B) + bias)), in place.
 //   bias:          C = BF16(BF16(A*B) + bias), the gemm_bias_bf16 rule with uniforms bound last.
-//   residual_partial: C = BF16(C + BF16(A*B + P)), in place, where P is a channel-major FP16
-//                  partial product [columns, partial_stride] of the same output computed over the
-//                  remaining K range by another engine; the sum is rounded to BF16 once.
+//   f32:           C = A*B kept in FP32 (a partial product over a K range, rounded by its consumer).
 // FP32 accumulation; tile geometry is a build-time specialization.
-enum class GemmEpilogue { gelu_mul, residual, bias_gelu, bias_residual, bias, residual_partial };
+enum class GemmEpilogue { gelu_mul, residual, bias_gelu, bias_residual, bias, f32 };
 
 inline std::string gemm_bf16_epilogue_source(GemmEpilogue epilogue, int tile_m = 64, int tile_n = 64,
                                              int simdgroups = 2) {
     if (tile_m <= 0 || tile_n <= 0 || simdgroups <= 0 || tile_n % 2)
         throw std::invalid_argument("GEMM epilogue tiles must be positive with an even column tile");
     const char* names[] = {"gemm_gelu_mul_bf16", "gemm_residual_bf16", "gemm_bias_gelu_bf16",
-                           "gemm_bias_residual_bf16", "gemm_bias_bf16_last", "gemm_residual_partial_bf16"};
+                           "gemm_bias_residual_bf16", "gemm_bias_bf16_last", "gemm_f32_bf16"};
     const int e = static_cast<int>(epilogue);
     return std::string(tensor_ops_preamble) + gelu_mul_bf16_value_source +
-        "struct Gemm { int rows, columns, inner, partial_stride; };\n"
+        "struct Gemm { int rows, columns, inner; };\n"
         "constant constexpr int GEMM_TILE_M=" + std::to_string(tile_m) + ";\n"
         "constant constexpr int GEMM_TILE_N=" + std::to_string(tile_n) + ";\n"
         "constant constexpr int GEMM_SIMDGROUPS=" + std::to_string(simdgroups) + ";\n"
@@ -36,10 +34,15 @@ inline std::string gemm_bf16_epilogue_source(GemmEpilogue epilogue, int tile_m =
 inline float gelu_tanh(float v) { return 0.5f*v*(1.0f+tanh(0.7978845608028654f*(v+0.044715f*v*v*v))); }
 // columns = N of B. For gelu_mul the output has columns/2 entries per row.
 // Arguments: A, B, C[, bias], uniforms last.
-kernel void GEMM_ENTRY(device bfloat* a [[buffer(0)]], device bfloat* b [[buffer(1)]],
-                       device bfloat* c [[buffer(2)]],
 #if GEMM_EPILOGUE == 5
-                       device const half* partial [[buffer(3)]], constant Gemm& p [[buffer(4)]],
+#define GEMM_OUT float
+#else
+#define GEMM_OUT bfloat
+#endif
+kernel void GEMM_ENTRY(device bfloat* a [[buffer(0)]], device bfloat* b [[buffer(1)]],
+                       device GEMM_OUT* c [[buffer(2)]],
+#if GEMM_EPILOGUE == 5
+                       constant Gemm& p [[buffer(3)]],
 #elif GEMM_EPILOGUE >= 2
                        device const bfloat* bias [[buffer(3)]], constant Gemm& p [[buffer(4)]],
 #else
@@ -88,13 +91,12 @@ kernel void GEMM_ENTRY(device bfloat* a [[buffer(0)]], device bfloat* b [[buffer
                 auto coord=accum.get_multidimensional_index(i);
                 uint col=group.x*GEMM_TILE_N+coord[0], row=group.y*GEMM_TILE_M+coord[1];
                 if (row<uint(p.rows) && col<uint(p.columns)) {
-                    device bfloat* out=c+row*uint(p.columns)+col;
 #if GEMM_EPILOGUE == 5
-                    bfloat value=bfloat(accum[i]+float(partial[col*uint(p.partial_stride)+row]));
+                    c[row*uint(p.columns)+col]=accum[i];
 #else
+                    device bfloat* out=c+row*uint(p.columns)+col;
                     bfloat value=bfloat(accum[i]);
-#endif
-#if GEMM_EPILOGUE >= 2 && GEMM_EPILOGUE != 5
+#if GEMM_EPILOGUE >= 2
                     value=bfloat(float(value)+float(bias[col]));
 #endif
 #if GEMM_EPILOGUE == 2
@@ -103,6 +105,7 @@ kernel void GEMM_ENTRY(device bfloat* a [[buffer(0)]], device bfloat* b [[buffer
                     value=bfloat(float(*out)+float(value));
 #endif
                     *out=value;
+#endif
                 }
             }
         }

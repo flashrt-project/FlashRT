@@ -94,13 +94,12 @@ inline constexpr KernelSource kernel_registry[] = {
     {"gemm_splitk_f32_bf16", "gemm_splitk_f32_bf16", [] { return gemm_splitk_bf16_source(); }},
     {"splitk_rope_bf16", "splitk_rope_bf16", splitk_reduce_bf16_source},
     {"splitk_residual_adarms_bf16", "splitk_residual_adarms_bf16", splitk_reduce_bf16_source},
-    // Exchange with a fixed-shape channel-major FP16 engine (Core ML): pack activations, and add its
-    // partial product over the remaining K range before the BF16 rounding of a residual GEMM.
+    // Exchange with a fixed-shape channel-major FP16 engine (Core ML): pack activations; FP32 partial
+    // GEMM over the local K range; add both partials with one BF16 rounding into the residual.
     {"pack_channels_f16", "pack_channels_f16", channel_pack_f16_source},
-    {"gemm_residual_partial_bf16", "gemm_residual_partial_bf16",
-     [] { return gemm_bf16_epilogue_source(GemmEpilogue::residual_partial); }},
-    {"gemm_residual_partial_bf16_32x128", "gemm_residual_partial_bf16",
-     [] { return gemm_bf16_epilogue_source(GemmEpilogue::residual_partial, 32, 128, 2); }},
+    {"residual_add_partials_bf16", "residual_add_partials_bf16", channel_pack_f16_source},
+    {"gemm_f32_bf16", "gemm_f32_bf16", [] { return gemm_bf16_epilogue_source(GemmEpilogue::f32); }},
+    {"gemm_f32_bf16_32x128", "gemm_f32_bf16", [] { return gemm_bf16_epilogue_source(GemmEpilogue::f32, 32, 128, 2); }},
     {"attention_d72_bf16", "attention_d72_bf16", attention_d72_bf16_source},
     {"attention_bf16", "attention_bf16", attention_simd_bf16_source},
     {"tr_gqa", "tr_gqa", [] { return gqa_online_bf16_source(); }},
