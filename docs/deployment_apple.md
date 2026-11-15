@@ -232,3 +232,29 @@ Encoder gate/up already use one concatenated GEMM by default.
 `--split-encoder-ffn` selects the split diagnostic path. Both write the same
 BF16 intermediate layout and use the same activation, with no extra copies.
 Provider parity does not establish independent OpenPI or robot task success.
+
+The native plan uses a fused BF16 lowering by default (`fused=False` restores the original
+lowering). Two explicit, off-by-default switches change numerics: `neural_engine=True`
+splits the vision and prefix FFNs between the GPU and Core ML programs on the Neural Engine
+(FP16 shares; needs `coremltools` to build the programs), and `decode_weights="int8"` or
+`"int4"` stores the denoising projections weight-only quantized. Both are available through
+`enable_native_pipeline(...)` and `examples/apple/pi05.py --native-pipeline --neural-engine
+--decode-weights int8`.
+
+### Measured: Mac mini M4 Pro, 64 GiB (2026-11-14)
+
+Two views, ten denoising steps, horizon 10, the eight fixture observations with fixed noise;
+end-to-end host latency including state/prompt update, preprocessing and unnormalization:
+
+| Configuration | E2E p50 | Max NRMSE vs FP32 reference |
+| --- | ---: | ---: |
+| Torch MPS reference at f4fb663 | 673.0 ms | 1.021% |
+| Native ICB at f4fb663 | 553.2 ms | 0.842% |
+| Fused BF16 native (default) | 478.7 ms | 0.823% |
+| `neural_engine=True` | 277.5 ms | 0.605% |
+| `neural_engine=True`, `decode_weights="int8"` | 282.2 ms | 0.649% |
+
+Accuracy is measured against LeRobot's Pi0.5 port in FP32 on the CPU (seven robot channels,
+worst observation); it is a numerical comparison, not LIBERO task success. Stage times,
+the int4 variant and the hardware measurements behind these choices are in the
+[native pipeline guide](../cpp/apple/README.md#fused-lowering-neural-engine-ffn-shares-and-weight-only-decode).

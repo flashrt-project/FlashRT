@@ -38,9 +38,16 @@ def main():
     parser.add_argument("--seed", type=int, default=20261019)
     parser.add_argument("--cpu-reference", action="store_true", help="Compare one sample to the shared CPU BF16 pipeline using FP32 GEMM accumulation")
     parser.add_argument("--native-pipeline", action="store_true", help="Fixed-shape BF16 ICB for patch, vision, prefix and decode with CPU input/output")
+    parser.add_argument("--neural-engine", action="store_true",
+                        help="With --native-pipeline: split the vision/prefix FFNs with Core ML programs on the "
+                             "Neural Engine (FP16 shares; needs coremltools)")
+    parser.add_argument("--decode-weights", choices=("int8", "int4"),
+                        help="With --native-pipeline: weight-only quantized denoising projections")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup < 0 or args.iters < 1 or args.samples < 1:
         parser.error("steps, iters and samples must be positive; warmup must be nonnegative")
+    if (args.neural_engine or args.decode_weights) and not args.native_pipeline:
+        parser.error("--neural-engine and --decode-weights require --native-pipeline")
     if args.tokenizer:
         if not args.tokenizer.is_file():
             parser.error(f"Tokenizer not found: {args.tokenizer}")
@@ -83,7 +90,9 @@ def main():
             if plan is None or not plan.accepts_prompt_length(frontend._prompt_len):
                 frontend.pipeline.disable_native_pipeline()
                 started = time.perf_counter()
-                frontend.pipeline.enable_native_pipeline(frontend._prompt_len)
+                frontend.pipeline.enable_native_pipeline(
+                    frontend._prompt_len, neural_engine=args.neural_engine or None,
+                    decode_weights=args.decode_weights)
                 native_setup_seconds += time.perf_counter() - started
 
     def run(observation):
@@ -134,6 +143,8 @@ def main():
         prompt_lengths=prompt_lengths, load_seconds=load_seconds,
         native_pipeline_setup_seconds=native_setup_seconds,
         native_pipeline=args.native_pipeline,
+        neural_engine=args.neural_engine,
+        decode_weights=args.decode_weights,
         first_inference_ms=first["latency_ms"], warmup=args.warmup, iterations=args.iters,
         latency_ms=dict(p50=float(np.median(latency)), p95=float(np.percentile(latency, 95)),
                         mean=float(np.mean(latency)), samples=latency),

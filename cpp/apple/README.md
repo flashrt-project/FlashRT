@@ -191,6 +191,80 @@ If exported as `driver.xml`, the analyzer correlates Metal driver memory events
 with each inference and renders Wire Memory intervals in orange. Event-duration
 unions avoid double counting; these events are not GPU shader work.
 
+### Fused lowering, Neural Engine FFN shares and weight-only decode
+
+`NativePi05Plan` records the shared traversal through `FusedPlan`
+([`fused.py`](../../flash_rt/hardware/apple_native/fused.py)) by default; `fused=False` keeps
+the one-dispatch-per-operation lowering above for A/B checks. During recording a GEMM is held
+for one or two operations and joined with its sole consumers:
+
+- M > 16: merged gate/up GEMM + GELU multiply (gate/up column blocks repacked side by side),
+  in-place residual, bias + GELU and bias + residual become GEMM epilogues; 32x128 tiles for
+  N >= 8192 or K >= 4096. Outputs are bit-identical to the unfused lowering for the same tile.
+- M <= 16 (denoising rows): projections are split along K into FP32 partials summed in a fixed
+  order by their consumer: RoPE with K/V placement, or gated residual + AdaRMS. Replay stays
+  deterministic; outputs agree with the unfused lowering within BF16 rounding.
+
+Two opt-in variants change numerics and are off by default:
+
+- `neural_engine=True` (needs `coremltools` to build; programs are cached by content under
+  `~/.cache/flash_rt/coreml` or `$FLASHRT_COREML_CACHE`) splits each SigLIP and Gemma FFN by
+  hidden channels between the GPU and a Core ML program on the Neural Engine: 2048 of 4304
+  vision and 10240 of 16384 prefix channels. The program computes its share's FP16 partial of
+  the down projection (gate/up or up convolutions, tanh GELU, down as convolutions of at most
+  2048 input channels). The GPU packs the FFN input to the program's channel-major FP16 layout,
+  ends the command buffer (its completion starts the prediction on the submitting thread),
+  computes its own share including the local down product, waits on a shared event and adds
+  both partials with a single BF16 rounding. The runtime pieces are generic:
+  `frt_apple_plan_coreml` registers a fixed-shape model over two FP16 plan buffers and
+  `frt_apple_plan_external` records its signal/wait boundaries; a failed prediction releases
+  the GPU and is reported after completion.
+- `decode_weights="int8" | "int4"` stores the denoising projections weight-only quantized
+  (int8 with an FP32 scale per output channel; 4-bit affine codes with a BF16 scale and bias
+  per 64 inputs). Exactly-10-row products use scalar FP32-FMA split-K kernels, other few-row
+  counts dequantize 64x64 tiles to BF16 for TensorOps. Activations stay BF16.
+
+`examples/apple/pi05.py --native-pipeline [--neural-engine] [--decode-weights int4]` exposes
+both switches. Tests: `tests/test_apple_native_fused.py`, `test_apple_native_coprocessor.py`,
+`test_apple_native_quantized.py`.
+
+Measured on Mac mini M4 Pro (20-core GPU, 64 GB), macOS 26.7.3, PyTorch 2.15.0,
+coremltools 9.0, the pinned Pi0.5 LIBERO checkpoint: two views, ten denoising steps, horizon
+10, the eight fixture observations (natural prompts of 147-150 tokens, prefix M = 659-662)
+with fixed BF16-representable noise. E2E covers state normalization, prompt/state tokenization
+and embedding, image normalization, native replay and action unnormalization (observations
+cycled, 5 warmups, 40 calls, p50). Stage times are GPU times of the same traversal recorded
+as one program per stage. Accuracy is against LeRobot's Pi0.5 port in FP32 on the CPU (7 robot
+channels x 10 steps, worst observation); the FP32 MPS run of that port differs from it by
+NRMSE 1e-6. These are numerical results, not LIBERO task success.
+
+| Configuration | E2E p50 (ms) | Vision | Prefix | 10 steps | Max NRMSE | Min cosine | GPU plan weights |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Upstream f4fb663, BF16 ICB | 553.2 | 72.9 | 388.5 | 59.5 | 0.842% | 0.999975 | 5.21 GB |
+| Fused BF16 (default) | 478.7 | 69.8 | 367.2 | 39.6 | 0.823% | 0.999977 | 5.21 GB |
+| `neural_engine=True` | 277.5 | 53.3 | 183.6 | 39.7 | 0.605% | 0.999983 | 2.82 GB |
+| `neural_engine=True`, `decode_weights="int8"` | 282.2 | 51.3 | 181.0 | 37.9 | 0.649% | 0.999981 | 2.50 GB |
+| `neural_engine=True`, `decode_weights="int4"` | 282.5 | 51.3 | 181.0 | 37.0 | 1.080% | 0.999949 | 2.37 GB |
+| `decode_weights="int4"` (GPU only) | 475.8 | 69.8 | 366.7 | 37.0 | 1.420% | 0.999919 | 4.76 GB |
+
+All configurations replay deterministically (three repeats per observation are bit-identical).
+Repeats in the same session gave 551.9 ms (upstream) and 277.1 ms (`neural_engine=True`);
+differences of a few milliseconds between rows are within run-to-run drift. Neural Engine
+programs keep their FP16 weights outside the GPU plan. On the same prepared-input scope
+(model call: 477.7 ms fused BF16, 281.8 ms with the Neural Engine), LeRobot's PyTorch port
+measured 681.9 ms eager and 584.6 ms with `torch.compile` in BF16 on MPS (its own 200-token
+padding; its vision tower stays FP32 off CUDA), and upstream Torch MPS 642.8 ms
+(`examples/apple/pi05.py`). The BF16 implementations span 0.38-1.02% max NRMSE against the FP32
+reference.
+
+On this GPU the BF16 GEMMs run at 7.0-7.4 TFLOPS against a measured simdgroup MMA peak of
+about 7.5 TFLOPS (BF16 inputs, FP32 accumulation), and INT8 TensorOps are slower than BF16
+(6.8 vs 7.55 TOPS at the prefix gate/up shape), so INT8/SmoothQuant activation quantization
+does not shorten the compute-bound vision and prefix stages here. The Neural Engine adds
+compute that runs fully concurrently with the GPU (no slowdown on either side was measured).
+The ten-row denoising projections are dominated by per-dispatch latency rather than the
+weight stream, which is why weight-only quantization saves memory but little time.
+
 ## Kernel diagnostics and tuning
 
 `benchmark_native_pipeline.py --profile-kernels` profiles every dispatch in
