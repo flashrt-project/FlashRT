@@ -12,6 +12,15 @@ elementwise consumers, they are emitted together.
   residual add optionally followed by its AdaRMS normalization. The merged
   gate/up product uses the GELU multiply epilogue directly.
 
+With ``coprocessor`` set, a large-row gated FFN (merged gate/up GEMM, GELU multiply,
+down GEMM, in-place residual) in the selected stages is split by hidden channels: the
+GPU keeps the leading channels, and a Core ML program (Neural Engine) computes the
+trailing channels' FP16 partial of the down projection in the same command buffer.
+The GPU packs the FFN input to the program's channel-major FP16 layout, signals the
+host, computes its share, waits for the program and adds the partial before the single
+BF16 rounding of the down output. This changes numerics (FP16 on the coprocessor share)
+and is therefore opt-in.
+
 Every fused form keeps the BF16 rounding boundaries of the separate dispatches;
 split-K sums its partials in a fixed order, so replay stays deterministic. Any
 other operation, copy or finish first emits the held work unchanged, so the
@@ -46,10 +55,23 @@ def _same(a, b):
 
 
 class FusedPlan(Plan):
-    def __init__(self, library=None, *, fuse_epilogues=True, tune_tiles=True):
+    def __init__(self, library=None, *, fuse_epilogues=True, tune_tiles=True, coprocessor=None):
         super().__init__(library)
         self.fuse_epilogues = fuse_epilogues
         self.tune_tiles = tune_tiles
+        # coprocessor: dict(hidden=channels per FFN on the Neural Engine, stages=("prefix",),
+        #                   spatial=4, cache_dir=None, compute_units="cpu_and_ne")
+        self.coprocessor = None
+        if coprocessor is not None:
+            cfg = dict(hidden=8192, stages=("prefix",), spatial=4, cache_dir=None, compute_units="cpu_and_ne")
+            unknown = set(coprocessor) - set(cfg)
+            if unknown:
+                raise ValueError(f"Unknown coprocessor options: {sorted(unknown)}")
+            cfg.update(coprocessor)
+            if cfg["hidden"] <= 0 or cfg["spatial"] <= 0:
+                raise ValueError("Coprocessor hidden channels and spatial rows must be positive")
+            self.coprocessor = cfg
+        self.coprocessor_tasks = []
         self._pending = None
         # Repacked weights stay referenced so their storage identity cannot be reused.
         self._repacked = {}
@@ -58,6 +80,15 @@ class FusedPlan(Plan):
 
     # ------------------------------------------------------------------ recording
     def linear(self, out, x, w, bias=None):
+        held = self._pending
+        if (held is not None and "ffn" in held and "down" not in held and bias is None
+                and self.bind(out, allow_strided=True).contiguous()
+                and _same(self.bind(x), held["ffn"]["hidden"]) and w.shape[-1] == held["ffn"]["gemm"]["k"]):
+            x, out = self.bind(x), self.bind(out)
+            m, k, n = math.prod(x.shape[:-1]), x.shape[-1], w.shape[-1]
+            down = dict(out=out, x=x, w=w, bias=None, m=m, n=n, k=k, stage=self.stage, small=False)
+            self._pending = dict(held, down=down)
+            return
         self._flush()
         m = math.prod(x.shape[:-1])
         small = m <= 16
@@ -73,6 +104,11 @@ class FusedPlan(Plan):
 
     def dispatch(self, name, tensors, writes, params, groups, threads=64, *, strided=()):
         pending, self._pending = self._pending, None
+        if pending is not None and "ffn" in pending:
+            if "down" in pending and self._coprocess(pending, name, tensors, params):
+                return
+            self._emit_gelu_mul(pending["ffn"]["gemm"], pending["ffn"]["hidden"])
+            pending = pending.get("down")
         if pending is not None:
             if pending.get("residual") is not None:
                 norm = self._residual_norm(pending, name, tensors)
@@ -95,6 +131,9 @@ class FusedPlan(Plan):
 
     def _flush(self):
         pending, self._pending = self._pending, None
+        if pending is not None and "ffn" in pending:
+            self._emit_gelu_mul(pending["ffn"]["gemm"], pending["ffn"]["hidden"])
+            pending = pending.get("down")
         if pending is not None and pending.get("residual") is not None:
             self._emit_splitk_residual(pending, None)
         elif pending is not None:
@@ -138,6 +177,80 @@ class FusedPlan(Plan):
                 self._gemm("_bias", p, p["out"], p["w"], p["n"], (p["bias"],))
             finally:
                 self.stage = current
+
+    def _emit_gelu_mul(self, p, out):
+        tm, tn, sg = self._tile(p["m"], p["n"], p["k"])
+        weight = self._packed_gelu_mul(p["w"], tn // 2)
+        self._gemm("_gelu_mul", p, out, weight, p["n"])
+        self.fused.append(("gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))
+
+    # ------------------------------------------------------------- coprocessor FFN
+    def _coprocessor_share(self, p):
+        """(gpu_hidden, coprocessor_hidden) for an eligible gated FFN GEMM, else None."""
+        cfg = self.coprocessor
+        if cfg is None or p["stage"] not in cfg["stages"]:
+            return None
+        hidden = p["n"] // 2
+        share = min(cfg["hidden"], hidden)
+        gpu = hidden - share
+        if gpu <= 0:
+            return None
+        tm, tn, sg = self._tile(p["m"], 2 * gpu, p["k"])
+        return (gpu, share) if gpu % (tn // 2) == 0 else None
+
+    def _coprocess(self, pending, name, tensors, params):
+        if not (name == "tr_residual" and len(params) == 3 and params[2] == 0):
+            return False
+        g, d = pending["ffn"]["gemm"], pending["down"]
+        residual, update, out = (self.bind(t) for t in tensors[:3])
+        if not (_same(update, d["out"]) and _same(out, residual)):
+            return False
+        from . import neural_engine
+
+        cfg = self.coprocessor
+        gpu, share = self._coprocessor_share(g)
+        m, channels, hidden = g["m"], g["k"], g["n"] // 2
+        spatial = cfg["spatial"]
+        capacity = (int(m) + spatial - 1) // spatial * spatial
+        w, wd = g["w"].tensor, d["w"].tensor
+        model, input_name, output_name, shape = neural_engine.gated_ffn_share(
+            w[:, gpu:hidden], w[:, hidden + gpu:], wd[gpu:], rows=capacity, spatial=spatial,
+            cache_dir=cfg["cache_dir"])
+        current = self.stage
+        try:
+            self.stage = g["stage"]
+            packed_in, partial = self.allocate((channels, capacity)), self.allocate((channels, capacity))
+            task = self.coreml_task(model, packed_in, partial, shape, input_name=input_name,
+                                    output_name=output_name,
+                                    compute_units=neural_engine.COMPUTE_UNITS[cfg["compute_units"]])
+            Plan.dispatch(self, "pack_channels_f16", [g["x"], packed_in], {1}, [m, channels, capacity],
+                          ((capacity + 31) // 32, (channels + 31) // 32), 256)
+            self.external(task, wait=False)
+            # GPU share: leading hidden channels of gate and up, then K-range [0, gpu) of down.
+            tm, tn, sg = self._tile(m, 2 * gpu, channels)
+            key = ("ffn_share", w.untyped_storage().data_ptr(), w.storage_offset(), gpu, tn // 2)
+            if key not in self._repacked:
+                block = tn // 2
+                source = w.detach().to("cpu")
+                gate, up = source[:, :gpu], source[:, hidden:hidden + gpu]
+                packed = torch.stack((gate.reshape(channels, -1, block), up.reshape(channels, -1, block)), 2)
+                self._repacked[key] = Weight(packed.reshape(channels, 2 * gpu).contiguous(),
+                                             g["w"].name + f".gelu_mul{block}.share{gpu}")
+            hidden_gpu = self.allocate((int(m), gpu))
+            self._gemm("_gelu_mul", dict(g, n=2 * gpu), hidden_gpu, self._repacked[key], 2 * gpu)
+            self.external(task, wait=True)
+            down = Weight(wd[:gpu], d["w"].name + f".share{gpu}")
+            self._repacked[("ffn_down", wd.untyped_storage().data_ptr(), wd.storage_offset(), gpu)] = down
+            tm, tn, sg = self._tile(m, d["n"], gpu)
+            Plan.dispatch(self, f"gemm_residual_partial_bf16{TILES[(tm, tn, sg)]}",
+                          [hidden_gpu, down, out, partial], {2}, [m, d["n"], gpu, capacity],
+                          ((d["n"] + tn - 1) // tn, (m + tm - 1) // tm), sg * 32)
+        finally:
+            self.stage = current
+        self.coprocessor_tasks.append(dict(task=task, stage=g["stage"], gpu_hidden=gpu, coprocessor_hidden=share,
+                                           rows=capacity, model=model))
+        self.fused.append(("coprocessor_ffn", g["stage"], (m, g["n"], g["k"])))
+        return True
 
     def _packed_gelu_mul(self, w, block):
         tensor = w.tensor
@@ -240,9 +353,11 @@ class FusedPlan(Plan):
             tm, tn, sg = self._tile(p["m"], p["n"], p["k"])
             if (p["n"] // 2) % (tn // 2):
                 return False
-            weight = self._packed_gelu_mul(p["w"], tn // 2)
-            self._gemm("_gelu_mul", p, out, weight, p["n"])
-            self.fused.append(("gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))
+            if self._coprocessor_share(p) is not None:
+                # Hold until the down projection and its residual show the whole FFN.
+                self._pending = dict(ffn=dict(gemm=p, hidden=out))
+                return True
+            self._emit_gelu_mul(p, out)
             return True
         if name == "tr_residual" and len(params) == 3 and params[2] == 0:
             residual, update, out = (self.bind(t) for t in tensors[:3])

@@ -24,6 +24,7 @@ class NativePi05Plan:
         dynamic_prompt=True,
         pad_prompt=False,
         fused=True,
+        neural_engine=None,
     ):
         if not source.compact_encoder or not source.precompute_modulation:
             raise ValueError(
@@ -35,11 +36,15 @@ class NativePi05Plan:
             raise ValueError("pad_prompt requires dynamic_prompt=True")
         if dynamic_prompt and int8_options is not None and int8_options.get("observe"):
             raise ValueError("Calibration requires dynamic_prompt=False to observe only real tokens")
+        if neural_engine is not None and (not fused or int8_options is not None):
+            raise ValueError("neural_engine requires the fused BF16 plan")
         if int8_options is None:
             # fused=False reproduces the original one-dispatch-per-operation lowering.
+            # neural_engine (opt-in) splits each prefix FFN between GPU and a Core ML
+            # program; see FusedPlan for the contract and options.
             if fused:
                 from flash_rt.hardware.apple_native.fused import FusedPlan
-                self.plan = FusedPlan(library)
+                self.plan = FusedPlan(library, coprocessor=neural_engine)
             else:
                 self.plan = Plan(library)
         else:
