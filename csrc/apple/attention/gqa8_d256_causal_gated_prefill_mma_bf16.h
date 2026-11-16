@@ -25,6 +25,7 @@ struct GatedPrefillAttention {
 constant constexpr uint NP=8u;               // positions (= SIMD groups) per threadgroup
 constant constexpr uint THREADS=NP*32u;
 constant constexpr uint SPAN=16u;            // keys staged per barrier pair
+constant constexpr uint NF=SPAN/8u;          // 8-key fragments per stage
 constant constexpr uint D=256u,FR=D/8u;      // head dimension, 8-wide fragments
 constant constexpr uint LDK=SPAN+8u;         // K blocks, transposed: [D dims][SPAN keys + pad]
 constant constexpr uint LDV=D+8u;            // V blocks: [SPAN keys][D dims + pad]
@@ -47,7 +48,6 @@ kernel void gqa8_d256_causal_gated_prefill_mma_bf16(const device bfloat* q [[buf
     const uint nr=min(NP,rows-row0);
     threadgroup bfloat Ks[D*LDK];
     threadgroup bfloat Vs[SPAN*LDV];
-    // Fragment coordinates: this lane holds row fy, columns fx and fx + 1 of each 8x8 tile.
     const ushort qid=lane/4u,fy=(qid&4u)+(lane/2u)%4u,fx=(qid&2u)*2u+(lane%2u)*2u;
     const float scale=p.scale*M_LOG2E_F;
     const float lowest=-3.402823466e+38f;
@@ -61,82 +61,72 @@ kernel void gqa8_d256_causal_gated_prefill_mma_bf16(const device bfloat* q [[buf
     const device bfloat* kbase=kv+p.kv+size_t(kh)*p.cap*D;
     const device bfloat* vbase=kv+p.kv+size_t(p.kv_heads)*p.cap*D+size_t(kh)*p.cap*D;
     const uint key_end=pos0+row0+nr;
-    // K/V blocks are software-pipelined: the next block's rows are read into registers before the current
-    // block is computed and stored to threadgroup memory at the top of the next iteration.
+    // K/V blocks go straight into threadgroup memory: holding the next block in registers costs more than it saves
+    // with 64 accumulator registers per lane.
     constexpr uint NL=SPAN*(D/8u)/THREADS;   // 16-byte K and V pieces per thread and stage
-    uint4 kreg[NL],vreg[NL];
-#define FRT_FETCH(from) \
-    FRT_UNROLL for(uint l=0;l<NL;++l) { \
-        uint i=t+l*THREADS,key=i/(D/8u),c=(i%(D/8u))*8u,src=(from)+key; \
-        bool ok=src<key_end; \
-        kreg[l]=ok?*(const device uint4*)(kbase+size_t(src)*D+c):uint4(0u); \
-        vreg[l]=ok?*(const device uint4*)(vbase+size_t(src)*D+c):uint4(0u); \
-    }
-    FRT_FETCH(0u)
     for(uint begin=0;begin<key_end;begin+=SPAN) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         FRT_UNROLL for(uint l=0;l<NL;++l) {
-            uint i=t+l*THREADS,key=i/(D/8u),c=(i%(D/8u))*8u;
-            *(threadgroup uint4*)(Vs+key*LDV+c)=vreg[l];
-            thread const bfloat* ke=(thread const bfloat*)&kreg[l];
+            uint i=t+l*THREADS,key=i/(D/8u),c=(i%(D/8u))*8u,src=begin+key;
+            bool ok=src<key_end;
+            const uint4 kreg=ok?*(const device uint4*)(kbase+size_t(src)*D+c):uint4(0u);
+            *(threadgroup uint4*)(Vs+key*LDV+c)=ok?*(const device uint4*)(vbase+size_t(src)*D+c):uint4(0u);
+            thread const bfloat* ke=(thread const bfloat*)&kreg;
             FRT_UNROLL for(uint e=0;e<8;++e)Ks[(c+e)*LDK+key]=ke[e];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if(begin+SPAN<key_end){FRT_FETCH(begin+SPAN)}
-        simdgroup_float8x8 s0=simdgroup_float8x8(0.0f),s1=simdgroup_float8x8(0.0f);
+        simdgroup_float8x8 s[NF];
+        FRT_UNROLL for(uint j=0;j<NF;++j)s[j]=simdgroup_float8x8(0.0f);
         for(uint dd=0;dd<FR;++dd) {
-            simdgroup_float8x8 k0,k1,qd;
+            simdgroup_float8x8 qd;
             const float2 a=float2(*(const device bfloat2*)(qr+8u*dd));
             qd.thread_elements()[0]=a.x;qd.thread_elements()[1]=a.y;
             const threadgroup bfloat* kr=Ks+(8u*dd+fy)*LDK+fx;
-            float2 b0=ld2(kr),b1=ld2(kr+8);
-            k0.thread_elements()[0]=b0.x;k0.thread_elements()[1]=b0.y;
-            k1.thread_elements()[0]=b1.x;k1.thread_elements()[1]=b1.y;
-            simdgroup_multiply_accumulate(s0,qd,k0,s0);
-            simdgroup_multiply_accumulate(s1,qd,k1,s1);
+            FRT_UNROLL for(uint j=0;j<NF;++j) {
+                simdgroup_float8x8 kf;
+                float2 b0=ld2(kr+8u*j);
+                kf.thread_elements()[0]=b0.x;kf.thread_elements()[1]=b0.y;
+                simdgroup_multiply_accumulate(s[j],qd,kf,s[j]);
+            }
         }
-        float v[2][2];
-        const bool open=live && begin+16u<=key_end && int(begin)+15<=qpos;
-        FRT_UNROLL for(uint j=0;j<2;++j)FRT_UNROLL for(uint e=0;e<2;++e) {
-            float x=(j?s1:s0).thread_elements()[e]*scale;
+        float v[NF][2];
+        const bool open=live && begin+SPAN<=key_end && int(begin)+int(SPAN)-1<=qpos;
+        FRT_UNROLL for(uint j=0;j<NF;++j)FRT_UNROLL for(uint e=0;e<2;++e) {
+            float x=s[j].thread_elements()[e]*scale;
             uint src=begin+8u*j+fx+e;
             bool ok=open || (live && src<key_end && int(src)<=qpos);
             v[j][e]=ok?x:lowest;
         }
         float new_max=max_score;
-        FRT_UNROLL for(uint j=0;j<2;++j) {
+        FRT_UNROLL for(uint j=0;j<NF;++j) {
             float thr=max(v[j][0],v[j][1]);
             float qgr=max(thr,simd_shuffle_xor(thr,ushort(1)));
             float sgr=max(qgr,simd_shuffle_xor(qgr,ushort(8)));
             new_max=max(new_max,sgr);
         }
         float sum_tmp=0.0f;
-        FRT_UNROLL for(uint j=0;j<2;++j) {
+        FRT_UNROLL for(uint j=0;j<NF;++j) {
             float a=v[j][0]==lowest?0.0f:metal::fast::exp2(v[j][0]-new_max);
             float b=v[j][1]==lowest?0.0f:metal::fast::exp2(v[j][1]-new_max);
-            v[j][0]=a;v[j][1]=b;
+            s[j].thread_elements()[0]=a;s[j].thread_elements()[1]=b;
             float thr=a+b;
             float qgr=thr+simd_shuffle_xor(thr,ushort(1));
             float sgr=qgr+simd_shuffle_xor(qgr,ushort(8));
             sum_tmp=sum_tmp+sgr;
         }
-        s0.thread_elements()[0]=v[0][0];s0.thread_elements()[1]=v[0][1];
-        s1.thread_elements()[0]=v[1][0];s1.thread_elements()[1]=v[1][1];
         const float factor=max_score==lowest?0.0f:metal::fast::exp2(max_score-new_max);
         max_score=new_max;
         sum_score=sum_score*factor+sum_tmp;
+        const threadgroup bfloat* vr=Vs+fy*LDV+fx;
         FRT_UNROLL for(uint dd=0;dd<FR;++dd) {
             o[dd].thread_elements()[0]*=factor;
             o[dd].thread_elements()[1]*=factor;
-        }
-        const threadgroup bfloat* vr=Vs+fy*LDV+fx;
-        FRT_UNROLL for(uint dd=0;dd<FR;++dd) {
-            simdgroup_float8x8 v0,v1;
-            float2 c0=ld2(vr+8u*dd),c1=ld2(vr+8u*LDV+8u*dd);
-            v0.thread_elements()[0]=c0.x;v0.thread_elements()[1]=c0.y;
-            v1.thread_elements()[0]=c1.x;v1.thread_elements()[1]=c1.y;
-            simdgroup_multiply_accumulate(o[dd],s0,v0,o[dd]);
-            simdgroup_multiply_accumulate(o[dd],s1,v1,o[dd]);
+            FRT_UNROLL for(uint j=0;j<NF;++j) {
+                simdgroup_float8x8 vf;
+                float2 c0=ld2(vr+8u*j*LDV+8u*dd);
+                vf.thread_elements()[0]=c0.x;vf.thread_elements()[1]=c0.y;
+                simdgroup_multiply_accumulate(o[dd],s[j],vf,o[dd]);
+            }
         }
     }
     if(!live)return;
