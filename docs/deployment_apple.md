@@ -24,6 +24,10 @@ Flint (the text LLM, MLX affine int4 checkpoint) runs on its own native Metal
 path: a resident decode kernel and chunked prefill programs on the same plan
 library, without PyTorch. See [Flint on Apple Silicon](flint_apple_usage.md).
 
+Qwen3.6-35B-A3B (MLX affine int4 export, text decoder) runs the same way: a
+resident decode step whose one-token arithmetic is bit-identical to `mlx-lm`, and a
+chunked prefill. See [Qwen3.6-35B-A3B on Apple Silicon](qwen36_moe_apple_usage.md).
+
 ## Python environment with uv
 
 Use a native arm64 Python, macOS 14 or newer and an MPS-enabled PyTorch build
