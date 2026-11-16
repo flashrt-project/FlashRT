@@ -362,6 +362,18 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
             self.decode(tokens[i], i, 1, program="greedy")
         return self.decode(tokens[n - 1], n - 1, 1, program=program, **sampling)[0]
 
+    def recurrent_state(self) -> tuple:
+        """Copy of the DeltaNet states and conv rings with the position, for ``restore_recurrent_state``. The KV
+        cache needs no copy to restart decoding at ``pos``: decode rewrites every slot from that position on."""
+        return (self.plan.read(self.buf["states"], 0, np.uint8, self.state_elements * 4),
+                self.plan.read(self.buf["rings"], 0, np.uint8, self.ring_elements * 2), self.pos)
+
+    def restore_recurrent_state(self, state: tuple) -> None:
+        """Return to the state captured by ``recurrent_state`` (e.g. to time several decodes from one prompt)."""
+        states, rings, self.pos = state
+        self.plan.write(self.buf["states"], 0, states)
+        self.plan.write(self.buf["rings"], 0, rings)
+
     def logits(self, step: int = 0) -> np.ndarray:
         """BF16 logits (raw uint16) of ``step`` in the last decode block."""
         v = self.cfg.vocab_size
