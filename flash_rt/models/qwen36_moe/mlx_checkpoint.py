@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -162,9 +162,6 @@ class Qwen35MoeMLXCheckpoint:
                 if name in self._index:
                     raise ValueError(f"tensor {name} appears in more than one shard")
                 self._index[name] = f
-
-    def names(self) -> Iterator[str]:
-        return (n[len(PREFIX):] for n in self._index if n.startswith(PREFIX))
 
     def tensor(self, name: str) -> np.ndarray:
         """Text-decoder tensor ``name`` (without the ``language_model.`` prefix); BF16 as raw uint16."""

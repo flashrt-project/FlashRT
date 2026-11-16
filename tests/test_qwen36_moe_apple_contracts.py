@@ -50,6 +50,12 @@ print(json.dumps(sorted(n for n in sys.modules if n.split('.')[0] in
     assert json.loads(result.stdout) == []
 
 
+def test_routing_entry():
+    from flash_rt.hardware import _PIPELINE_MAP
+    assert _PIPELINE_MAP[("qwen36_moe", "torch", "apple_mps")] == (
+        "flash_rt.frontends.torch.qwen36_moe_mps", "Qwen36MoeTorchFrontendMps")
+
+
 def test_config_and_geometry():
     raw = _config()
     cfg = config_from_json(raw, {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "eos_token_id": [248046, 248044]})
@@ -101,6 +107,7 @@ def _fake_runtime(logits=None, noise=None):
     from flash_rt.frontends.torch._qwen36_moe_mps_runtime import Qwen36MoeRuntime
     rt = Qwen36MoeRuntime.__new__(Qwen36MoeRuntime)
     rt.max_seq, rt.prefill_chunk = 16384, 2048
+    rt.cfg = SimpleNamespace(vocab_size=16384)
     rt.buf = {"tokens": 0, "noise": 1}
     rt.programs = {name: name for name in ("prefill", "prefill_small", "prefill_head", "noise")}
     rt._state = np.zeros(4, np.uint32)
@@ -150,6 +157,25 @@ def test_prefill_samples_the_first_token(n):
     rt, runs, _, _ = _fake_runtime(logits)
     assert rt.prefill(list(range(n)), seed=123, **sampling) == 0          # greedy ignores the noise
     assert "noise" not in [p for p, _ in runs]
+
+
+def test_runtime_rejects_bad_sampling_and_token_ids():
+    rt, runs, _, _ = _fake_runtime(np.zeros(64, np.float32))
+    for bad in (dict(top_k=0), dict(top_k=33), dict(top_k=20, top_p=0.0)):
+        with pytest.raises(ValueError, match="top_k"):
+            rt.prefill([1, 2, 3], program="sampled", **bad)
+        with pytest.raises(ValueError, match="top_k"):
+            rt.decode(1, 0, 1, program="sampled", **bad)
+        with pytest.raises(ValueError, match="top_k"):
+            rt.select("sampled", **bad)
+    for ids in ([1, 16384], [-1, 2]):
+        with pytest.raises(ValueError, match="vocabulary"):
+            rt.prefill(ids)
+    with pytest.raises(ValueError, match="vocabulary"):
+        rt.decode(16384, 0, 1)
+    with pytest.raises(ValueError, match="vocabulary"):
+        rt.decode(1, 0, 1, eos=[16384])
+    assert runs == []                                                 # nothing reached the GPU
 
 
 def test_first_token_selection_rule():

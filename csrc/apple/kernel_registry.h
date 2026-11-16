@@ -102,7 +102,7 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { W4A16Options o; o.grouped = true; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_grouped_swiglu", "gemm_w4a16_affine",
      [] { W4A16Options o; o.grouped = true; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
-    // Split-K partitions (M <= 512 rows) keep the two-SIMD-group threadgroup qualified against MLX.
+    // The same products on the single-chain path for every row count (expert blocks of any size).
     {"gemm_w4a16_affine_direct", "gemm_w4a16_affine",
      [] { W4A16Options o; o.direct = true; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_direct_residual", "gemm_w4a16_affine",
@@ -113,6 +113,7 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { W4A16Options o; o.grouped = true; o.direct = true; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_grouped_direct_swiglu", "gemm_w4a16_affine",
      [] { W4A16Options o; o.grouped = true; o.direct = true; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+    // Split-K partitions (M <= 512 rows) keep the two-SIMD-group threadgroup qualified against MLX.
     {"gemm_w4a16_affine_splitk", "gemm_w4a16_affine",
      [] { W4A16Options o; o.splitk = true; o.simdgroups = 2; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_splitk_residual", "gemm_w4a16_affine",
@@ -189,7 +190,6 @@ inline constexpr KernelSource kernel_registry[] = {
     {"qwen35moe_deltanet_ring_bf16", "qwen35moe_deltanet_ring_bf16", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_deltanet_gate_rows_bf16", "qwen35moe_deltanet_gate_rows_bf16", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_qk_norm_rope_kv_rows_bf16", "qwen35moe_qk_norm_rope_kv_rows_bf16", qwen35moe_prefill_rows_bf16_source},
-    {"qwen35moe_router_top8_rows_bf16", "qwen35moe_router_top8_rows_bf16", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_router_top8_dense_rows_bf16", "qwen35moe_router_top8_dense_rows_bf16",
      qwen35moe_router_rows_bf16_source},
     {"qwen35moe_expert_count", "qwen35moe_expert_count", qwen35moe_prefill_rows_bf16_source},

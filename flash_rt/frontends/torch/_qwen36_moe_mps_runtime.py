@@ -2,7 +2,9 @@
 
 Weights stay in the checkpoint's MLX affine form (4-bit codes with BF16 scale/bias per 64 inputs; 8-bit for
 the router and the shared-expert gate; BF16 norms, conv and DeltaNet gate parameters): the bytes are copied
-verbatim into one shared Metal buffer and addressed through a per-layer descriptor table of 64-bit offsets.
+verbatim into one shared Metal buffer and addressed through a per-layer descriptor table of 64-bit offsets. The
+only derived data is a BF16 copy of each layer's router (``bf16(scale * q + bias)``, 1 MB per layer), which the
+prefill's router product reads; the decode step reads the 8-bit codes.
 Model state: BF16 KV cache of the ten attention layers (slot = position), FP32 recurrent state of the thirty
 DeltaNet layers ([32, 128, 128] each) and their last conv input frames (BF16, a four-slot ring, slot = position
 mod 4). The steady-state decode step is one resident dispatch that runs up to eight tokens; the host writes the
@@ -20,15 +22,15 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 from flash_rt.hardware.apple_native.native import NativePlan
-from flash_rt.models.flint.mlx_checkpoint import AffineMatrix, bf16_to_f32
+from flash_rt.models.flint.mlx_checkpoint import AffineMatrix, bf16_to_f32, f32_to_bf16
 from flash_rt.models.qwen36_moe.mlx_checkpoint import (
     Qwen35MoeConfig, Qwen35MoeConfigError, Qwen35MoeMLXCheckpoint)
 from flash_rt.models.qwen36_moe.pipeline_mps import (
     BLOCK, D_ALOG, D_AUX, D_CONV, D_DOWN, D_DT, D_EMBED, D_FINAL_NORM, D_FLAGS, D_GATE, D_GDN_NORM, D_HEAD,
-    D_IN_NORM, D_K_NORM, D_M0, D_M1, D_M2, D_M3, D_OUT, D_POST_NORM, D_Q_NORM, D_ROUTER, D_ROUTER_DENSE, D_SGATE, D_SH_DOWN,
-    D_SH_GATE, D_SH_UP, D_STATE, D_UP, DECODE_KERNELS, DESCRIPTOR, PARTIALS, RING_ELEMENTS, STATE_ELEMENTS,
-    SMALL_ROWS, STATE_WORDS, STATISTICS, WORKERS, WORKSPACE, GROUPED_TM, Qwen36MoePipelineMps, Qwen36MoePrefillMps,
-    check_geometry)
+    D_IN_NORM, D_K_NORM, D_M0, D_M1, D_M2, D_M3, D_OUT, D_POST_NORM, D_Q_NORM, D_ROUTER, D_ROUTER_DENSE,
+    D_SGATE, D_SH_DOWN, D_SH_GATE, D_SH_UP, D_STATE, D_UP, DECODE_KERNELS, DESCRIPTOR, GROUPED_TM, PARTIALS,
+    RING_ELEMENTS, SMALL_ROWS, STATE_ELEMENTS, STATE_WORDS, STATISTICS, WORKERS, WORKSPACE,
+    Qwen36MoePipelineMps, Qwen36MoePrefillMps, check_geometry)
 
 ALIGN = 256
 ROUTING = 1280
@@ -47,7 +49,6 @@ _PARAM_LAYOUTS = {
     "delta": ((), ("conv", "alog", "dt", "norm", "ring", "state"), ()),
     "qk": (("cap", "pad"), ("q_norm", "k_norm", "kv"), ("logbase", "pad2")),
     "attention": (("kv_heads", "cap", "gate_stride", "pad"), ("kv",), ("scale", "pad2")),
-    "router": ((), ("w", "s", "b", "gw", "gs", "gb"), ()),
     "router_dense": ((), ("dense", "gw", "gs", "gb"), ()),
     "scan": (("tile_rows", "pad"), (), ()),
     "uint": (("value",), (), ()),
@@ -55,12 +56,12 @@ _PARAM_LAYOUTS = {
 
 
 def _dequantize_bf16(m: AffineMatrix) -> np.ndarray:
-    """``bf16(scale * q + bias)`` per element (one rounding, to nearest even), as raw uint16 [rows, k]."""
+    """``bf16(fma(scale, q, bias))`` per element as raw uint16 [rows, k]: the FP32 fused multiply-add the w4a16
+    product kernels use for their weight tiles, rounded to BF16 (the float64 product and sum are exact)."""
     q = m.codes.astype(np.float64).reshape(m.rows, -1, 64)
-    w = (q * bf16_to_f32(m.scales).astype(np.float64)[..., None] + bf16_to_f32(m.biases).astype(np.float64)[..., None])
-    mant, exp = np.frexp(w.reshape(m.rows, -1))
-    rounded = np.ldexp(np.rint(mant * 256.0) / 256.0, exp).astype(np.float32)   # 8 significant bits: BF16-exact
-    return (rounded.view(np.uint32) >> 16).astype(np.uint16)
+    scales = bf16_to_f32(m.scales).astype(np.float64)[..., None]
+    biases = bf16_to_f32(m.biases).astype(np.float64)[..., None]
+    return f32_to_bf16((q * scales + biases).astype(np.float32).reshape(m.rows, -1))
 
 
 class _Layout:
@@ -83,8 +84,9 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 32768, library: Optional[str] = None,
                  prefill_chunk: int = MAX_CHUNK, prefill_layers: int = 0):
-        """``prefill_chunk``: rows per prefill program (mlx-lm prefills in steps of 2048 tokens).
-        ``prefill_layers``: diagnostic, prefill only the first layers."""
+        """``prefill_chunk``: rows per prefill program, 513..2048 (mlx-lm prefills in steps of 2048 tokens; a
+        prompt's last chunk below 513 rows takes the small-chunk program). ``prefill_layers``: diagnostic,
+        prefill only the first layers."""
         if not SMALL_ROWS <= prefill_chunk <= MAX_CHUNK:
             raise ValueError(f"prefill_chunk must be in [{SMALL_ROWS}, {MAX_CHUNK}]")
         if max_seq < 1:
@@ -170,9 +172,9 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
                 d[D_CONV] = layout.add(self._bf16(a + "conv1d.weight", (cfg.conv_dim, cfg.conv_kernel, 1)))
                 d[D_ALOG] = layout.add(self._bf16(a + "A_log", (V,)))
                 d[D_DT] = layout.add(self._bf16(a + "dt_bias", (V,)))
-                for base, name, rows, k in ((D_M0, "in_proj_qkv", cfg.conv_dim, H), (D_M1, "in_proj_z", cfg.value_dim, H),
-                                            (D_M2, "in_proj_b", V, H), (D_M3, "in_proj_a", V, H),
-                                            (D_OUT, "out_proj", H, cfg.value_dim)):
+                for base, name, rows, k in ((D_M0, "in_proj_qkv", cfg.conv_dim, H),
+                                            (D_M1, "in_proj_z", cfg.value_dim, H), (D_M2, "in_proj_b", V, H),
+                                            (D_M3, "in_proj_a", V, H), (D_OUT, "out_proj", H, cfg.value_dim)):
                     d[base:base + 4] = self._matrix(layout, self._affine(a + name, rows, k), rows)
                 d[D_STATE], d[D_AUX] = state_offset, ring_offset
                 state_offset += STATE_ELEMENTS
@@ -182,14 +184,17 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
             d[D_ROUTER:D_ROUTER + 4] = self._matrix(layout, router, E)
             d[D_ROUTER_DENSE] = layout.add(_dequantize_bf16(router))
             d[D_SGATE:D_SGATE + 4] = self._matrix(layout, self._affine(m + "shared_expert_gate", 1, H, bits=8), 1)
-            for base, name, rows, k in ((D_GATE, "gate_proj", I, H), (D_UP, "up_proj", I, H), (D_DOWN, "down_proj", H, I)):
-                d[base:base + 4] = self._matrix(layout, self._affine(m + "switch_mlp." + name, rows, k, experts=E), rows)
+            for base, name, rows, k in ((D_GATE, "gate_proj", I, H), (D_UP, "up_proj", I, H),
+                                        (D_DOWN, "down_proj", H, I)):
+                expert = self._affine(m + "switch_mlp." + name, rows, k, experts=E)
+                d[base:base + 4] = self._matrix(layout, expert, rows)
             for base, name, rows, k in ((D_SH_GATE, "gate_proj", S, H), (D_SH_UP, "up_proj", S, H),
                                         (D_SH_DOWN, "down_proj", H, S)):
                 d[base:base + 4] = self._matrix(layout, self._affine(m + "shared_expert." + name, rows, k), rows)
         f = table[cfg.num_layers]
         f[D_FINAL_NORM] = layout.add(self._bf16("model.norm.weight", (H,)))
-        f[D_EMBED:D_EMBED + 4] = self._matrix(layout, self._affine("model.embed_tokens", cfg.vocab_size, H), cfg.vocab_size)
+        embedding = self._affine("model.embed_tokens", cfg.vocab_size, H)
+        f[D_EMBED:D_EMBED + 4] = self._matrix(layout, embedding, cfg.vocab_size)
         f[D_HEAD:D_HEAD + 4] = self._matrix(layout, self._affine("lm_head", cfg.vocab_size, H), cfg.vocab_size)
 
         self.weight_bytes = layout.size
@@ -281,7 +286,11 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
             raise ValueError(f"prefill start {start} outside [0, {n})")
         if n > self.max_seq:
             raise ValueError(f"prompt length {n} exceeds max_seq {self.max_seq}")
-        self.plan.write(self.buf["tokens"], 0, np.asarray(tokens, dtype=np.uint32))
+        ids = np.asarray(tokens, dtype=np.int64)
+        if ids.min() < 0 or ids.max() >= self.cfg.vocab_size:
+            raise ValueError("prompt token id outside the checkpoint vocabulary")
+        self._check_sampling(program, top_k, top_p)
+        self.plan.write(self.buf["tokens"], 0, ids.astype(np.uint32))
         if start == 0:
             self.reset()
         pos, timings = start, []
@@ -303,10 +312,11 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
         """Token from the logits in decode slot 0 by the decode programs' rule: greedy argmax (lowest id on
         ties), or top-k by logit (ties: larger id first), nucleus cut on the cumulative probability, then the
         maximum of log-probability / temperature + noise (ties: lowest id)."""
+        self._check_sampling(program, top_k, top_p)
         x = bf16_to_f32(self.logits(0)).astype(np.float64)
         if program != "sampled":
             return int(np.argmax(x))
-        k = max(1, min(int(top_k), 32))
+        k = int(top_k)
         order = np.lexsort((-np.arange(x.size), -x))[:k]
         m = x.max()
         lse = m + np.log(np.exp(x - m).sum())
@@ -326,13 +336,18 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
         self.pos = 0
 
     # ------------------------------------------------------------------- decode
+    @staticmethod
+    def _check_sampling(program: str, top_k: int, top_p: float) -> None:
+        """The fused sampler keeps the ``top_k`` largest logits in 32 slots; nothing would be selected at 0."""
+        if program == "sampled" and (not 1 <= int(top_k) <= 32 or not 0.0 < float(top_p) <= 1.0):
+            raise ValueError("the sampled program needs 1 <= top_k <= 32 and 0 < top_p <= 1")
+
     def _decode_params(self, token, position, steps, eos, top_k, top_p, temperature, seed) -> np.ndarray:
         p = np.zeros(16, dtype=np.uint32)
         p[0], p[1], p[2], p[3] = token, position, steps, len(eos)
         p[4:4 + len(eos)] = list(eos)
         p[8] = top_k
         p[9:11] = np.array([top_p, 1.0 / temperature if temperature else 1.0], dtype=np.float32).view(np.uint32)
-        p[11] = getattr(self, "debug_layer", 0)
         if seed is not None:
             p[12], p[13], p[14] = int(seed) & 0xFFFFFFFF, (int(seed) >> 32) & 0xFFFFFFFF, 1
         return p
@@ -350,6 +365,9 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
             raise ValueError(f"decode range [{position}, {position + steps}) exceeds max_seq {self.max_seq}")
         if len(eos) > 4:
             raise ValueError("at most four stop tokens")
+        if not 0 <= int(token) < self.cfg.vocab_size or any(not 0 <= int(e) < self.cfg.vocab_size for e in eos):
+            raise ValueError("token id outside the checkpoint vocabulary")
+        self._check_sampling(program, top_k, top_p)
         self._params[:] = self._decode_params(token, position, steps, eos, top_k, top_p, temperature, seed)
         self._control[:] = 0
         self._diagnostic[:] = 0

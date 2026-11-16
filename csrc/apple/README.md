@@ -23,6 +23,8 @@ attention/
   gqa_merge_fp32_bf16.h           FP32 partials -> BF16 output
   gqa8_causal_prefill_bf16.h      GQA-8 causal / sliding-window prefill with sinks (TensorOps)
   gqa8_causal_prefill_mma_bf16.h  the same on 8x8 SIMD-group MMAs (default prefill path)
+  gqa8_d256_causal_gated_prefill_mma_bf16.h
+                                  GQA-8 causal prefill for 256-wide heads with an output gate (MMAs)
 conv/
   patch_pack_bf16.h               NHWC patch extraction
   patch_probe_bf16.h              diagnostic NCHW patch view
@@ -41,6 +43,12 @@ flint/                            kernels specialized to Flint's geometry (flint
   flint_decode_resident_bf16.h    resident MoE decode step (int4 affine weights)
   flint_prefill_rows_bf16.h       prefill rows: embedding, RMSNorm, Q/K norm + RoPE, KV ring copies
   flint_moe_rows_bf16.h           router top-k, expert count / scan / placement / combine
+qwen35moe/                        kernels specialized to the qwen3_5_moe geometry (qwen35moe_* entries)
+  qwen35moe_decode_resident_bf16.h
+                                  resident decode step: Gated DeltaNet, gated attention, MoE
+  qwen35moe_prefill_rows_bf16.h   prefill rows: embedding, DeltaNet conv / recurrence / gated norm,
+                                  Q/K norm + RoPE, expert count / placement / combine
+  qwen35moe_router_rows_bf16.h    prefill router: TensorOps logits, softmax top-8, shared-expert gate
 kernel_registry.h                dispatch name -> source builder / entry point
 ```
 
@@ -72,12 +80,19 @@ Weight packing, buffer allocation and compilation stay in setup.
 Kernels that hard-code one model's geometry live under `flint/` with a `flint_`
 prefix on file, source builder and registry entry, like `csrc/kernels/flint/` in
 the CUDA tree; the Flint runtime checks the checkpoint geometry against them
-before it compiles anything. The w4a16 affine GEMM / row-vector kernels, the
+before it compiles anything. `qwen35moe/` follows the same rule for the
+qwen3_5_moe text decoder (Qwen3.6-35B-A3B; see
+`docs/qwen36_moe_apple_usage.md`); its prefill also dispatches two `flint_`
+kernels that fit its geometry (RMSNorm rows over 2048, the expert-count scan).
+The w4a16 affine GEMM / row-vector kernels, the
 GQA-8 prefill attention and the Gumbel noise rows are model independent (shape
 constraints stated in each header). Together they keep the exported MLX affine
 int4 weights and reproduce MLX's arithmetic for each operation, including the
 reduction orders MLX uses for a given row count (split-K partitions, vector
 paths); the headers state the reproduced rule. See `docs/flint_apple_usage.md`.
+The `gemm_w4a16_affine*_direct*` entries are the same products on the
+single-chain path for every row count, for callers that do not need MLX's
+small-row accumulation.
 
 ## Adding a precision or implementation
 

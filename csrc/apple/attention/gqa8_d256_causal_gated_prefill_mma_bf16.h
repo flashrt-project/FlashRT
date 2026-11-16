@@ -11,7 +11,8 @@ namespace flashrt::apple::shaders {
 // Per row: keys in blocks of 16 from position 0, S = Q.K^T by FP32 MMAs chained over the 32 head-dimension
 // fragments, scaled by scale*log2(e), masked scores at the lowest finite value, P = exp2(S - max) with a running
 // maximum, O rescaled per block, O += P.V, O / sum at the end, rounded to BF16 and multiplied by
-// sigmoid(gate) (BF16, each operation rounded). Blocks a row cannot see are skipped. Output BF16
+// sigmoid(gate) (BF16, each operation rounded). A threadgroup visits the blocks up to its last position; keys a
+// row cannot see are masked. Output BF16
 // [row][q_head*256 + d]; the gates come from the projection output [row][q_head*512 + 256 + d].
 // Keys and values: cache slots [0, pos0 + rows) (slot == position), K [kv_heads][cap][256] then V.
 inline std::string gqa8_d256_causal_gated_prefill_mma_bf16_source() {
