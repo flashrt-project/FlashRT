@@ -163,12 +163,13 @@ inline constexpr KernelSource kernel_registry[] = {
     {"flint_decode_verify4_bf16", "flint_decode_verify_bf16",
      [] { FlintDecodeOptions o; o.verify_rows = 4; return flint_decode_resident_bf16_source(o); }},
     // qwen3_5_moe resident decode step (MLX affine int4 g64 weights, BF16 activations/KV, FP32 DeltaNet
-    // state): greedy, fused top-k/top-p sampling, and greedy with the residual-stream trace.
+    // state): greedy, fused top-k/top-p sampling, and greedy with the residual-stream trace used for
+    // bit-exact qualification (the three share one arithmetic).
     {"qwen35moe_decode_resident_bf16", "qwen35moe_decode_resident_bf16",
      [] { return qwen35moe_decode_resident_bf16_source(); }},
     {"qwen35moe_decode_resident_sampled_bf16", "qwen35moe_decode_resident_bf16",
      [] { Qwen35MoeDecodeOptions o; o.sampled = true; return qwen35moe_decode_resident_bf16_source(o); }},
-    {"qwen35moe_decode_resident_trace_bf16", "qwen35moe_decode_resident_bf16",
+    {"qwen35moe_decode_resident_reference_bf16", "qwen35moe_decode_resident_bf16",
      [] { Qwen35MoeDecodeOptions o; o.trace = true; return qwen35moe_decode_resident_bf16_source(o); }},
     // qwen3_5_moe chunked-prefill row kernels and the causal gated attention for 256-wide heads.
     {"qwen35moe_embed_affine4_rows_bf16", "qwen35moe_embed_affine4_rows_bf16", qwen35moe_prefill_rows_bf16_source},

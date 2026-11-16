@@ -56,7 +56,7 @@ def check_geometry(cfg: Qwen35MoeConfig) -> None:
 DECODE_KERNELS = {
     "greedy": "qwen35moe_decode_resident_bf16",
     "sampled": "qwen35moe_decode_resident_sampled_bf16",
-    "trace": "qwen35moe_decode_resident_trace_bf16",
+    "reference": "qwen35moe_decode_resident_reference_bf16",
 }
 
 

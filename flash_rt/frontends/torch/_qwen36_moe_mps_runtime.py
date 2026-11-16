@@ -381,7 +381,7 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
 
     def trace(self, step: int = 0) -> np.ndarray:
         """Residual stream after the embedding and after every layer of ``step`` in the last block of the
-        ``trace`` program (raw BF16 [layers + 1, hidden]); the other programs do not write it."""
+        ``reference`` program (raw BF16 [layers + 1, hidden]); the other programs do not write it."""
         rows = self.cfg.num_layers + 1
         n = rows * self.cfg.hidden_size
         return self.plan.read(self.buf["trace"], step * n * 2, np.uint16, n).reshape(rows, -1)
