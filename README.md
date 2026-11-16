@@ -303,6 +303,22 @@ decode program to its resident kernel. Same Mac (M4 Pro, 64 GB), same token
 ids, batch 1; the reference is rec v0.1.1 (MLX).
 [Protocol, equivalence and reproduction](docs/flint_apple_usage.md).
 
+#### Qwen3.6-35B-A3B (MLX int4, Apple Silicon)
+
+Native Metal plan for the text decoder of `mlx-community/Qwen3.6-35B-A3B-4bit`
+on M4 Pro / M4 Max at the checkpoint's precision (affine int4 g64 weights, BF16
+activations and KV, FP32 DeltaNet state). A one-token decode step is
+bit-identical to `mlx-lm`'s. Same Mac (M4 Pro, 64 GB), same token ids, batch 1,
+interleaved runs; the reference is mlx-lm 0.31.3.
+
+| Context | Greedy decode, mlx-lm | Greedy decode, FlashRT | Prefill, mlx-lm | Prefill, FlashRT |
+|---|---|---|---|---|
+| 1K | 86.6-86.9 tok/s | 110.0 tok/s (+27%) | 1.13 s | 1.00 s |
+| 4K | 83.6-83.8 tok/s | 106.3 tok/s (+27%) | 4.44 s | 3.80 s |
+| 16K | 72.2 tok/s | 91.8 tok/s (+27%) | 21.5-21.7 s | 18.6 s |
+
+[Protocol, equivalence and reproduction](docs/qwen36_moe_apple_usage.md).
+
 | Context tokens | Prefill, rec s | Prefill, FlashRT s | Decode greedy, rec tok/s | Decode greedy, FlashRT tok/s |
 |---:|---:|---:|---:|---:|
 | 1,024 | 1.11-1.28 | **0.96** | 131.2-133.5 | **137.0** |
