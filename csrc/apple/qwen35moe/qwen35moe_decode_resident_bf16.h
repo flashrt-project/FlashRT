@@ -209,23 +209,21 @@ template<uint K,typename P>
 inline void q4(Matrix m,P x,device bfloat16_t* out,uint lane,uint sg,uint groups) {
     for(uint first=sg*4;first<m.n;first+=groups*4)q4_block<K>(m,x,out,lane,first);
 }
-// 8-bit qmv_fast (K = 2048): 8 inputs per lane and 256-input block, four scale groups per block.
+// 8-bit qmv_fast (K = 2048): 8 inputs per lane and 256-input block, four scale groups per block. One row.
 template<typename P>
-inline void q8_block(Matrix m,P x,device bfloat16_t* out,uint lane,uint first) {
-    float a[4]={0.0f,0.0f,0.0f,0.0f};
+inline void q8_fast_row(Matrix m,P x,device bfloat16_t* out,uint lane,uint row) {
+    float a=0.0f;
     for(uint block=0;block<2048;block+=256) {
         uint scalar=block+lane*8;
         float v[8];float sum=0.0f;
         for(uint i=0;i<8;++i){v[i]=bf16_f(x[scalar+i]);sum+=v[i];}
-        for(uint r=0;r<4;++r) {
-            uint row=first+r;uint gi=row*32+scalar/64;
-            const device uchar* w=m.w+size_t(row)*2048+scalar;
-            float accum=0.0f;
-            for(uint i=0;i<8;++i)accum+=v[i]*float(w[i]);
-            a[r]+=bf16_f(m.s[gi])*accum+sum*bf16_f(m.b[gi]);
-        }
+        uint gi=row*32+scalar/64;
+        const device uchar* w=m.w+size_t(row)*2048+scalar;
+        float accum=0.0f;
+        for(uint i=0;i<8;++i)accum+=v[i]*float(w[i]);
+        a+=bf16_f(m.s[gi])*accum+sum*bf16_f(m.b[gi]);
     }
-    for(uint r=0;r<4;++r){float v=simd_sum(a[r]);if(lane==0)store_bf16(out+first+r,rb(v));}
+    float v=simd_sum(a);if(lane==0)store_bf16(out+row,rb(v));
 }
 // 8-bit general qmv for a one-row matrix (K = 2048): 4 inputs per lane and 128-input block.
 template<typename P>
@@ -265,7 +263,7 @@ inline void rms_2048(const thread float* x,const device bfloat16_t* w,threadgrou
 }
 // RMSNorm of one 256-wide attention head in place (two leaves of 128), then RoPE over the pairs (d, d + 32) of
 // the first 64 dimensions. One SIMD group.
-inline void head_norm_rope(device bfloat16_t* p,const device bfloat16_t* w,uint position,uint lane) {
+inline void head_norm_rope(const device bfloat16_t* p,device bfloat16_t* dst,const device bfloat16_t* w,uint position,uint lane) {
     float s0=0.0f,s1=0.0f;
     for(uint j=0;j<4;++j){float v=bf16_f(p[lane*4+j]);s0+=v*v;}
     for(uint j=0;j<4;++j){float v=bf16_f(p[128+lane*4+j]);s1+=v*v;}
@@ -280,9 +278,9 @@ inline void head_norm_rope(device bfloat16_t* p,const device bfloat16_t* w,uint 
     float theta=float(position)*metal::exp2(-dd*FRT_LOGBASE);
     float c=metal::fast::cos(theta),s=metal::fast::sin(theta);
     simdgroup_barrier(mem_flags::mem_device);
-    store_bf16(p+lane,rb(a*c-b*s));
-    store_bf16(p+lane+32,rb(a*s+b*c));
-    for(uint j=0;j<6;++j)store_bf16(p+64+lane*6+j,rest[j]);
+    store_bf16(dst+lane,rb(a*c-b*s));
+    store_bf16(dst+lane+32,rb(a*s+b*c));
+    for(uint j=0;j<6;++j)store_bf16(dst+64+lane*6+j,rest[j]);
 }
 
 // --------------------------------------------------------------------------------------- attention
@@ -380,7 +378,8 @@ inline void attention_merge_gate(device bfloat16_t* out,const device bfloat16_t*
 // k, the gates, the delta rule over its 128 state rows and the gated RMSNorm of the result.
 //   ring: conv input frames [4][8192] of this layer (slot = position mod 4; the current frame is already stored)
 //   state: FP32 [32][128][128] (value head, value dim, key dim)
-// tg: threadgroup scratch [q 128 | k 128 | v 128 | y 128 | g, beta].
+// tg: threadgroup scratch [q 128 | k 128 | v 128 | y 128 | g, beta]. deltanet_head leaves the delta-rule output in
+// tg; deltanet_gate (after z is complete) writes the gated norm.
 inline float conv_tap(const device bfloat16_t* ring,const device bfloat16_t* w,uint channel,uint position) {
     float acc=0.0f;
     for(uint i=0;i<4;++i)acc+=bf16_f(ring[((position+1u+i)&3u)*8192u+channel])*bf16_f(w[channel*4u+i]);
@@ -432,24 +431,30 @@ inline void deltanet_head(const device uchar* weights,const threadgroup ulong* d
     }
 #endif
     device float* rows=state+size_t(head)*16384u;
-    for(uint dv=simd*16u;dv<simd*16u+16u;++dv) {
+    for(uint dv=simd*16u;dv<simd*16u+16u;dv+=4u) {
+        // four rows per iteration (component r = row dv + r); every row's arithmetic is that of one row
         device float4* cell=(device float4*)(rows+dv*128u+lane*4u);
-        const float4 loaded=*cell;
-        float s[4]={loaded.x,loaded.y,loaded.z,loaded.w};
-        float kv_mem=0.0f;
+        const float4 c0=cell[0],c1=cell[32],c2=cell[64],c3=cell[96];
+        float4 s[4];
+        for(uint i=0;i<4;++i)s[i]=float4(c0[i],c1[i],c2[i],c3[i]);
+        float4 kv_mem=float4(0.0f);
         for(uint i=0;i<4;++i){s[i]=s[i]*g;kv_mem+=s[i]*k[i];}
         kv_mem=simd_sum(kv_mem);
-        const float delta=(tg[256u+dv]-kv_mem)*beta;
-        float y=0.0f;
+        const float4 delta=(float4(tg[256u+dv],tg[257u+dv],tg[258u+dv],tg[259u+dv])-kv_mem)*beta;
+        float4 y=float4(0.0f);
         for(uint i=0;i<4;++i){s[i]=s[i]+k[i]*delta;y+=s[i]*q[i];}
         y=simd_sum(y);
-        *cell=float4(s[0],s[1],s[2],s[3]);
-        if(lane==0)tg[384u+dv]=rb(y);
+        for(uint r=0;r<4;++r)cell[32u*r]=float4(s[0][r],s[1][r],s[2][r],s[3][r]);
+        if(lane==0)for(uint r=0;r<4;++r)tg[384u+dv+r]=rb(y[r]);
 #if FRT_TRACE
-        if(dbg && lane==0)dbg[64u+head*128u+dv]=y;
+        if(dbg && lane==0)for(uint r=0;r<4;++r)dbg[64u+head*128u+dv+r]=y[r];
 #endif
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// Gated RMSNorm of the head's delta-rule output (tg[384..511]) with SiLU(z): SIMD group 0 of the head's group.
+inline void deltanet_gate(const device uchar* weights,const threadgroup ulong* d,const device bfloat16_t* ws,
+                          device bfloat16_t* out,threadgroup float* tg,uint head,uint lane,uint simd) {
     if(simd==0) {
         const device bfloat16_t* nw=(const device bfloat16_t*)(weights+d[D_GDN_NORM]);
         float y[4];float acc=0.0f;
@@ -558,7 +563,7 @@ kernel void qwen35moe_decode_resident_bf16(
     const uint group=group3.x,sg=group*8+simd,index=group*256+tid;
     device atomic_uint* control=(device atomic_uint*)private_control;
     threadgroup uint ready[1];
-    uint phase=0;
+    uint phase=0,z_base=0;
     threadgroup float reduction[33];
     threadgroup ulong layer_descriptor[64];
     threadgroup float scratch[520];
@@ -605,17 +610,32 @@ kernel void qwen35moe_decode_resident_bf16(
             rms_2048(h,(const device bfloat16_t*)(weights+d[D_IN_NORM]),n,tid,lane,simd,reduction);
             if(!full) {
                 device bfloat16_t* ring=rings+d[D_AUX];
-                q4<2048>(weight_matrix(weights,d+D_M0),n,ring+(position&3u)*8192u,lane,sg,FRT_GROUPS);
-                q4<2048>(weight_matrix(weights,d+D_M1),n,workspace+W_Z,lane,sg,FRT_GROUPS);
-                if(sg<8)q4_block<2048>(weight_matrix(weights,d+D_M2),n,workspace+W_BA,lane,sg*4u);
-                else if(sg<16)q4_block<2048>(weight_matrix(weights,d+D_M3),n,workspace+W_BA+32u,lane,(sg-8u)*4u);
+                // 2048 qkv + 8 b + 8 a + the first 240 z four-row units: eight per SIMD group
+                for(uint unit=sg;unit<2304u;unit+=FRT_GROUPS) {
+                    if(unit<2048u)q4_block<2048>(weight_matrix(weights,d+D_M0),n,ring+(position&3u)*8192u,lane,unit*4u);
+                    else if(unit<2056u)q4_block<2048>(weight_matrix(weights,d+D_M2),n,workspace+W_BA,lane,(unit-2048u)*4u);
+                    else if(unit<2064u)q4_block<2048>(weight_matrix(weights,d+D_M3),n,workspace+W_BA+32u,lane,(unit-2056u)*4u);
+                    else q4_block<2048>(weight_matrix(weights,d+D_M1),n,workspace+W_Z,lane,(unit-2064u)*4u);
+                }
                 SYNC();
 #if FRT_TRACE
                 device float* dbg=(step==0u && params.debug_layer==layer+1u)?(device float*)(block_trace+(FRT_LAYERS+1u)*2048u):nullptr;
 #else
                 device float* dbg=nullptr;
 #endif
+                // The delta rule (groups 0..31) overlaps the rest of the z product: its remaining 784 four-row
+                // units are claimed by ticket, by the idle groups at once and by the others after their state rows.
                 if(group<32)deltanet_head(weights,d,ring,states+d[D_STATE],workspace,a,scratch,group,position,tid,lane,simd,dbg);
+                for(;;) {
+                    uint ticket=0;
+                    if(lane==0)ticket=atomic_fetch_add_explicit(control+40,1u,memory_order_relaxed);
+                    ticket=simd_broadcast(ticket,0);
+                    if(ticket>=z_base+784u)break;
+                    q4_block<2048>(weight_matrix(weights,d+D_M1),n,workspace+W_Z,lane,(240u+ticket-z_base)*4u);
+                }
+                z_base+=784u+FRT_GROUPS;
+                SYNC();
+                if(group<32)deltanet_gate(weights,d,workspace,a,scratch,group,lane,simd);
                 SYNC();
             } else {
                 const uint cap=uint(d[D_AUX]),count=position+1;
@@ -623,22 +643,21 @@ kernel void qwen35moe_decode_resident_bf16(
                 KVView vals=keys.value();
                 device bfloat16_t* q=workspace+W_QKV;
                 device bfloat16_t* kx=workspace+W_Z;
-                q4<2048>(weight_matrix(weights,d+D_M0),n,q,lane,sg,FRT_GROUPS);
-                if(sg>=160)q4<2048>(weight_matrix(weights,d+D_M1),n,kx,lane,sg-160u,128u);
-                if(sg>=32 && sg<160)q4<2048>(weight_matrix(weights,d+D_M2),n,kx+512u,lane,sg-32u,128u);
+                // 2048 q + 128 k + 128 v four-row units, strided over the SIMD groups
+                for(uint unit=sg;unit<2304u;unit+=FRT_GROUPS) {
+                    if(unit<2048u)q4_block<2048>(weight_matrix(weights,d+D_M0),n,q,lane,unit*4u);
+                    else if(unit<2176u)q4_block<2048>(weight_matrix(weights,d+D_M1),n,kx,lane,(unit-2048u)*4u);
+                    else q4_block<2048>(weight_matrix(weights,d+D_M2),n,kx+512u,lane,(unit-2176u)*4u);
+                }
                 SYNC();
                 // q/k RMSNorm + RoPE (SIMD groups 0..15 query heads, 16..17 key heads); values copied to the cache
-                if(sg<16)head_norm_rope(q+sg*512u,(const device bfloat16_t*)(weights+d[D_Q_NORM]),position,lane);
-                else if(sg<18)head_norm_rope(kx+(sg-16u)*256u,(const device bfloat16_t*)(weights+d[D_K_NORM]),position,lane);
+                if(sg<16)head_norm_rope(q+sg*512u,q+sg*512u,(const device bfloat16_t*)(weights+d[D_Q_NORM]),position,lane);
+                else if(sg<18)head_norm_rope(kx+(sg-16u)*256u,(device bfloat16_t*)keys.head(sg-16u,0).address(position*256u),
+                                             (const device bfloat16_t*)(weights+d[D_K_NORM]),position,lane);
                 else if(sg<20) {
                     const uint hd=sg-18u;
                     device uint4* dst=(device uint4*)(vals.head(hd,0).address(position*256u)+lane*8u);
                     *dst=*((const device uint4*)(kx+512u+hd*256u+lane*8u));
-                }
-                SYNC();
-                if(sg<2) {
-                    device uint4* dst=(device uint4*)(keys.head(sg,0).address(position*256u)+lane*8u);
-                    *dst=*((const device uint4*)(kx+sg*256u+lane*8u));
                 }
                 SYNC();
                 const bool rounded=count>=1024;
@@ -655,8 +674,8 @@ kernel void qwen35moe_decode_resident_bf16(
             for(uint j=0;j<8;++j){uint i=(tid+(j/4)*256)*4+j%4;h[j]=rb(h[j]+bf16_f(o[i]));}
             rms_2048(h,(const device bfloat16_t*)(weights+d[D_POST_NORM]),n,tid,lane,simd,reduction);
             // router logits (8-bit) and the shared-expert gate logit
-            if(sg<64)q8_block(weight_matrix(weights,d+D_ROUTER),n,route,lane,sg*4u);
-            else if(sg==64)q8_row(weight_matrix(weights,d+D_SGATE),n,route+256u,lane);
+            if(sg<256)q8_fast_row(weight_matrix(weights,d+D_ROUTER),n,route,lane,sg);
+            else if(sg==256)q8_row(weight_matrix(weights,d+D_SGATE),n,route+256u,lane);
             SYNC();
             if(simd==0)route_top8(route,route_ids,route_weights,lane);
             threadgroup_barrier(mem_flags::mem_threadgroup);
