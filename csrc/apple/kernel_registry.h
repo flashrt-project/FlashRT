@@ -3,6 +3,7 @@
 #include "attention/attention_simd_bf16.h"
 #include "attention/gqa8_causal_prefill_bf16.h"
 #include "attention/gqa8_causal_prefill_mma_bf16.h"
+#include "attention/gqa8_d256_causal_gated_prefill_mma_bf16.h"
 #include "attention/gqa_merge_fp32_bf16.h"
 #include "attention/gqa_online_bf16.h"
 #include "attention/gqa_split_bf16.h"
@@ -25,6 +26,7 @@
 #include "kernels/rms_norm_bf16.h"
 #include "kernels/rope_bf16.h"
 #include "qwen35moe/qwen35moe_decode_resident_bf16.h"
+#include "qwen35moe/qwen35moe_prefill_rows_bf16.h"
 #ifdef FLASHRT_APPLE_INT8_EXPERIMENT
 #include "gemm/int8_tensor_ops.h"
 #include "quantize/bf16_int8_rowwise.h"
@@ -168,6 +170,19 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { Qwen35MoeDecodeOptions o; o.sampled = true; return qwen35moe_decode_resident_bf16_source(o); }},
     {"qwen35moe_decode_resident_trace_bf16", "qwen35moe_decode_resident_bf16",
      [] { Qwen35MoeDecodeOptions o; o.trace = true; return qwen35moe_decode_resident_bf16_source(o); }},
+    // qwen3_5_moe chunked-prefill row kernels and the causal gated attention for 256-wide heads.
+    {"qwen35moe_embed_affine4_rows_bf16", "qwen35moe_embed_affine4_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_deltanet_inputs_rows_bf16", "qwen35moe_deltanet_inputs_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_deltanet_recurrence_bf16", "qwen35moe_deltanet_recurrence_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_deltanet_ring_bf16", "qwen35moe_deltanet_ring_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_deltanet_gate_rows_bf16", "qwen35moe_deltanet_gate_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_qk_norm_rope_kv_rows_bf16", "qwen35moe_qk_norm_rope_kv_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_router_top8_rows_bf16", "qwen35moe_router_top8_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_expert_count", "qwen35moe_expert_count", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_expert_place_bf16", "qwen35moe_expert_place_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_expert_combine_rows_bf16", "qwen35moe_expert_combine_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"gqa8_d256_causal_gated_prefill_mma_bf16", "gqa8_d256_causal_gated_prefill_mma_bf16",
+     gqa8_d256_causal_gated_prefill_mma_bf16_source},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {

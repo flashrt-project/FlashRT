@@ -27,11 +27,30 @@ from flash_rt.models.qwen36_moe.pipeline_mps import (
     BLOCK, D_ALOG, D_AUX, D_CONV, D_DOWN, D_DT, D_EMBED, D_FINAL_NORM, D_FLAGS, D_GATE, D_GDN_NORM, D_HEAD,
     D_IN_NORM, D_K_NORM, D_M0, D_M1, D_M2, D_M3, D_OUT, D_POST_NORM, D_Q_NORM, D_ROUTER, D_SGATE, D_SH_DOWN,
     D_SH_GATE, D_SH_UP, D_STATE, D_UP, DECODE_KERNELS, DESCRIPTOR, PARTIALS, RING_ELEMENTS, STATE_ELEMENTS,
-    STATISTICS, WORKERS, WORKSPACE, Qwen36MoePipelineMps, check_geometry)
+    SMALL_ROWS, STATE_WORDS, STATISTICS, WORKERS, WORKSPACE, GROUPED_TM, Qwen36MoePipelineMps, Qwen36MoePrefillMps,
+    check_geometry)
 
 ALIGN = 256
 ROUTING = 1280
 CONTROL = 1024
+MAX_CHUNK = 2048        # prefill chunk limit (rows per program; mlx-lm's prefill step)
+PARAM_BYTES = 4 << 20   # constant parameter blocks of the prefill programs
+
+_PARAM_LAYOUTS = {
+    # kind: (uint32 fields, uint64 fields, float32 fields) in MSL struct order (uints, then ulongs, then floats)
+    "gemm": (("rows", "columns", "inner", "x_stride", "y_stride", "experts", "limit", "per_row"),
+             ("w", "s", "b", "w2", "s2", "b2"), ()),
+    "embed": (("hidden", "pad"), ("w", "s", "b"), ()),
+    "rms": (("hidden", "last"), ("w",), ("eps", "pad2")),
+    "qmv": (("inner", "columns", "x_stride", "y_stride", "limit", "experts", "per_row", "pad"),
+            ("w", "s", "b", "w2", "s2", "b2", "x", "y"), ()),
+    "delta": ((), ("conv", "alog", "dt", "norm", "ring", "state"), ()),
+    "qk": (("cap", "pad"), ("q_norm", "k_norm", "kv"), ("logbase", "pad2")),
+    "attention": (("kv_heads", "cap", "gate_stride", "pad"), ("kv",), ("scale", "pad2")),
+    "router": ((), ("w", "s", "b", "gw", "gs", "gb"), ()),
+    "scan": (("tile_rows", "pad"), (), ()),
+    "uint": (("value",), (), ()),
+}
 
 
 class _Layout:
@@ -49,10 +68,15 @@ class _Layout:
         return offset
 
 
-class Qwen36MoeRuntime(Qwen36MoePipelineMps):
-    """Owns the Metal plan, every buffer and the decode programs (batch 1)."""
+class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
+    """Owns the Metal plan, every buffer, the decode programs and the chunked prefill programs (batch 1)."""
 
-    def __init__(self, checkpoint_dir: str, max_seq: int = 32768, library: Optional[str] = None):
+    def __init__(self, checkpoint_dir: str, max_seq: int = 32768, library: Optional[str] = None,
+                 prefill_chunk: int = MAX_CHUNK, prefill_layers: int = 0):
+        """``prefill_chunk``: rows per prefill program (mlx-lm prefills in steps of 2048 tokens).
+        ``prefill_layers``: diagnostic, prefill only the first layers."""
+        if not SMALL_ROWS <= prefill_chunk <= MAX_CHUNK:
+            raise ValueError(f"prefill_chunk must be in [{SMALL_ROWS}, {MAX_CHUNK}]")
         if max_seq < 1:
             raise ValueError("max_seq must be positive")
         self.ckpt = Qwen35MoeMLXCheckpoint(checkpoint_dir)
@@ -67,11 +91,17 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps):
         self._upload_weights()
         self.ckpt.close()   # weights now live in the Metal buffer; release the shard mappings
         self._allocate_state()
-        self.vocab_param = 0
-        self.plan.write(self.buf["args"], 0, np.array([self.cfg.vocab_size], dtype=np.uint32))
+        self.prefill_chunk = int(prefill_chunk)
+        self._allocate_prefill(self.prefill_chunk)
+        self.vocab_param = self.param("uint", value=self.cfg.vocab_size)
         self.programs = {name: self.record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
         self.programs["noise"] = self.record_noise()
+        self.programs["prefill"] = self.record_prefill(self.prefill_chunk, prefill_layers)
+        self.programs["prefill_small"] = self.record_prefill(SMALL_ROWS - 1, prefill_layers, small=True)
+        self.programs["prefill_head"] = self.record_prefill_head()
+        self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
         self.plan.finish(resident=True)
+        self._state = self.plan.view(self.buf["state"], np.uint32, STATE_WORDS)
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
         self._packet = self.plan.view(self.buf["packet"], np.uint32, 17)
         self._diagnostic = self.plan.view(self.buf["diagnostic"], np.uint32, WORKERS)
@@ -169,7 +199,6 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps):
             "states": self.state_elements * 4,
             "rings": self.ring_elements * 2,
             "params": 64,
-            "args": 256,
             "noise": BLOCK * v * 4,
             "logits": BLOCK * v * 2,
             "trace": BLOCK * (self.cfg.num_layers + 1) * self.cfg.hidden_size * 2,
@@ -183,6 +212,100 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps):
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
+
+    # ------------------------------------------------------------------ prefill
+    def _allocate_prefill(self, C: int):
+        cfg = self.cfg
+        H, K = cfg.hidden_size, cfg.num_experts_per_tok
+        width = 2 * cfg.q_dim + 2 * cfg.kv_dim   # widest projection row (attention q | k | v)
+        sizes = {
+            "tokens": self.max_seq * 4, "state": 4 * STATE_WORDS,
+            "h": C * H * 2, "n": C * H * 2, "qkv": C * width * 2, "z": C * cfg.value_dim * 2,
+            "ba": C * 2 * cfg.linear_value_heads * 2, "dqk": C * 4096 * 2, "dv": C * cfg.value_dim * 2,
+            "dgates": C * 2 * cfg.linear_value_heads * 4, "dy": C * cfg.value_dim * 2,
+            "qt": C * cfg.q_dim * 2, "attn": C * cfg.q_dim * 2,
+            "ids": C * K * 4, "gates": C * K * 4, "sgate": C * 4, "counts": cfg.num_experts * 4,
+            "starts": (cfg.num_experts + 1) * 4, "tiles": (cfg.num_experts + 1) * 4, "cursors": cfg.num_experts * 4,
+            "slots": C * K * 4, "xp": C * K * H * 2, "actp": C * K * cfg.expert_intermediate_size * 2,
+            "yp": C * K * H * 2, "acts": C * cfg.shared_intermediate_size * 2, "shared": C * H * 2,
+            "args": PARAM_BYTES,
+        }
+        for name, nbytes in sizes.items():
+            self.buf[name] = self.plan.buffer(nbytes)
+        self.plan.write(self.buf["counts"], 0, np.zeros(cfg.num_experts, dtype=np.uint32))
+        self._param_blob = bytearray()
+        self.logbase = float(np.float32(np.log2(cfg.rope_theta)))
+        self.scan_param = self.param("scan", tile_rows=GROUPED_TM)
+
+    def param(self, kind: str, **fields) -> int:
+        """Append one constant parameter block (256-byte aligned) and return its byte offset."""
+        uints, ulongs, floats = _PARAM_LAYOUTS[kind]
+        if kind in ("gemm", "embed", "qmv") and not np.isscalar(fields.get("w", 0)):
+            w = fields.pop("w")
+            fields.update(w=int(w[0]), s=int(w[1]), b=int(w[2]))
+            if "w2" in fields:
+                w2 = fields.pop("w2")
+                fields.update(w2=int(w2[0]), s2=int(w2[1]), b2=int(w2[2]))
+        blob = np.array([fields.get(k, 0) for k in uints], dtype=np.uint32).tobytes()
+        if ulongs:
+            blob += b"\0" * ((-len(blob)) % 8)
+            blob += np.array([fields.get(k, 0) for k in ulongs], dtype=np.uint64).tobytes()
+        blob += np.array([fields.get(k, 0.0) for k in floats], dtype=np.float32).tobytes()
+        self._param_blob += b"\0" * ((-len(self._param_blob)) % 256)
+        offset = len(self._param_blob)
+        self._param_blob += blob
+        if len(self._param_blob) > PARAM_BYTES:
+            raise RuntimeError("prefill parameter blocks exceed the parameter buffer")
+        return offset
+
+    def prefill(self, tokens: Sequence[int], start: int = 0, program: str = "greedy", top_k: int = 0,
+                top_p: float = 1.0, temperature: float = 1.0, seed: Optional[int] = None) -> int:
+        """Advance the model state over prompt positions [start, n) with the chunked prefill programs, compute
+        the last position's logits and return the first generated token (greedy, or the sampled program's
+        top-k/top-p rule with Gumbel noise from ``seed`` at position n - 1; ``seed=None`` uses the noise row
+        written by ``set_noise``). ``start`` > 0 continues from the state left by positions [0, start)."""
+        n = len(tokens)
+        if not 0 <= start < n:
+            raise ValueError(f"prefill start {start} outside [0, {n})")
+        if n > self.max_seq:
+            raise ValueError(f"prompt length {n} exceeds max_seq {self.max_seq}")
+        self.plan.write(self.buf["tokens"], 0, np.asarray(tokens, dtype=np.uint32))
+        if start == 0:
+            self.reset()
+        pos, timings = start, []
+        while pos < n:
+            rows = min(self.prefill_chunk, n - pos)
+            self._state[:] = (pos, rows, 0, pos + rows)
+            prefill_program = "prefill_small" if rows < SMALL_ROWS else "prefill"
+            timings.append(self.plan.run(self.programs[prefill_program]))
+            pos += rows
+        timings.append(self.plan.run(self.programs["prefill_head"]))
+        self.last_prefill_timings = timings
+        self.pos = n
+        if program == "sampled" and seed is not None:
+            self._params[:] = self._decode_params(0, n - 1, 1, (), top_k, top_p, temperature, seed)
+            self.plan.run(self.programs["noise"])
+        return self.select(program, top_k=top_k, top_p=top_p, temperature=temperature)
+
+    def select(self, program: str = "greedy", top_k: int = 0, top_p: float = 1.0, temperature: float = 1.0) -> int:
+        """Token from the logits in decode slot 0 by the decode programs' rule: greedy argmax (lowest id on
+        ties), or top-k by logit (ties: larger id first), nucleus cut on the cumulative probability, then the
+        maximum of log-probability / temperature + noise (ties: lowest id)."""
+        x = bf16_to_f32(self.logits(0)).astype(np.float64)
+        if program != "sampled":
+            return int(np.argmax(x))
+        k = max(1, min(int(top_k), 32))
+        order = np.lexsort((-np.arange(x.size), -x))[:k]
+        m = x.max()
+        lse = m + np.log(np.exp(x - m).sum())
+        lp = x[order] - lse
+        before = np.concatenate(([0.0], np.cumsum(np.exp(lp))[:-1]))
+        kept = np.ones(k, bool) if top_p >= 1.0 else (1.0 - before) > (1.0 - top_p)
+        noise = self.plan.read(self.buf["noise"], 0, np.float32, x.size)
+        inv_t = 1.0 / temperature if temperature else 1.0
+        score = np.where(kept, lp * inv_t + noise[order], -np.inf)
+        best = score.max()
+        return int(order[(score == best) & kept].min())
 
     def reset(self) -> None:
         """Empty context: zero DeltaNet states and conv frames (the KV cache needs no clearing)."""
