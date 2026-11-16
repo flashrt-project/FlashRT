@@ -1,5 +1,7 @@
 # Qwen3.6-35B-A3B text inference
 
+(Apple Silicon with the MLX int4 checkpoint: see [qwen36_moe_apple_usage.md](qwen36_moe_apple_usage.md).)
+
 FlashRT runs the language backbone from the official
 `Qwen/Qwen3.6-35B-A3B` BF16 checkpoint on an RTX 5090 (SM120) and on Jetson AGX
 Thor (SM110). The checkpoint uses the same `qwen3_5_moe` text architecture as

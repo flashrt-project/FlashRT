@@ -303,22 +303,6 @@ decode program to its resident kernel. Same Mac (M4 Pro, 64 GB), same token
 ids, batch 1; the reference is rec v0.1.1 (MLX).
 [Protocol, equivalence and reproduction](docs/flint_apple_usage.md).
 
-#### Qwen3.6-35B-A3B (MLX int4, Apple Silicon)
-
-Native Metal plan for the text decoder of `mlx-community/Qwen3.6-35B-A3B-4bit`
-on M4 Pro / M4 Max at the checkpoint's precision (affine int4 g64 weights, BF16
-activations and KV, FP32 DeltaNet state). A one-token decode step is
-bit-identical to `mlx-lm`'s. Same Mac (M4 Pro, 64 GB), same token ids, batch 1,
-interleaved runs; the reference is mlx-lm 0.31.3.
-
-| Context | Greedy decode, mlx-lm | Greedy decode, FlashRT | Prefill, mlx-lm | Prefill, FlashRT |
-|---|---|---|---|---|
-| 1K | 86.6-86.9 tok/s | 110.0 tok/s (+27%) | 1.13 s | 1.00 s |
-| 4K | 83.6-83.8 tok/s | 106.3 tok/s (+27%) | 4.44 s | 3.80 s |
-| 16K | 72.2 tok/s | 91.8 tok/s (+27%) | 21.5-21.7 s | 18.6 s |
-
-[Protocol, equivalence and reproduction](docs/qwen36_moe_apple_usage.md).
-
 | Context tokens | Prefill, rec s | Prefill, FlashRT s | Decode greedy, rec tok/s | Decode greedy, FlashRT tok/s |
 |---:|---:|---:|---:|---:|
 | 1,024 | 1.11-1.28 | **0.96** | 131.2-133.5 | **137.0** |
@@ -329,6 +313,26 @@ interleaved runs; the reference is mlx-lm 0.31.3.
 Optional greedy lookup decoding (n-gram draft tokens, each verified row
 bit-identical to the greedy step) decodes the same tokens 10-17% faster on
 these code prompts (1K-32K).
+
+#### Qwen3.6-35B-A3B (MLX int4, Apple Silicon)
+
+Native Metal plan for the text decoder of `mlx-community/Qwen3.6-35B-A3B-4bit`
+on M4 Pro / M4 Max at the checkpoint's precision (affine int4 g64 weights, BF16
+activations and KV, FP32 DeltaNet state). One-token decode steps are
+bit-identical to mlx-lm's at every context length; the chunked prefill agrees
+with it at the level of its own reordering noise. Same Mac (M4 Pro, 64 GB),
+same token ids, batch 1, interleaved runs; the reference is mlx-lm 0.31.3.
+[Protocol, equivalence and reproduction](docs/qwen36_moe_apple_usage.md).
+
+| Context tokens | Prefill, mlx-lm s | Prefill, FlashRT s | Decode greedy, mlx-lm tok/s | Decode greedy, FlashRT tok/s |
+|---:|---:|---:|---:|---:|
+| 1,024 | 1.13-1.16 | **0.95** | 87.0-87.1 | **110.3** |
+| 4,096 | 4.43-4.48 | **3.62** | 83.6-83.8 | **106.5** |
+| 16,384 | 21.7-22.0 | **17.6** | 72.2 | **92.2** |
+| 65,536 | 132.4-133.0 | **126.5** | 49.4-49.6 | **60.0** |
+
+With the checkpoint's default sampling (temperature 1, top-p 0.95, top-k 20)
+decode is 24-33% faster than mlx-lm (109.6 against 82.6 tok/s at 1K).
 
 #### Qwen3-8B
 
@@ -994,7 +998,7 @@ have been built and tested, and the dispatch map that selects them.
 | AMD Instinct MI350X | gfx950 (CDNA4) | Supported | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Uses the gfx950 source set, checked at build and runtime. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300X | gfx942 (CDNA3) | Supported | Architecture-specific BF16/FP8 FNUZ kernels and HIP graphs. See [AMD deployment](docs/deployment_amd.md), [π0.5](docs/deployment_amd_pi05.md), and [GR00T N1.7](docs/deployment_amd_groot_n17.md). |
 | Ascend 910B4 | Ascend NPU | Supported | Pi0.5 and GR00T N1.7 backend with native AscendC kernels and NPU graphs. See [π0.5 deployment](docs/deployment_npu.md) and [GR00T N1.7 deployment](docs/deployment_npu_groot_n17.md). |
-| Apple Silicon | Metal / PyTorch MPS | Experimental | Pi0.5 BF16 eager execution using the shared torch pipeline. No CUDA build required; checkpoint accuracy and production latency remain unqualified. See [Apple setup with uv](docs/deployment_apple.md). Flint MLX int4 on the native Metal plan (M4 Pro / M4 Max), bit-identical prefill to rec; see [Flint on Apple Silicon](docs/flint_apple_usage.md). |
+| Apple Silicon | Metal / PyTorch MPS | Experimental | Pi0.5 BF16 eager execution using the shared torch pipeline. No CUDA build required; checkpoint accuracy and production latency remain unqualified. See [Apple setup with uv](docs/deployment_apple.md). Flint MLX int4 on the native Metal plan (M4 Pro / M4 Max), bit-identical prefill to rec; see [Flint on Apple Silicon](docs/flint_apple_usage.md). Qwen3.6-35B-A3B MLX int4 on the same plan, one-token decode steps bit-identical to mlx-lm; see [Qwen3.6-35B-A3B on Apple Silicon](docs/qwen36_moe_apple_usage.md). |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
 | RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission, Hy-Embodied-0.5-VLA (`config="hyvla"`, SM120 FP8 / NVFP4 ViT+prefill), LaWAM (`config="lawam"`, 18.85 ms E2E), MolmoAct2 (`config="molmoact2"`, 51.0 ms graph replay, 7.87x), and VLA-JEPA (`config="vla_jepa"`, 8.12 ms p50, 8.58x over LeRobot eager); see [Community benchmarks](#community-hardware-benchmarks), [HyVLA RTX notes](docs/hyvla05_rtx_sm120.md), [LaWAM RTX notes](docs/lawam_rtx.md), [MolmoAct2 usage](docs/molmoact2_usage.md), and [VLA-JEPA usage](docs/vla_jepa_rtx.md). |
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |

@@ -23,14 +23,12 @@ namespace flashrt::apple::shaders {
 struct Qwen35MoeDecodeOptions {
     bool sampled = false;   // fused top-k/top-p gumbel selection instead of greedy argmax
     bool trace = false;     // write the residual stream after the embedding and every layer
-    int debug_layer = -1;   // >= 0: also dump that layer's intermediates into the trace buffer tail (step 0)
 };
 
 inline std::string qwen35moe_decode_resident_bf16_source(const Qwen35MoeDecodeOptions& o = {}) {
     std::string defines = std::string("\n#define FRT_WORKERS 36u") +
         "\n#define FRT_SAMPLED " + std::to_string(o.sampled ? 1 : 0) +
-        "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) +
-        "\n#define FRT_DEBUG_LAYER " + std::to_string(o.debug_layer) + "\n";
+        "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) + "\n";
     return std::string(metal_preamble) + defines + R"MSL(
 typedef bfloat bfloat16_t;
 constant constexpr uint FRT_GROUPS=FRT_WORKERS*8u;        // SIMD groups in the grid (288)
@@ -96,7 +94,7 @@ struct DecodeParams {
     uint token, position, steps, eos_count;
     uint eos[4];
     uint top_k; float top_p, inverse_temperature;
-    uint debug_layer;      // trace build: layer + 1 whose intermediates go to the trace buffer's second block
+    uint reserved;
 };
 
 // ------------------------------------------------------------------------------------------ barriers
@@ -289,9 +287,6 @@ inline void head_norm_rope(const device bfloat16_t* p,device bfloat16_t* dst,con
 // MLX vector attention. Single pass (fewer than 1024 keys): 32 key-strided partitions per query head with FP32
 // partial outputs; two passes: `parts` partitions with BF16 partial outputs (ROUNDED). Each task covers one
 // partition for HEADS query heads of one KV head; a lane owns 8 of the 256 dimensions.
-#ifndef FRT_ACC
-#define FRT_ACC(a,f,w,v) metal::fma(a,f,(w)*(v))
-#endif
 template<uint HEADS,bool ROUNDED>
 inline void attention_partial(const device bfloat16_t* q,KVView k,KVView v,device float* partial,device float* stats,
                               uint count,uint parts,uint lane,uint sg) {
@@ -322,7 +317,8 @@ inline void attention_partial(const device bfloat16_t* q,KVView k,KVView v,devic
             }
             for(uint h=0;h<HEADS;++h) {
                 float factor=simd_shuffle(old,ushort(h)),weight=simd_shuffle(add,ushort(h));
-                for(uint j=0;j<8;++j)acc[h][j]=FRT_ACC(acc[h][j],factor,weight,value[j]);
+                // MLX's o * factor + exp_score * value compiles to fma(o, factor, exp_score * value)
+                for(uint j=0;j<8;++j)acc[h][j]=metal::fma(acc[h][j],factor,weight*value[j]);
             }
         }
         if(lane<HEADS){device float* stat_out=stats+((first+lane)*parts+part)*2;stat_out[0]=hi;stat_out[1]=z;}
@@ -392,7 +388,7 @@ inline float conv_tap(const device bfloat16_t* ring,const device bfloat16_t* w,u
 }
 inline void deltanet_head(const device uchar* weights,const threadgroup ulong* d,device bfloat16_t* ring,
                           device float* state,const device bfloat16_t* ws,device bfloat16_t* out,
-                          threadgroup float* tg,uint head,uint position,uint tid,uint lane,uint simd,device float* dbg) {
+                          threadgroup float* tg,uint head,uint position,uint lane,uint simd) {
     const device bfloat16_t* cw=(const device bfloat16_t*)(weights+d[D_CONV]);
     const uint khead=head/2u;
     if(simd<3) {
@@ -429,12 +425,6 @@ inline void deltanet_head(const device uchar* weights,const threadgroup ulong* d
     float q[4],k[4];
     for(uint i=0;i<4;++i){q[i]=tg[lane*4u+i];k[i]=tg[128u+lane*4u+i];}
     const float g=tg[512],beta=tg[513];
-#if FRT_TRACE
-    if(dbg) {   // [g 32 | beta 32 | y 32x128 | q 32x128 | k 32x128 | v 32x128]
-        if(tid==0){dbg[head]=g;dbg[32u+head]=beta;}
-        if(simd<3)for(uint i=0;i<4;++i)dbg[64u+(1u+simd)*4096u+head*128u+lane*4u+i]=tg[simd*128u+lane*4u+i];
-    }
-#endif
     device float* rows=state+size_t(head)*16384u;
     for(uint dv=simd*16u;dv<simd*16u+16u;dv+=4u) {
         // four rows per iteration (component r = row dv + r); every row's arithmetic is that of one row
@@ -451,9 +441,6 @@ inline void deltanet_head(const device uchar* weights,const threadgroup ulong* d
         y=simd_sum(y);
         for(uint r=0;r<4;++r)cell[32u*r]=float4(s[0][r],s[1][r],s[2][r],s[3][r]);
         if(lane==0)for(uint r=0;r<4;++r)tg[384u+dv+r]=rb(y[r]);
-#if FRT_TRACE
-        if(dbg && lane==0)for(uint r=0;r<4;++r)dbg[64u+head*128u+dv+r]=y[r];
-#endif
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -623,14 +610,9 @@ kernel void qwen35moe_decode_resident_bf16(
                     else q4_block<2048>(weight_matrix(weights,d+D_M1),n,workspace+W_Z,lane,(unit-2064u)*4u);
                 }
                 SYNC();
-#if FRT_TRACE
-                device float* dbg=(step==0u && params.debug_layer==layer+1u)?(device float*)(block_trace+(FRT_LAYERS+1u)*2048u):nullptr;
-#else
-                device float* dbg=nullptr;
-#endif
                 // one value head per threadgroup: delta rule, then its gated norm (threadgroup barriers only)
                 if(group<32) {
-                    deltanet_head(weights,d,ring,states+d[D_STATE],workspace,a,scratch,group,position,tid,lane,simd,dbg);
+                    deltanet_head(weights,d,ring,states+d[D_STATE],workspace,a,scratch,group,position,lane,simd);
                     deltanet_gate(weights,d,workspace,a,scratch,group,lane,simd);
                 }
                 SYNC();

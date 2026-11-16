@@ -6,8 +6,9 @@ namespace flashrt::apple::shaders {
 // Row kernels of the chunked prefill of the qwen3_5_moe text decoder (BF16 activations, FP32 math, one BF16
 // rounding per operation, matching the resident decode step): affine-4 embedding rows; Gated DeltaNet rows
 // (depthwise conv + SiLU, unit-RMS q/k, gates), the delta-rule recurrence over the chunk, the conv ring update and
-// the gated RMSNorm; per-head Q/K RMSNorm + RoPE with K/V publication for the softmax-attention layers; router
-// softmax top-8 rows, expert counting and row placement, and the weighted expert combination.
+// the gated RMSNorm; per-head Q/K RMSNorm + RoPE with K/V publication for the softmax-attention layers; expert
+// counting and row placement, and the weighted expert combination (the router rows are in
+// qwen35moe_router_rows_bf16.h).
 // Chunk-variable values (first position, valid rows) come from a device `state` buffer [pos0, rows]; grids
 // cover the chunk capacity and surplus threadgroups return.
 inline std::string qwen35moe_prefill_rows_bf16_source() {
@@ -29,7 +30,7 @@ inline float silu_f32(float x) {
     float y=1.0f/(1.0f+metal::fast::exp(frt_absf(x)));
     return x*(x<0?y:1.0f-y);
 }
-constant constexpr uint HIDDEN=2048u,EXPERTS=256u,TOPK=8u;
+constant constexpr uint HIDDEN=2048u,TOPK=8u;
 constant constexpr float EPS=1e-06f;
 
 struct EmbedRows { uint hidden, pad; ulong w, s, b; };
@@ -215,81 +216,6 @@ kernel void qwen35moe_qk_norm_rope_kv_rows_bf16(const device bfloat* x [[buffer(
 }
 
 // ------------------------------------------------------------------------------------------- MoE
-struct RouterRows { ulong w, s, b, gw, gs, gb; };   // router [256][2048] and shared-expert gate [1][2048], 8-bit
-// One threadgroup per row: router logits (8-bit affine products with the accumulation of the decode step),
-// FP32 softmax, the eight largest probabilities in ascending order (ties: ascending index; equal probabilities
-// at the cut keep the larger index) with weights probability / sum, and sigmoid of the shared-expert gate logit.
-// ids, gates: [rows][8]; shared_gate: [rows] FP32.
-kernel void qwen35moe_router_top8_rows_bf16(const device bfloat* x [[buffer(0)]],const device uchar* weights [[buffer(1)]],
-    device uint* ids [[buffer(2)]],device float* gates [[buffer(3)]],device float* shared_gate [[buffer(4)]],
-    constant RouterRows& p [[buffer(5)]],const device uint* state [[buffer(6)]],
-    uint row [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    if(row>=state[1])return;
-    threadgroup float logits[EXPERTS];
-    const device bfloat* in=x+size_t(row)*HIDDEN;
-    const device ushort* scales=(const device ushort*)(weights+p.s);
-    const device ushort* biases=(const device ushort*)(weights+p.b);
-    for(uint e=sg;e<EXPERTS;e+=8u) {
-        float a=0.0f;
-        for(uint block=0;block<HIDDEN;block+=256u) {
-            const uint scalar=block+lane*8u;
-            float v[8];float sum=0.0f;
-            for(uint i=0;i<8;++i){v[i]=bf_f(in[scalar+i]);sum+=v[i];}
-            const uint gi=e*32u+scalar/64u;
-            const device uchar* w=weights+p.w+size_t(e)*HIDDEN+scalar;
-            float accum=0.0f;
-            for(uint i=0;i<8;++i)accum+=v[i]*float(w[i]);
-            a+=bits_f(scales[gi])*accum+sum*bits_f(biases[gi]);
-        }
-        a=simd_sum(a);
-        if(lane==0)logits[e]=rb(a);
-    }
-    if(sg==7) {
-        float a=0.0f;
-        for(uint block=0;block<HIDDEN;block+=128u) {
-            const uint scalar=block+lane*4u;
-            float v[4];float sum=0.0f;
-            for(uint i=0;i<4;++i){v[i]=bf_f(in[scalar+i]);sum+=v[i];}
-            const uint gi=scalar/64u;
-            const device uchar* w=weights+p.gw+scalar;
-            float accum=0.0f;
-            for(uint i=0;i<4;++i)accum+=v[i]*float(w[i]);
-            a+=bits_f(((const device ushort*)(weights+p.gs))[gi])*accum+sum*bits_f(((const device ushort*)(weights+p.gb))[gi]);
-        }
-        a=simd_sum(a);
-        if(lane==0)shared_gate[row]=sigmoid_bf16(rb(a),false);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if(sg!=0)return;
-    float xv[8];
-    for(uint j=0;j<8;++j)xv[j]=logits[(j/4u)*128u+lane*4u+j%4u];
-    float m0=-3.402823466e+38f,m1=-3.402823466e+38f;
-    for(uint j=0;j<4;++j){m0=(m0<xv[j])?xv[j]:m0;m1=(m1<xv[4+j])?xv[4+j]:m1;}
-    m0=simd_max(m0);m1=simd_max(m1);
-    const float top=max(m0,m1);
-    float n0=0.0f,n1=0.0f;
-    for(uint j=0;j<4;++j){xv[j]=metal::fast::exp(xv[j]-top);n0+=xv[j];}
-    for(uint j=0;j<4;++j){xv[4+j]=metal::fast::exp(xv[4+j]-top);n1+=xv[4+j];}
-    n0=simd_sum(n0);n1=simd_sum(n1);
-    const float normalizer=1.0f/simd_sum(lane==0?n0:(lane==1?n1:0.0f));
-    float pr[8];
-    for(uint j=0;j<8;++j)pr[j]=rb(xv[j]*normalizer);
-    float chosen[8];uint picked[8];
-    for(uint rank=0;rank<8;++rank) {
-        float best=-1.0f;uint idx=0;
-        for(uint j=0;j<8;++j){uint i=(j/4u)*128u+lane*4u+j%4u;if(pr[j]>best||(pr[j]==best&&i>idx)){best=pr[j];idx=i;}}
-        const float peak=simd_max(best);
-        const uint selected=simd_max(best==peak?idx:0u);
-        if(lane==0){picked[7u-rank]=selected;chosen[7u-rank]=peak;}
-        for(uint j=0;j<8;++j)if((j/4u)*128u+lane*4u+j%4u==selected)pr[j]=-2.0f;
-    }
-    if(lane==0) {
-        float total=0.0f;
-        for(uint r=0;r<8;++r)total=rb(total+chosen[r]);
-        for(uint r=0;r<8;++r){ids[row*TOPK+r]=picked[r];gates[row*TOPK+r]=rb(chosen[r]/total);}
-    }
-}
 // counts[e] += assignments; grid = rows * 8 threads.
 kernel void qwen35moe_expert_count(const device uint* ids [[buffer(0)]],device atomic_uint* counts [[buffer(1)]],
     const device uint* state [[buffer(2)]],uint i [[thread_position_in_grid]]) {

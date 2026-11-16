@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Optional
 
 from flash_rt.hardware.apple_native.native import READ, READ_WRITE, WRITE
+# Tiles and row bounds of the model-independent w4a16 product kernels (csrc/apple/gemm), as the Flint prefill uses
+# them; its hidden-2048 RMSNorm rows and expert-count scan kernels are reused here as well.
+from flash_rt.models.flint.pipeline_mps import GEMM_THREADS, GROUPED_TM, SMALL_ROWS, TM, TN, qmv_limit
 from flash_rt.models.qwen36_moe.mlx_checkpoint import Qwen35MoeConfig, Qwen35MoeConfigError
 
 WORKERS = 36            # co-resident threadgroups of 256 threads (M4 Pro / M4 Max GPU profile)
@@ -44,6 +47,10 @@ RING_ELEMENTS = 4 * 8192            # BF16 conv input frames per layer (slot = p
 WORKSPACE = 42240                   # BF16 elements (see the kernel's W_* offsets)
 PARTIALS = 16 * 32 * 1024 * 8 // 2  # FP32 (or BF16 rounded) attention partitions
 STATISTICS = 16 * 1024 * 2
+
+
+def _ceil(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 def check_geometry(cfg: Qwen35MoeConfig) -> None:
@@ -103,10 +110,6 @@ class Qwen36MoePipelineMps:
 
 
 # ---------------------------------------------------------------------------------------------- prefill
-# The w4a16 products are the model-independent kernels of the Flint prefill (same tiles and MLX dispatch rules).
-from flash_rt.models.flint.pipeline_mps import (  # noqa: E402
-    GEMM_THREADS, GROUPED_TM, SMALL_ROWS, TM, TN, _ceil, qmv_limit)
-
 STATE_WORDS = 4   # uint32 per state record: position, rows, 0, end
 
 

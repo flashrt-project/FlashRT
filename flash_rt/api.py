@@ -792,7 +792,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "config='qwen36_moe' is a text LLM and is not served through "
             "load_model's VLA wrapper. Construct it directly:\n"
             "    from flash_rt.frontends.torch.qwen36_moe import "
-            "Qwen36MoeTextFrontend\n"
+            "Qwen36MoeTextFrontend              # RTX 5090 / Thor, BF16 checkpoint\n"
+            "    from flash_rt.frontends.torch.qwen36_moe_mps import "
+            "Qwen36MoeTorchFrontendMps    # Apple Silicon, MLX int4\n"
             "See docs/qwen36_moe_usage.md.")
     if config == "flint":
         raise NotImplementedError(

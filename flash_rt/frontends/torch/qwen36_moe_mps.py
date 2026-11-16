@@ -3,8 +3,8 @@
 The text decoder is a 40-layer MoE (256 experts, top-8 softmax routing plus a gated shared expert) whose layers
 alternate three Gated DeltaNet (linear attention) layers with one gated softmax-attention layer. This frontend
 reads the MLX affine export (4-bit codes with BF16 scale/bias per 64 inputs, 8-bit router) with FlashRT's own
-safetensors reader, copies the weight bytes unchanged into one Metal buffer, and runs FlashRT's native Metal
-programs: a chunked prefill and a resident decode step that produces up to eight tokens per dispatch. No MLX or
+safetensors reader, copies the weight bytes unchanged into one Metal buffer (plus a BF16 copy of the routers for
+the prefill), and runs FlashRT's native Metal programs: a chunked prefill and a resident decode step that produces up to eight tokens per dispatch. No MLX or
 framework code runs at inference time; a one-token step reproduces mlx-lm's logits bit for bit.
 
     from flash_rt.frontends.torch.qwen36_moe_mps import Qwen36MoeTorchFrontendMps
@@ -12,8 +12,8 @@ framework code runs at inference time; a one-token step reproduces mlx-lm's logi
     text = fe.chat([{"role": "user", "content": "Write a quicksort in Python."}], max_new_tokens=512)
 
 Text only: the checkpoint's vision tower is not loaded. Constructed directly rather than through ``load_model``
-(a text decoder has no VLA ``predict`` surface). The name follows the RTX frontend; PyTorch is not imported.
-See ``docs/qwen36_moe_apple_usage.md``.
+(a text decoder has no VLA ``predict`` surface). The module sits with the other frontends; PyTorch is not
+imported. See ``docs/qwen36_moe_apple_usage.md``.
 """
 
 from __future__ import annotations
@@ -21,7 +21,8 @@ from __future__ import annotations
 from typing import Dict, Iterator, List, Optional, Sequence
 
 from flash_rt.frontends.torch._qwen36_moe_mps_runtime import Qwen36MoeRuntime
-from flash_rt.models.flint.tokenizer import FlintTokenizer as _JsonTokenizer   # tokenizer.json + chat template
+# The tokenizer.json / chat-template reader is model independent (it lives with the Flint model code).
+from flash_rt.models.flint.tokenizer import FlintTokenizer as _JsonTokenizer
 from flash_rt.models.qwen36_moe.mlx_checkpoint import Qwen35MoeConfig
 from flash_rt.models.qwen36_moe.pipeline_mps import BLOCK
 
@@ -37,6 +38,8 @@ class Qwen36MoeTorchFrontendMps:
         self.cfg: Qwen35MoeConfig = self.rt.cfg
         self.tokenizer = _JsonTokenizer.from_directory(checkpoint_dir, chat_template=chat_template)
         self.eog = set(self.cfg.eos_token_ids)
+        # generation_config.json's sampling settings; generation is greedy unless they are passed to stream()
+        self.sampling_defaults = dict(temperature=self.cfg.temperature, top_p=self.cfg.top_p, top_k=self.cfg.top_k)
         self._state_ids: List[int] = []   # tokens the recurrent state and the KV cache currently hold
         self.last_reused = 0
 
@@ -57,9 +60,11 @@ class Qwen36MoeTorchFrontendMps:
                reuse_prefix: bool = False, temperature: float = 0.0, top_p: float = 1.0, top_k: int = 20,
                seed: int = 0) -> Iterator[List[int]]:
         """Continuation of ``prompt_ids`` as it is produced, in blocks of up to eight tokens. Stops after an
-        end-of-generation token (included); ``stop_ids=()`` disables stopping. ``temperature=0`` is greedy;
-        otherwise top-k (1..32) / top-p sampling with Gumbel noise drawn on the GPU from ``seed`` and the token
-        position.
+        end-of-generation token (included); ``stop_ids=()`` disables stopping. The decode step itself stops at
+        the first four stop ids; further ones are checked per block, and the tokens after them are dropped.
+        ``temperature=0`` (the default) is greedy; otherwise top-k (1..32) / top-p sampling with Gumbel noise
+        drawn on the GPU from ``seed`` and the token position (``sampling_defaults`` holds the checkpoint's
+        ``generation_config.json`` settings).
 
         ``reuse_prefix``: when the prompt extends everything the model state already holds (the previous
         prompt and its generated tokens, e.g. the next turn of a chat), prefill only the new tokens. The

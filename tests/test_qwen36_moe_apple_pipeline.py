@@ -6,7 +6,7 @@ Skipped unless ``FLASHRT_QWEN36_MOE_MLX_DIR`` points at a ``mlx-community/Qwen3.
 host is an Apple Silicon Mac and the plan library is built (``scripts/apple/build_native.sh``).
 
 * one-token steps from an empty context reproduce mlx-lm's logits bit for bit (needs ``mlx_lm``; skipped
-  otherwise), below and above the 1024-key switch of the attention kernel;
+  otherwise; both engines are loaded, about 40 GB), below and above the 1024-key switch of the attention kernel;
 * a block of eight greedy steps equals eight single steps (tokens and logits);
 * chunked prefills (small-chunk, single-chunk and multi-chunk programs) are deterministic, a prefill continued
   at a chunk boundary equals the full prefill, and the chunked prefill agrees with stepping the prompt through
@@ -75,7 +75,7 @@ def test_single_steps_reproduce_mlx_lm(fe):
         ref = model(mx.array([[tok]]), cache=cache)[0, -1]
         rt.decode(tok, t, 1)
         if t < 12 or t >= 1020:   # single-pass attention, then the two-pass path from 1024 keys
-            raw = np.array(ref.astype(mx.float32)).view(np.uint32).__rshift__(16).astype(np.uint16)
+            raw = (np.array(ref.astype(mx.float32)).view(np.uint32) >> 16).astype(np.uint16)
             assert np.array_equal(rt.logits(0), raw), f"logits differ at step {t}"
             checked += 1
         else:
@@ -140,10 +140,12 @@ def test_restored_state_repeats_a_decode(fe, chat_ids):
     rt = fe.rt
     first = rt.prefill(chat_ids)
     state = rt.recurrent_state()
-    a = rt.decode(first, len(chat_ids), 8) + rt.decode(0, len(chat_ids) + 8, 8)
+    def two_blocks():
+        block = rt.decode(first, len(chat_ids), 8)
+        return block + rt.decode(block[-1], len(chat_ids) + 8, 8)
+    a = two_blocks()
     rt.restore_recurrent_state(state)
-    b = rt.decode(first, len(chat_ids), 8) + rt.decode(0, len(chat_ids) + 8, 8)
-    assert a == b
+    assert two_blocks() == a
 
 
 def test_seeded_sampling(fe, chat_ids):

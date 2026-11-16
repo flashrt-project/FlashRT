@@ -43,7 +43,8 @@ def detect_arch() -> str:
         ``"amd_rdna3"``  — AMD RDNA 3 (gfx1100 / Radeon Pro W7900D)
         ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
         ``"amd_rdna4"``  — AMD RDNA 4 (gfx1201 / Radeon AI PRO R9700)
-        ``"apple_mps"`` — Apple Silicon (Pi0.5 BF16 via PyTorch MPS; Flint on the native Metal plan)
+        ``"apple_mps"`` — Apple Silicon (Pi0.5 BF16 via PyTorch MPS; Flint and Qwen3.6-35B-A3B on the
+                          native Metal plan)
 
     Raises RuntimeError if no supported accelerator is available or the
     card has an unsupported SM level. Deliberately strict: silently
@@ -387,6 +388,12 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("qwen36_moe", "torch", "thor"):
         ("flash_rt.frontends.torch.qwen36_moe",
          "Qwen36MoeTextFrontend"),
+    # The MLX affine int4 export (mlx-community/Qwen3.6-35B-A3B-4bit) on Apple
+    # Silicon through the native Metal plan (no torch at runtime): constructed
+    # directly (see flash_rt/api.py and docs/qwen36_moe_apple_usage.md).
+    ("qwen36_moe", "torch", "apple_mps"):
+        ("flash_rt.frontends.torch.qwen36_moe_mps",
+         "Qwen36MoeTorchFrontendMps"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
