@@ -20,11 +20,15 @@ namespace flashrt::apple::shaders {
 // BF16 results are summed as MLX's reduction does (k <= 8: in order with BF16 rounding per add; 16: eight
 // interleaved BF16 accumulators, then in order; 32: FP32). M below `limit` (MLX's vector-path bound) or a
 // GROUPED product below 1024 assignments is left to the row-vector kernel; each variant returns otherwise.
+// DIRECT variants take every M at or above `limit` on the single-chain path (GROUPED: any number of assignments)
+// for callers that do not need MLX's small-M accumulation.
 struct W4A16Options {
     int tile_m = 64, tile_n = 64, simdgroups = 4;   // threadgroup of simdgroups * 32 threads
     int epilogue = 0;      // 0 store, 1 residual add, 2 SwiGLU (gate/up)
     bool grouped = false;
     bool splitk = false;   // the split-K partition path (non-grouped)
+    bool direct = false;   // every row count on this path (one K chain; grouped: any number of assignments),
+                           // instead of leaving MLX's split-K / row-vector cases to the other variants
 };
 
 inline std::string gemm_w4a16_affine_source(const W4A16Options& o = {}) {
@@ -32,6 +36,8 @@ inline std::string gemm_w4a16_affine_source(const W4A16Options& o = {}) {
         throw std::invalid_argument("w4a16 GEMM tile dimensions must be positive, tile_n a multiple of 32");
     if (o.splitk && o.grouped)
         throw std::invalid_argument("w4a16 GEMM split-K applies to non-grouped products");
+    if (o.splitk && o.direct)
+        throw std::invalid_argument("w4a16 GEMM direct is the single-chain path");
     if (o.grouped && (o.tile_m % o.simdgroups || (o.tile_m / o.simdgroups) % 16 || o.tile_m % 8 ||
                       o.tile_n % o.simdgroups || (o.tile_n / o.simdgroups) % 16))
         throw std::invalid_argument("grouped w4a16 GEMM sub-tiles (tile_m / simdgroups rows, tile_n / simdgroups "
@@ -48,6 +54,7 @@ inline std::string gemm_w4a16_affine_source(const W4A16Options& o = {}) {
         "#define EPILOGUE " + std::to_string(o.epilogue) + "\n" +
         "#define GROUPED " + std::to_string(o.grouped ? 1 : 0) + "\n" +
         "#define SPLITK " + std::to_string(o.splitk ? 1 : 0) + "\n" +
+        "#define DIRECT " + std::to_string(o.direct ? 1 : 0) + "\n" +
         R"MSL(
 struct AffineGemm {
     uint rows, columns, inner;          // capacity rows (grid), N, K
@@ -160,7 +167,9 @@ kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device 
     uint sg [[simdgroup_index_in_threadgroup]]) {
     uint n0=group.x*uint(TN);
     if(n0>=p.columns)return;
+#if !DIRECT
     if(state[1]*p.per_row<1024u)return;
+#endif
     uint e_lo=0,e_hi=p.experts;
     if(group.y>=tiles[p.experts])return;
     while(e_lo<e_hi){uint mid=(e_lo+e_hi)/2;if(tiles[mid+1]<=group.y)e_lo=mid+1;else e_hi=mid;}
@@ -203,7 +212,7 @@ kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device 
     const uint parts=splitk_parts(m_rows,p.columns,p.inner);
 #if SPLITK
     if(parts<=1u)return;
-#else
+#elif !DIRECT
     if(parts>1u)return;
 #endif
     const uint row0=group.y*uint(TM);

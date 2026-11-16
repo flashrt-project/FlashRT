@@ -105,8 +105,7 @@ class Qwen36MoePipelineMps:
 # ---------------------------------------------------------------------------------------------- prefill
 # The w4a16 products are the model-independent kernels of the Flint prefill (same tiles and MLX dispatch rules).
 from flash_rt.models.flint.pipeline_mps import (  # noqa: E402
-    GEMM_THREADS, GROUPED_TM, GROUPED_VECTOR_ASSIGNMENTS, SMALL_ROWS, SPLITK_ROW_TILES, SPLITK_THREADS, TM, TN,
-    _ceil, qmv_limit)
+    GEMM_THREADS, GROUPED_TM, SMALL_ROWS, TM, TN, _ceil, qmv_limit)
 
 STATE_WORDS = 4   # uint32 per state record: position, rows, 0, end
 
@@ -115,8 +114,9 @@ class Qwen36MoePrefillMps:
     """Records the chunked-prefill programs: one program fills the model state (KV cache, DeltaNet states and conv
     rings) for positions [pos0, pos0 + rows) with rows <= capacity. The runtime supplies ``plan``, ``buf``,
     ``param(kind, **fields) -> offset`` and the per-layer descriptors; chunk position and row count come from the
-    ``state`` buffer. The small-chunk program (``small=True``, rows < SMALL_ROWS) adds the split-K and row-vector
-    product paths that MLX's matmuls take for small M, each kernel returning when its path does not apply."""
+    ``state`` buffer. The small-chunk program (``small=True``, rows < SMALL_ROWS) uses the direct product
+    variants and, below MLX's vector bound, the row-vector kernels, each kernel returning when its path does not
+    apply."""
 
     def record_prefill(self, capacity: int, layers: int = 0, small: bool = False) -> int:
         b, cfg, L = self.buf, self.cfg, self.layer_table
@@ -126,33 +126,29 @@ class Qwen36MoePrefillMps:
         state = (b["state"], 0, READ)
 
         def gemm(epilogue, x, w_off, y, rows, n, k, x_stride, y_stride, y_off=0, w2_off=None, grouped=False):
-            limit = qmv_limit(k, n)
+            # Large chunks: the single-chain w4a16 GEMM (MLX's accumulation for that many rows; narrow products
+            # take the direct variant). Small chunks: the direct variants (one K chain for every row count from
+            # MLX's vector bound up; expert blocks of any size), and the row-vector kernels below the bound.
+            limit = qmv_limit(k, n) if small and not grouped else 0
             w2 = w_off if w2_off is None else w2_off
             params = self.param("gemm", rows=rows, columns=n, inner=k, x_stride=x_stride, y_stride=y_stride,
                                 experts=cfg.num_experts if grouped else 0, per_row=K if grouped else 1,
-                                limit=limit if small else 0, w=w_off, w2=w2)
+                                limit=limit, w=w_off, w2=w2)
             binds = [(x, 0, READ), (b["weights"], 0, READ), (y, y_off, READ_WRITE), (b["args"], params, READ),
                      (b["starts"], 0, READ), (b["tiles"], 0, READ), state]
-            name = "gemm_w4a16_affine" + ("_grouped" if grouped else "") + epilogue
+            direct = small or n < 512
+            name = "gemm_w4a16_affine" + ("_grouped" if grouped else "") + ("_direct" if direct else "") + epilogue
             groups_y = _ceil(rows, GROUPED_TM) + cfg.num_experts if grouped else _ceil(rows, TM)
             plan.dispatch(name, binds, (_ceil(n, TN), groups_y, 1), GEMM_THREADS, label=name)
-            # MLX splits K for few output tiles: small chunks, and narrow products (n < 512) at any chunk size
-            if not grouped and (small or n < 512):
-                split = "gemm_w4a16_affine_splitk" + epilogue
-                plan.dispatch(split, binds, (_ceil(n, TN), _ceil(rows, TM) if n < 512 else
-                                             min(_ceil(rows, TM), SPLITK_ROW_TILES), 1), SPLITK_THREADS, label=split)
-            if not small:
+            if not small or grouped:
                 return
             vec = self.param("qmv", inner=k, columns=n, x_stride=x_stride, y_stride=y_stride, limit=limit,
-                             experts=cfg.num_experts if grouped else 0, per_row=K if grouped else 1, w=w_off, w2=w2)
-            name = "qmv_w4a16_affine_rows" + ("_grouped" if grouped else "") + epilogue
-            vec_rows = min(rows, GROUPED_VECTOR_ASSIGNMENTS - 1) if grouped else min(rows, limit - 1)
+                             experts=0, per_row=1, w=w_off, w2=w2)
+            vec_rows = min(rows, limit - 1)
             vbinds = [(b["weights"], 0, READ), (x, 0, READ), (y, y_off, READ_WRITE), (b["args"], vec, READ),
                       state, (b["starts"], 0, READ)]
-            plan.dispatch(name, vbinds, (vec_rows, n // 8, 1), 64, label=name)
-            if not grouped:
-                wide = "qmv_w4a16_affine_wide" + epilogue
-                plan.dispatch(wide, vbinds, (vec_rows, n // 8, 1), 64, label=wide)
+            for name in ("qmv_w4a16_affine_rows" + epilogue, "qmv_w4a16_affine_wide" + epilogue):
+                plan.dispatch(name, vbinds, (vec_rows, n // 8, 1), 64, label=name)
 
         emb = self.param("embed", hidden=H, w=L[cfg.num_layers][D_EMBED:D_EMBED + 3])
         plan.dispatch("qwen35moe_embed_affine4_rows_bf16", [
