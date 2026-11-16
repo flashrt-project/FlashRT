@@ -27,6 +27,7 @@
 #include "kernels/rope_bf16.h"
 #include "qwen35moe/qwen35moe_decode_resident_bf16.h"
 #include "qwen35moe/qwen35moe_prefill_rows_bf16.h"
+#include "qwen35moe/qwen35moe_router_rows_bf16.h"
 #ifdef FLASHRT_APPLE_INT8_EXPERIMENT
 #include "gemm/int8_tensor_ops.h"
 #include "quantize/bf16_int8_rowwise.h"
@@ -179,6 +180,8 @@ inline constexpr KernelSource kernel_registry[] = {
     {"qwen35moe_deltanet_gate_rows_bf16", "qwen35moe_deltanet_gate_rows_bf16", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_qk_norm_rope_kv_rows_bf16", "qwen35moe_qk_norm_rope_kv_rows_bf16", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_router_top8_rows_bf16", "qwen35moe_router_top8_rows_bf16", qwen35moe_prefill_rows_bf16_source},
+    {"qwen35moe_router_top8_dense_rows_bf16", "qwen35moe_router_top8_dense_rows_bf16",
+     qwen35moe_router_rows_bf16_source},
     {"qwen35moe_expert_count", "qwen35moe_expert_count", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_expert_place_bf16", "qwen35moe_expert_place_bf16", qwen35moe_prefill_rows_bf16_source},
     {"qwen35moe_expert_combine_rows_bf16", "qwen35moe_expert_combine_rows_bf16", qwen35moe_prefill_rows_bf16_source},

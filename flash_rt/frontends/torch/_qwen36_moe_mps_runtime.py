@@ -25,7 +25,7 @@ from flash_rt.models.qwen36_moe.mlx_checkpoint import (
     Qwen35MoeConfig, Qwen35MoeConfigError, Qwen35MoeMLXCheckpoint)
 from flash_rt.models.qwen36_moe.pipeline_mps import (
     BLOCK, D_ALOG, D_AUX, D_CONV, D_DOWN, D_DT, D_EMBED, D_FINAL_NORM, D_FLAGS, D_GATE, D_GDN_NORM, D_HEAD,
-    D_IN_NORM, D_K_NORM, D_M0, D_M1, D_M2, D_M3, D_OUT, D_POST_NORM, D_Q_NORM, D_ROUTER, D_SGATE, D_SH_DOWN,
+    D_IN_NORM, D_K_NORM, D_M0, D_M1, D_M2, D_M3, D_OUT, D_POST_NORM, D_Q_NORM, D_ROUTER, D_ROUTER_DENSE, D_SGATE, D_SH_DOWN,
     D_SH_GATE, D_SH_UP, D_STATE, D_UP, DECODE_KERNELS, DESCRIPTOR, PARTIALS, RING_ELEMENTS, STATE_ELEMENTS,
     SMALL_ROWS, STATE_WORDS, STATISTICS, WORKERS, WORKSPACE, GROUPED_TM, Qwen36MoePipelineMps, Qwen36MoePrefillMps,
     check_geometry)
@@ -48,9 +48,19 @@ _PARAM_LAYOUTS = {
     "qk": (("cap", "pad"), ("q_norm", "k_norm", "kv"), ("logbase", "pad2")),
     "attention": (("kv_heads", "cap", "gate_stride", "pad"), ("kv",), ("scale", "pad2")),
     "router": ((), ("w", "s", "b", "gw", "gs", "gb"), ()),
+    "router_dense": ((), ("dense", "gw", "gs", "gb"), ()),
     "scan": (("tile_rows", "pad"), (), ()),
     "uint": (("value",), (), ()),
 }
+
+
+def _dequantize_bf16(m: AffineMatrix) -> np.ndarray:
+    """``bf16(scale * q + bias)`` per element (one rounding, to nearest even), as raw uint16 [rows, k]."""
+    q = m.codes.astype(np.float64).reshape(m.rows, -1, 64)
+    w = (q * bf16_to_f32(m.scales).astype(np.float64)[..., None] + bf16_to_f32(m.biases).astype(np.float64)[..., None])
+    mant, exp = np.frexp(w.reshape(m.rows, -1))
+    rounded = np.ldexp(np.rint(mant * 256.0) / 256.0, exp).astype(np.float32)   # 8 significant bits: BF16-exact
+    return (rounded.view(np.uint32) >> 16).astype(np.uint16)
 
 
 class _Layout:
@@ -168,7 +178,9 @@ class Qwen36MoeRuntime(Qwen36MoePipelineMps, Qwen36MoePrefillMps):
                 state_offset += STATE_ELEMENTS
                 ring_offset += RING_ELEMENTS
             m = p + "mlp."
-            d[D_ROUTER:D_ROUTER + 4] = self._matrix(layout, self._affine(m + "gate", E, H, bits=8), E)
+            router = self._affine(m + "gate", E, H, bits=8)
+            d[D_ROUTER:D_ROUTER + 4] = self._matrix(layout, router, E)
+            d[D_ROUTER_DENSE] = layout.add(_dequantize_bf16(router))
             d[D_SGATE:D_SGATE + 4] = self._matrix(layout, self._affine(m + "shared_expert_gate", 1, H, bits=8), 1)
             for base, name, rows, k in ((D_GATE, "gate_proj", I, H), (D_UP, "up_proj", I, H), (D_DOWN, "down_proj", H, I)):
                 d[base:base + 4] = self._matrix(layout, self._affine(m + "switch_mlp." + name, rows, k, experts=E), rows)

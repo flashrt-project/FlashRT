@@ -32,6 +32,7 @@ GEOMETRY = {
 DESCRIPTOR = 64
 D_FLAGS, D_IN_NORM, D_POST_NORM = 0, 1, 2
 D_GDN_NORM, D_CONV, D_ALOG, D_DT = 3, 4, 5, 6          # DeltaNet layers
+D_ROUTER_DENSE = 7                                     # router dequantized to BF16 (prefill)
 D_Q_NORM, D_K_NORM = 3, 4                              # attention layers
 D_M0, D_M1, D_M2, D_M3, D_OUT = 8, 12, 16, 20, 24      # DeltaNet: qkv, z, b, a, out; attention: q, k, v, -, o
 D_ROUTER, D_SGATE, D_GATE, D_UP, D_DOWN, D_SH_GATE, D_SH_UP, D_SH_DOWN = range(28, 60, 4)
@@ -207,11 +208,11 @@ class Qwen36MoePrefillMps:
             plan.dispatch("flint_rms_rows_bf16", [
                 (b["h"], 0, READ), (b["weights"], 0, READ), (b["n"], 0, WRITE), (b["args"], rms_post, READ), state,
             ], (C, 1, 1), 256)
-            router = self.param("router", w=int(d[D_ROUTER]), s=int(d[D_ROUTER + 1]), b=int(d[D_ROUTER + 2]),
-                                gw=int(d[D_SGATE]), gs=int(d[D_SGATE + 1]), gb=int(d[D_SGATE + 2]))
-            plan.dispatch("qwen35moe_router_top8_rows_bf16", [
+            router = self.param("router_dense", dense=int(d[D_ROUTER_DENSE]), gw=int(d[D_SGATE]),
+                                gs=int(d[D_SGATE + 1]), gb=int(d[D_SGATE + 2]))
+            plan.dispatch("qwen35moe_router_top8_dense_rows_bf16", [
                 (b["n"], 0, READ), (b["weights"], 0, READ), (b["ids"], 0, WRITE), (b["gates"], 0, WRITE),
-                (b["sgate"], 0, WRITE), (b["args"], router, READ), state], (C, 1, 1), 256)
+                (b["sgate"], 0, WRITE), (b["args"], router, READ), state], (_ceil(C, 16), 1, 1), 128)
             plan.dispatch("qwen35moe_expert_count", [
                 (b["ids"], 0, READ), (b["counts"], 0, READ_WRITE), state], (_ceil(C * K, 256), 1, 1), 256)
             plan.dispatch("flint_expert_scan", [
