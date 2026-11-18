@@ -1,0 +1,83 @@
+# FlashRT — LingBot-VLA-v2-6B model configuration
+# Model structure and default RoboTwin inference settings.
+name: lingbot_vla_v2
+display_name: "LingBot-VLA-v2-6B"
+hf_model: robbyant/lingbot-vla-v2-6b
+
+# Backbone (Qwen3-VL)
+backbone:
+  family: qwen3_vl
+  hf_model: Qwen/Qwen3-VL-4B-Instruct
+  # Language model
+  embedding_dim: 2560
+  llm_layers: 36
+  llm_num_q_heads: 32
+  llm_num_kv_heads: 8         # GQA
+  llm_head_dim: 128
+  llm_intermediate_size: 9728
+
+  # Vision encoder
+  vit_blocks: 24
+  vit_hidden: 1024
+  vit_out_hidden: 2560        # projected to LLM embedding dim
+  vit_heads: 16
+  vit_intermediate: 4096
+  vit_patch_size: 16
+  vit_temporal_patch: 2
+  vit_spatial_merge: 2        # 2x2 patches per visual token
+  deepstack_visual_indexes: [5, 11, 17]  # ViT features for early LLM layers
+
+# Action expert (flow matching)
+action_expert:
+  hidden_size: 768
+  num_layers: 36
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  # MoE FFN
+  moe:
+    num_layers: 36          # all action expert layers
+    num_experts: 32
+    top_k: 4                # routed experts per token
+    intermediate_size: 512  # per routed expert
+    shared_intermediate_size: 704
+
+# Policy inference (checkpoint settings override these defaults)
+policy:
+  tokenizer_path: Qwen/Qwen3-VL-4B-Instruct  # HF repo or local processor directory
+  max_action_dim: 55
+  max_state_dim: 55
+  chunk_size: 50
+  num_steps: 10              # denoising steps
+  tokenizer_max_length: 72
+  vlm_causal: true
+  adanorm_time: true
+  final_norm_adanorm: false
+  action_fp32: false
+  token_top_k: 4
+  routed_scaling_factor: 4.0
+  router_activation: sigmoid
+  use_shared_expert_gate: false
+  use_moe: true
+
+  # Alignment queries used during action sampling
+  align_params:
+    mode: query
+    num_task_tokens: 8
+    use_future_video: true
+    depth:
+      use_future_depth: true
+      block_future_depth_to_action: false
+    video:
+      use_cls_loss: false
+      use_patch_loss: true
+      use_current_patch_loss: true
+      use_current_shared_task_proj: true
+      share_future_depth_query: true
+      use_shared_future_task_proj: true
+      block_suffix_to_future_video: false
+
+# Image inputs (official RoboTwin defaults)
+image:
+  target_size: [256, 256]
+  num_views: 3               # top, left wrist, right wrist

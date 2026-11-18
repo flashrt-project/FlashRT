@@ -11,6 +11,7 @@ Per-model deployment guides:
 | Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3/3.5/4 BF16 |
 | GR00T N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | CDNA FP8 backbone + BF16 DiT; RDNA 3/3.5/4 BF16 |
 | Higgs Audio v3 | [deployment_amd_higgs_audio_v3.md](deployment_amd_higgs_audio_v3.md) | RDNA 3/3.5/4 BF16; RDNA 4 FP8 W8A8 |
+| LingBot-VLA-v2 | [deployment_amd_lingbot_vla_v2.md](deployment_amd_lingbot_vla_v2.md) | RDNA BF16; full model validated on RDNA 3.5 |
 
 ## Supported hardware
 
@@ -77,9 +78,9 @@ Dependencies:
 - **hipBLASLt** — ships with ROCm and is required by both AMD source sets.
   RDNA uses an instance-local BF16 algorithm cache populated by runtime
   measurements before HIP Graph capture.
-- **No vendored third-party code.** There is no CUTLASS/CK checkout to
-  manage; everything else is HIP C++ plus compiler MFMA intrinsics on CDNA4
-  or WMMA builtins on RDNA 3, 3.5 and 4.
+- **No CUTLASS/CK checkout for the native build.** The extension uses HIP C++
+  plus compiler MFMA intrinsics on CDNA4 or WMMA builtins on RDNA 3, 3.5
+  and 4.
 - **aiter** (strongly recommended for CDNA4) — AMD's assembly flash-attention
   library. When importable it serves the attention sites; otherwise the
   backend falls back to torch SDPA. Attention is the largest kernel
@@ -233,6 +234,7 @@ python -m pytest tests/test_amd_routing.py tests/test_amd_extension.py \
 | `test_amd_pi05_model.py` | end-to-end model load, graph capture, pinned-noise determinism, exact/fixed prompt modes, FP8 and BF16 | no checkpoint (see the per-model guide for the environment variables) |
 | `test_amd_rdna_routing.py` | gfx1100/gfx1151/gfx1201 routing, lazy imports, BF16/profile contracts, and CDNA/Triton isolation | torch unavailable; hardware-only cases require a supported RDNA GPU |
 | `test_amd_rdna_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no supported RDNA ROCm device; missing/broken extensions on RDNA fail |
+| `test_amd_rdna_lingbot_vla_v2.py` | LingBot routing, weight layouts, HIP precision, MoE packing, full-model references and Graph replay | native cases require RDNA; full-model cases require checkpoint/reference assets |
 | `test_amd_rdna_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, optimized/fallback parity, and shipped LIBERO frames | no supported RDNA GPU or checkpoint |
 | `test_amd_groot_routing.py` | GROOT N1.7 pipeline-map entry, precision-tier contracts, attention-backend site/layer validation | extension-dependent cases skip without the `.so` |
 | `test_amd_groot_model.py` | GROOT N1.7 end-to-end: kernel backbone, finite actions, pinned-noise determinism, optional reference cosine | no checkpoint |

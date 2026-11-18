@@ -276,6 +276,14 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.amd.frontends.torch.groot_n17",
          "GrootN17TorchFrontendAmd"),
 
+    # ── LingBot-VLA-v2 (Qwen3-VL + MoE action expert) ──
+    ("lingbot_vla_v2", "torch", "amd_rdna3"):
+        ("flash_rt.amd.frontends.torch.lingbot_vla_v2_rdna", "LingbotVlaV2TorchFrontendAmdRdna"),
+    ("lingbot_vla_v2", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.lingbot_vla_v2_rdna", "LingbotVlaV2TorchFrontendAmdRdna"),
+    ("lingbot_vla_v2", "torch", "amd_rdna4"):
+        ("flash_rt.amd.frontends.torch.lingbot_vla_v2_rdna", "LingbotVlaV2TorchFrontendAmdRdna"),
+
     # ── Motus (Wan2.2 + Qwen-VL + action/understanding experts) ──
     # RTX 5090 path only for now. Motus uses a bundle-based E2E contract
     # rather than the image-list VLA API used by Pi0/Pi0.5/GROOT.

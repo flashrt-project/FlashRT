@@ -42,6 +42,37 @@ class Rdna35GemmBackend:
     def _stream(tensor: torch.Tensor) -> int:
         return int(torch.cuda.current_stream(tensor.device).cuda_stream)
 
+    def begin_exact_calibration(
+        self, rows, columns, inner, *, biased=False, num_algorithms=32,
+    ):
+        """Screen BF16 nn.Linear algorithms against the cached reference output."""
+        self._runner.begin_bf16_nt_calibration(rows, columns, inner, biased, num_algorithms)
+
+    def end_exact_calibration(self):
+        """Cache the fastest algorithm matching every calibration sample."""
+        return self._runner.end_bf16_nt_calibration()
+
+    def linear_pair(self, out, x, weight, *, reference_rows=None):
+        """Project two nn.Linear weights with shared input and reference reduction."""
+        rows, inner = x.shape
+        columns = out.shape[-1]
+        if weight.shape != (2 * columns, inner) or out.shape != (2, rows, columns):
+            raise ValueError("paired RDNA projections require [2N, K] weights and [2, M, N] output")
+        if (
+            any(
+                t.dtype != self.dtype or t.device != x.device or not t.is_contiguous()
+                for t in (x, weight, out)
+            )
+            or x.device.type != "cuda"
+        ):
+            raise ValueError(
+                "paired RDNA projections require contiguous BF16 tensors on one ROCm device"
+            )
+        self._runner.bf16_nt_pair(
+            x.data_ptr(), weight.data_ptr(), out.data_ptr(), rows,
+            rows if reference_rows is None else reference_rows, columns, inner, self._stream(x),
+        )
+
     def _smallm_gemm(
         self, out, x, weight_nt, bias=None, *, accumulate=False,
     ) -> None:
@@ -96,12 +127,14 @@ class Rdna35GemmBackend:
             return None
         return weight_nt
 
-    def linear(self, out, x, weight, bias=None, *, weight_transposed=False):
+    def linear(self, out, x, weight, bias=None, *, weight_transposed=False,
+               reference_rows=None):
         """BF16 linear with K-by-N weights, or explicit N-by-K Torch layout.
 
-        The latter preserves the materialized nn.Linear weight layout and
-        Torch's GEMM dispatch. Existing K-by-N callers retain their native
-        hipBLASLt/small-M policy. Packing belongs to caller setup, never here.
+        The latter describes nn.Linear storage directly through hipBLASLt.
+        reference_rows retains the padded-shape algorithm for compact rows.
+        Existing K-by-N callers retain their native hipBLASLt/small-M policy.
+        Packing belongs to caller setup, never here.
         """
         tensors = (out, x, weight) if bias is None else (
             out, x, weight, bias)
@@ -113,63 +146,62 @@ class Rdna35GemmBackend:
             raise TypeError("RDNA 3.5 GEMM tensors must be BF16")
         if x.ndim < 2 or out.ndim < 2 or weight.ndim != 2:
             raise ValueError(
-                f"unsupported linear rank: x={x.ndim} weight={weight.ndim} "
-                f"out={out.ndim}")
+                f"unsupported linear rank: x={x.ndim} weight={weight.ndim} out={out.ndim}"
+            )
         if not x.is_contiguous():
             raise ValueError("RDNA 3.5 GEMM input must be contiguous")
         if out.stride(-1) != 1:
-            raise ValueError(
-                "RDNA 3.5 GEMM output must have unit column stride")
+            raise ValueError("RDNA 3.5 GEMM output must have unit column stride")
         if weight.stride(1) != 1:
-            raise ValueError(
-                "RDNA 3.5 GEMM weight must be row-major with unit column stride")
+            raise ValueError("RDNA 3.5 GEMM weight must be row-major with unit column stride")
         inner, columns = weight.shape[::-1] if weight_transposed else weight.shape
         expected = (*x.shape[:-1], columns)
         if x.shape[-1] != inner or out.shape != expected:
             raise ValueError(
                 f"unsupported linear shape: x={tuple(x.shape)} "
-                f"weight={tuple(weight.shape)} out={tuple(out.shape)}")
+                f"weight={tuple(weight.shape)} out={tuple(out.shape)}"
+            )
         x2 = x.reshape(-1, x.shape[-1])
         if out.ndim == 2:
             out2 = out
         elif out.is_contiguous():
             out2 = out.reshape(-1, out.shape[-1])
         else:
-            raise ValueError(
-                "RDNA 3.5 batched GEMM output must be contiguous")
+            raise ValueError("RDNA 3.5 batched GEMM output must be contiguous")
         output_stride = out2.stride(0)
         if output_stride < out2.shape[1]:
-            raise ValueError(
-                "RDNA 3.5 GEMM output row stride is too small")
-        if bias is not None and (
-            bias.shape != (out2.shape[1],) or not bias.is_contiguous()
-        ):
+            raise ValueError("RDNA 3.5 GEMM output row stride is too small")
+        if bias is not None and (bias.shape != (out2.shape[1],) or not bias.is_contiguous()):
             raise ValueError("unsupported RDNA 3.5 GEMM bias")
         if weight_transposed:
-            if bias is None:
-                torch.mm(x2, weight.t(), out=out2)
-            else:
-                torch.addmm(bias, x2, weight.t(), out=out2)
+            if reference_rows is not None:
+                self._runner.bf16_nt_rows(
+                    x2.data_ptr(), weight.data_ptr(), out2.data_ptr(),
+                    0 if bias is None else bias.data_ptr(), x2.shape[0], reference_rows,
+                    out2.shape[1], x2.shape[1], weight.stride(0), output_stride, self._stream(x),
+                )
+                return
+            self._runner.bf16_nt(
+                x2.data_ptr(), weight.data_ptr(), out2.data_ptr(),
+                0 if bias is None else bias.data_ptr(), x2.shape[0], out2.shape[1], x2.shape[1],
+                weight.stride(0), output_stride, self._stream(x),
+            )
             return
         weight_nt = self._prepared_weight_nt(weight)
-        if (
-            weight_nt is not None
-            and x2.shape[0] <= 48
-            and out2.is_contiguous()
-        ):
+        if weight_nt is not None and x2.shape[0] <= 48 and out2.is_contiguous():
             self._smallm_gemm(out2, x2, weight_nt, bias)
             return
         stream = int(torch.cuda.current_stream(x.device).cuda_stream)
         if bias is None:
             self._runner.bf16_nn(
-                x2.data_ptr(), weight.data_ptr(), out2.data_ptr(),
-                x2.shape[0], out2.shape[1], x2.shape[1], weight.stride(0),
-                output_stride, stream)
+                x2.data_ptr(), weight.data_ptr(), out2.data_ptr(), x2.shape[0], out2.shape[1],
+                x2.shape[1], weight.stride(0), output_stride, stream,
+            )
         else:
             self._runner.bf16_nn_bias(
-                x2.data_ptr(), weight.data_ptr(), out2.data_ptr(),
-                bias.data_ptr(), x2.shape[0], out2.shape[1], x2.shape[1],
-                weight.stride(0), output_stride, stream)
+                x2.data_ptr(), weight.data_ptr(), out2.data_ptr(), bias.data_ptr(), x2.shape[0],
+                out2.shape[1], x2.shape[1], weight.stride(0), output_stride, stream,
+            )
 
     def linear_residual(self, out, x, weight, bias=None) -> bool:
         """Fuse a prepared small-M projection into an in-place residual."""

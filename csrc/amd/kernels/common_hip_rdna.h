@@ -18,6 +18,28 @@
 
 constexpr int FLASHRT_RDNA_WAVE_SIZE = 32;
 
+// Keep an FP32 product separate from a following add under fast FP contraction.
+__device__ __forceinline__ float rdna_mul_f32(float first, float second) {
+  float product;
+  asm("v_mul_f32 %0, %1, %2" : "=v"(product) : "v"(first), "v"(second));
+  return product;
+}
+
+// Preserve the rounded high product in split log2(e) range reduction.
+__device__ __forceinline__ float rdna_exp_f32(float value) {
+  if (value < -0x1.9d1dap+6f)
+    return 0.0f;
+  if (value >= 0x1.62e43p+6f)
+    return INFINITY;
+  const float high = 0x1.715476p+0f, low = 0x1.4ae0bep-26f;
+  const float product = rdna_mul_f32(value, high);
+  const float error = fmaf(value, low, fmaf(value, high, -product));
+  const float exponent = nearbyintf(product);
+  const float fraction = (product - exponent) + error;
+  return __builtin_amdgcn_ldexpf(__builtin_amdgcn_exp2f(fraction),
+                                 static_cast<int>(exponent));
+}
+
 // ── Low-precision conversion helpers ──
 
 template <typename T> __device__ __forceinline__ float rdna_to_f32(T value);

@@ -232,3 +232,79 @@ class Rdna35TensorOps:
         self.residual(out_sum, update, residual, gate)
         return self.adarms(
             out_norm, out_sum, cond, weight, bias, eps, modulation)
+
+    def rms_norm_affine(self, x, weight, eps=1e-6, *, modulation=None):
+        """BF16 affine, or FP32 AdaRMS affine/modulation before the store."""
+        if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+            raise TypeError("RDNA affine RMSNorm requires BF16 input and weight")
+        if not x.is_contiguous() or x.shape[-1] % 4:
+            raise ValueError("RDNA affine RMSNorm requires contiguous rows with a 4-aligned width")
+        out = torch.empty_like(x)
+        rows, width = x.numel() // x.shape[-1], x.shape[-1]
+        if modulation is None:
+            self.fvk.rms_norm_affine_rdna(
+                x.data_ptr(), weight.data_ptr(), out.data_ptr(), rows, width, eps, self._stream(x)
+            )
+        else:
+            gamma, beta = modulation
+            if gamma.dtype != torch.float32 or beta.dtype != torch.float32:
+                raise TypeError("RDNA AdaRMS modulation must be FP32")
+            self.fvk.ada_rms_norm_fp32_rdna(
+                x.data_ptr(), weight.data_ptr(), gamma.data_ptr(), beta.data_ptr(), out.data_ptr(),
+                rows, width, eps, self._stream(x),
+            )
+        return out
+
+    def residual_rms_affine(
+        self, update, residual, weight, eps=1e-6, *, modulation=None, shared=None
+    ):
+        """Round the residual stream before affine RMSNorm or FP32 AdaRMSNorm."""
+        summed, out = torch.empty_like(residual), torch.empty_like(residual)
+        gamma, beta = modulation if modulation is not None else (None, None)
+        width = residual.shape[-1]
+        self.fvk.residual_rms_affine_rdna(
+            update.data_ptr(), residual.data_ptr(), 0 if shared is None else shared.data_ptr(),
+            weight.data_ptr(), 0 if gamma is None else gamma.data_ptr(),
+            0 if beta is None else beta.data_ptr(), summed.data_ptr(), out.data_ptr(),
+            residual.numel() // width, width, eps, self._stream(residual),
+        )
+        return summed, out
+
+    def rotate_half_hip(self, x, cos, sin, *, fp32=False):
+        """SHD or batch-1 BSHD input; preserve FP32 products and strided Q/K."""
+        if x.dtype not in (torch.bfloat16, torch.float32) or cos.dtype != sin.dtype:
+            raise TypeError("RDNA rotate-half requires BF16/FP32 input and matching tables")
+        dtype = torch.float32 if fp32 else x.dtype
+        if dtype == torch.float32 and cos.dtype != torch.float32:
+            raise TypeError("FP32 RDNA rotate-half requires FP32 tables")
+        flat = x[0] if x.ndim == 4 else x
+        cosine, sine = (cos[0], sin[0]) if cos.ndim == 3 else (cos, sin)
+        out = torch.empty(x.shape, dtype=dtype, device=x.device)
+        self.fvk.rotate_half_rdna(
+            flat.data_ptr(), cosine.data_ptr(), sine.data_ptr(), out.data_ptr(), flat.shape[0],
+            flat.shape[1], flat.shape[2], flat.stride(0), flat.stride(1), cosine.stride(0),
+            sine.stride(0), x.dtype == torch.float32, cos.dtype == torch.float32,
+            dtype == torch.float32, self._stream(x),
+        )
+        return out
+
+    def residual_rms_router(self, update, residual, weight, modulation, eps):
+        """768-wide residual/AdaRMSNorm with a BF16-rounded FP32 router input."""
+        summed, out = torch.empty_like(residual), torch.empty_like(residual)
+        router_input = torch.empty(residual.shape, device=residual.device, dtype=torch.float32)
+        gamma, beta = modulation
+        self.fvk.residual_rms_router_rdna(
+            update.data_ptr(), residual.data_ptr(), weight.data_ptr(), gamma.data_ptr(),
+            beta.data_ptr(), summed.data_ptr(), out.data_ptr(), router_input.data_ptr(),
+            residual.numel() // 768, eps, self._stream(residual),
+        )
+        return summed, out, router_input
+
+    def silu_bf16(self, x, up=None):
+        """Round SiLU to BF16 before the optional BF16 up multiplication."""
+        out = torch.empty_like(x)
+        self.fvk.silu_bf16_rdna(
+            x.data_ptr(), 0 if up is None else up.data_ptr(), out.data_ptr(), x.numel(),
+            self._stream(x),
+        )
+        return out
