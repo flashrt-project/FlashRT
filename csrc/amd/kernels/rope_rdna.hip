@@ -89,6 +89,32 @@ __global__ void qkv_rope_rdna_kernel(
       qkv2[input_base + kQPairs + kKvPairs + head_pair];
 }
 
+// ── Strided SHD rotate-half with contiguous output ──
+
+template <typename Input, typename Coeff, typename Output>
+__global__ void rotate_half_rdna_kernel(const Input *__restrict__ input,
+                                        const Coeff *__restrict__ cosine,
+                                        const Coeff *__restrict__ sine,
+                                        Output *__restrict__ output, int size,
+                                        int heads, int dim, int row_stride,
+                                        int head_stride, int cosine_stride,
+                                        int sine_stride) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size) {
+    const int column = index % dim;
+    const int head = index / dim % heads, row = index / (dim * heads);
+    const int base = row * row_stride + head * head_stride;
+    const float value = static_cast<float>(input[base + column]);
+    float other = static_cast<float>(input[base + (column + dim / 2) % dim]);
+    if (column < dim / 2)
+      other = -other;
+    const float c = static_cast<float>(cosine[row * cosine_stride + column]);
+    const float s = static_cast<float>(sine[row * sine_stride + column]);
+    output[index] =
+        static_cast<Output>(rdna_mul_f32(value, c) + rdna_mul_f32(other, s));
+  }
+}
+
 } // namespace
 
 // ── Host dispatch ──
@@ -101,4 +127,43 @@ void qkv_rope_rdna(const __hip_bfloat16 *qkv, const __hip_bfloat16 *rope_cos,
   const int pairs = rows * kHeadPairs;
   qkv_rope_rdna_kernel<<<(pairs + threads - 1) / threads, threads, 0, stream>>>(
       qkv, rope_cos, rope_sin, q_out, k_out, v_out, rows, position_start);
+}
+
+void rotate_half_rdna(const void *input, const void *cosine, const void *sine,
+                      void *output, int rows, int heads, int dim,
+                      int row_stride, int head_stride, int cosine_stride,
+                      int sine_stride, bool input_fp32, bool coeff_fp32,
+                      bool output_fp32, hipStream_t stream) {
+  const int size = rows * heads * dim;
+  const dim3 grid((size + 255) / 256);
+  if (input_fp32) {
+    rotate_half_rdna_kernel<float, float, float><<<grid, 256, 0, stream>>>(
+        static_cast<const float *>(input), static_cast<const float *>(cosine),
+        static_cast<const float *>(sine), static_cast<float *>(output), size,
+        heads, dim, row_stride, head_stride, cosine_stride, sine_stride);
+  } else if (output_fp32) {
+    rotate_half_rdna_kernel<__hip_bfloat16, float, float>
+        <<<grid, 256, 0, stream>>>(static_cast<const __hip_bfloat16 *>(input),
+                                   static_cast<const float *>(cosine),
+                                   static_cast<const float *>(sine),
+                                   static_cast<float *>(output), size, heads,
+                                   dim, row_stride, head_stride, cosine_stride,
+                                   sine_stride);
+  } else if (coeff_fp32) {
+    rotate_half_rdna_kernel<__hip_bfloat16, float, __hip_bfloat16>
+        <<<grid, 256, 0, stream>>>(static_cast<const __hip_bfloat16 *>(input),
+                                   static_cast<const float *>(cosine),
+                                   static_cast<const float *>(sine),
+                                   static_cast<__hip_bfloat16 *>(output), size,
+                                   heads, dim, row_stride, head_stride,
+                                   cosine_stride, sine_stride);
+  } else {
+    rotate_half_rdna_kernel<__hip_bfloat16, __hip_bfloat16, __hip_bfloat16>
+        <<<grid, 256, 0, stream>>>(static_cast<const __hip_bfloat16 *>(input),
+                                   static_cast<const __hip_bfloat16 *>(cosine),
+                                   static_cast<const __hip_bfloat16 *>(sine),
+                                   static_cast<__hip_bfloat16 *>(output), size,
+                                   heads, dim, row_stride, head_stride,
+                                   cosine_stride, sine_stride);
+  }
 }

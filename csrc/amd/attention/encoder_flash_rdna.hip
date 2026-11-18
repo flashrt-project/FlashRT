@@ -248,6 +248,56 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
   }
 }
 
+// ── BF16 score/probability rounding for vision attention ──
+
+template <int Width>
+__global__ __launch_bounds__(128) void attention_softmax_bf16_rdna_kernel(
+    const __hip_bfloat16 *__restrict__ scores,
+    __hip_bfloat16 *__restrict__ probs, int rows, int keys, float scale) {
+  const int row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (row >= rows)
+    return;
+  float values[Width / 32], maximum = -INFINITY;
+#pragma unroll
+  for (int i = 0; i < Width / 32; ++i) {
+    const int column = lane + i * 32;
+    values[i] =
+        column < keys
+            ? __bfloat162float(__float2bfloat16(
+                  __bfloat162float(scores[row * keys + column]) * scale))
+            : -INFINITY;
+    maximum = fmaxf(maximum, values[i]);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2)
+    maximum = fmaxf(maximum, __shfl_xor(maximum, offset, 32));
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < Width / 32; ++i) {
+    values[i] = rdna_exp_f32(values[i] - maximum);
+    sum += values[i];
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2)
+    sum += __shfl_xor(sum, offset, 32);
+#pragma unroll
+  for (int i = 0; i < Width / 32; ++i)
+    if (lane + i * 32 < keys)
+      probs[row * keys + lane + i * 32] = __float2bfloat16(values[i] / sum);
+}
+
+__global__ void
+attention_store_bshd_rdna_kernel(const __hip_bfloat16 *__restrict__ input,
+                                 __hip_bfloat16 *__restrict__ output, int size,
+                                 int queries, int heads, int dim) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size) {
+    const int column = index % dim, head = index / dim % heads,
+              row = index / (heads * dim);
+    output[index] = input[(head * queries + row) * dim + column];
+  }
+}
+
 } // namespace
 
 // ── Host dispatch and fixed-shape validation ──
@@ -326,4 +376,39 @@ void attention_encoder_gqa_rdna(const __hip_bfloat16 *query,
         <<<grid, threads, 0, stream>>>(query, key, value, output, query_rows,
                                       valid_kv_rows, query_heads, scale_log2);
   }
+}
+
+void attention_softmax_bf16_rdna(const __hip_bfloat16 *scores,
+                                 __hip_bfloat16 *probs, int queries, int keys,
+                                 int heads, float scale, hipStream_t stream) {
+  const int rows = queries * heads;
+#define FLASHRT_LAUNCH_SOFTMAX_BF16(w)                                         \
+  attention_softmax_bf16_rdna_kernel<w>                                        \
+      <<<(rows + 3) / 4, 128, 0, stream>>>(scores, probs, rows, keys, scale)
+  if (keys <= 32) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(32);
+  } else if (keys <= 64) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(64);
+  } else if (keys <= 128) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(128);
+  } else if (keys <= 256) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(256);
+  } else if (keys <= 512) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(512);
+  } else if (keys <= 1024) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(1024);
+  } else if (keys <= 2048) {
+    FLASHRT_LAUNCH_SOFTMAX_BF16(2048);
+  } else
+    throw std::invalid_argument(
+        "RDNA BF16 vision attention supports up to 2048 keys");
+#undef FLASHRT_LAUNCH_SOFTMAX_BF16
+}
+
+void attention_store_bshd_rdna(const __hip_bfloat16 *input,
+                               __hip_bfloat16 *output, int queries, int heads,
+                               int dim, hipStream_t stream) {
+  const int size = queries * heads * dim;
+  attention_store_bshd_rdna_kernel<<<(size + 255) / 256, 256, 0, stream>>>(
+      input, output, size, queries, heads, dim);
 }

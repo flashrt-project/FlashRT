@@ -1,14 +1,16 @@
 // ================================================================
 // FlashRT AMD -- BF16 activation kernels (RDNA 3.5, wave32)
 //
-// Implements the activation surface used by the Pi0.5 BF16 pipeline:
+// Implements the activation surface used by RDNA BF16 pipelines:
 //   gelu:             out[i] = GELU_tanh(x[i])
 //   gelu_mul:         out[i] = GELU_tanh(gate[i]) * up[i]
 //   gelu_mul_merged:  same operation from row-major [gate | up]
 //   silu:             out[i] = x[i] / (1 + exp(-x[i]))
+//   silu_bf16:        round SiLU to BF16 before optional up multiplication
 //
 // Inputs and outputs are BF16; transcendental and multiply operations use
-// FP32 intermediates and round once at the output. Even-sized tensors use
+// FP32 intermediates. The silu_bf16 variant preserves the intermediate BF16
+// store; other variants round once at the output. Even-sized tensors use
 // packed BF16x2 or BF16x4 accesses. Scalar kernels are retained for odd-size
 // correctness rather than imposing alignment constraints on the raw ABI.
 //
@@ -162,6 +164,24 @@ silu_packed_rdna_kernel(const __hip_bfloat162 *__restrict__ input,
   }
 }
 
+// ── BF16 SiLU, with rounding before the optional up multiplication ──
+
+template <bool Multiply>
+__global__ void silu_bf16_rdna_kernel(const __hip_bfloat16 *__restrict__ gate,
+                                      const __hip_bfloat16 *__restrict__ up,
+                                      __hip_bfloat16 *__restrict__ output,
+                                      int size) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size) {
+    const float value = __bfloat162float(gate[index]);
+    float activated = value / (1.0f + expf(-value));
+    if constexpr (Multiply)
+      activated = __bfloat162float(__float2bfloat16(activated)) *
+                  __bfloat162float(up[index]);
+    output[index] = __float2bfloat16(activated);
+  }
+}
+
 } // namespace
 
 // ── Host dispatch ──
@@ -228,4 +248,13 @@ void silu_rdna(const __hip_bfloat16 *input, __hip_bfloat16 *output, int size,
   }
   silu_rdna_kernel<<<(size + threads - 1) / threads, threads, 0, stream>>>(
       input, output, size);
+}
+void silu_bf16_rdna(const __hip_bfloat16 *gate, const __hip_bfloat16 *up,
+                    __hip_bfloat16 *output, int size, hipStream_t stream) {
+  if (up)
+    silu_bf16_rdna_kernel<true>
+        <<<(size + 255) / 256, 256, 0, stream>>>(gate, up, output, size);
+  else
+    silu_bf16_rdna_kernel<false>
+        <<<(size + 255) / 256, 256, 0, stream>>>(gate, up, output, size);
 }

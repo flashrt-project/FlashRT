@@ -392,7 +392,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n15", "groot_n17",
-            "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
+            "lingbot_vla_v2", "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
             "cosmos3_edge", "xvla", "ltx25", "lawam", "vla_jepa".
             "xvla" is lerobot/xvla-libero on RTX SM120/SM121 (torch only;
             see ``xvla_precision``).
@@ -502,8 +502,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             (production default ``10``).
         precision: Execution tier, one of ``"auto"``, ``"bf16"``, ``"int8"``
             or ``"fp8"``. Apple MPS accepts ``"auto"`` / ``"bf16"``.
-            Ascend accepts ``"auto"`` / ``"bf16"`` / ``"int8"``. On
-            other architectures anything but ``"auto"`` raises, because those
+            Ascend accepts auto / bf16 / int8. AMD RDNA LingBot-VLA-v2
+            accepts auto / bf16. On other architectures anything but auto
+            raises, because those
             backends select their tier through ``use_fp8``/``use_fp4``/
             ``use_fp16`` while the frontend class is being chosen. On Ascend,
             ``"fp8"`` raises (910/A2 parts have no FP8 tensor hardware), and
@@ -523,8 +524,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             reference against the quantized default. On GROOT N1.7 the
             default is FP8 (FP8 backbone + bf16 DiT), so ``use_fp8=False``
             without ``use_fp16=True`` raises.
-        num_steps: Pi0/Pi0.5 torch only when supported. Number of
-            flow-matching ODE steps. ``None`` uses the frontend default.
+        num_steps: Pi0/Pi0.5 and LingBot-VLA-v2 torch when supported. Number of
+            flow-matching ODE steps. None uses the frontend default.
         vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
             for vision tokens; valid values are 1, 2, or 4. ``None`` keeps
             the frontend default.
@@ -639,14 +640,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 f"Unknown Jetson-PI config: {config}. "
                 "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n15", "groot_n17", "pi0",
-                      "pi0fast",
+                      "pi0fast", "lingbot_vla_v2",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
                       "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b", "lawam",
                       "molmoact2", "vla_jepa"):
         raise ValueError(
             f"Unknown config: {config}. "
-            f"Supported: pi05, groot, groot_n15, groot_n17, pi0, pi0fast, motus, "
+            f"Supported: pi05, groot, groot_n15, groot_n17, pi0, pi0fast, lingbot_vla_v2, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
             f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b, "
             f"lawam, molmoact2, vla_jepa")
@@ -860,6 +861,23 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     if precision not in _PRECISION_TIERS:
         raise ValueError(
             f"precision must be one of {sorted(_PRECISION_TIERS)}, got {precision!r}")
+    if config == "lingbot_vla_v2":
+        if framework != "torch" or arch not in ("amd_rdna3", "amd_rdna35", "amd_rdna4"):
+            raise ValueError("LingBot-VLA-v2 requires framework='torch' and AMD RDNA hardware")
+        if precision not in ("auto", "bf16") or (
+                use_fp4 or use_fp16 or use_fa4 or use_fp4_decoder
+                or use_fp4_encoder_attn or use_fp4_siglip_ffn):
+            raise ValueError("LingBot-VLA-v2 on RDNA supports BF16 only")
+        if action_dim is not None:
+            raise ValueError("LingBot-VLA-v2 returns the policy's padded action channels")
+        if fuse_image_embeds is not None or use_backbone_graph is not None:
+            raise ValueError("LingBot-VLA-v2 uses infer(use_graph=...) to control its inference graph")
+        pipe_cls = resolve_pipeline_class(config, framework, arch)
+        kwargs = dict(num_views=num_views, num_steps=num_steps, action_horizon=action_horizon,
+                      hardware=arch, use_fp8=False)
+        if device is not None:
+            kwargs["device"] = device
+        return VLAModel(pipe_cls(checkpoint, **kwargs), framework)
     if arch == "apple_mps":
         if precision not in ("auto", "bf16"):
             raise ValueError("Apple MPS currently supports precision='bf16' only")

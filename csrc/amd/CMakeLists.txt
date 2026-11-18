@@ -84,6 +84,7 @@ if(GPU_ARCH_BASE MATCHES "^(gfx1100|gfx1151|gfx1201)$")
     kernels/activation_rdna.hip
     kernels/elementwise_rdna.hip
     kernels/rope_rdna.hip
+    kernels/moe_rdna.hip
     attention/decoder_flash_rdna.hip
     attention/encoder_flash_rdna.hip
     gemm/hipblaslt_runner_rdna.hip

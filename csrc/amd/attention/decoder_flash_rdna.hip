@@ -34,6 +34,7 @@
 #include "../kernels/common_hip_rdna.h"
 
 #include <cfloat>
+#include <cmath>
 #include <stdexcept>
 
 namespace {
@@ -313,6 +314,144 @@ __launch_bounds__(kAttentionThreads) void attention_decoder_gqa_rdna_kernel(
       __float2bfloat16(((acc0 + acc1) + (acc2 + acc3)) * inverse_denominator);
 }
 
+// ── Materialized FP32 attention helpers ──
+
+__global__ void attention_pack_kv_rdna_kernel(
+    const float *__restrict__ key, const float *__restrict__ value,
+    const float *__restrict__ suffix_key,
+    const __hip_bfloat16 *__restrict__ suffix_value,
+    float *__restrict__ packed_key, float *__restrict__ packed_value, int size,
+    int prefix_rows, int heads, int kv_heads, int dim, int key_stride,
+    int value_stride, int suffix_key_stride, int suffix_value_stride) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size) {
+    const int column = index % dim, head = index / dim % heads;
+    const int row = index / (heads * dim), kv_head = head / (heads / kv_heads);
+    const int source_column = kv_head * dim + column;
+    packed_key[index] =
+        row < prefix_rows ? key[row * key_stride + source_column]
+                          : suffix_key[(row - prefix_rows) * suffix_key_stride +
+                                       source_column];
+    packed_value[index] =
+        row < prefix_rows
+            ? value[row * value_stride + source_column]
+            : __bfloat162float(
+                  suffix_value[(row - prefix_rows) * suffix_value_stride +
+                               source_column]);
+  }
+}
+
+// ── Rotate-half and grouped Q/K/V packing ──
+// Write FP32 rotary results directly to the grouped query and suffix cache.
+
+__global__ void attention_rope_pack_fp32_rdna_kernel(
+    const __hip_bfloat16 *query, const __hip_bfloat16 *key,
+    const __hip_bfloat16 *value, const float *cosine, const float *sine,
+    float *packed_query, float *packed_key, float *packed_value, int queries,
+    int heads, int kv_heads, int dim, int query_stride, int key_stride,
+    int value_stride, int cosine_stride, int sine_stride) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int half = dim / 2, groups = heads / kv_heads;
+  if (index >= queries * heads * half)
+    return;
+  const int column = index % half, group = index / half % groups;
+  const int row = index / (half * groups) % queries;
+  const int kv_head = index / (half * groups * queries);
+  const int source =
+      row * query_stride + (kv_head * groups + group) * dim + column;
+  const float first = __bfloat162float(query[source]);
+  const float second = __bfloat162float(query[source + half]);
+  const float c0 = cosine[row * cosine_stride + column];
+  const float c1 = cosine[row * cosine_stride + column + half];
+  const float s0 = sine[row * sine_stride + column];
+  const float s1 = sine[row * sine_stride + column + half];
+  const int target =
+      ((kv_head * queries + row) * groups + group) * dim + column;
+  packed_query[target] = rdna_mul_f32(first, c0) + rdna_mul_f32(-second, s0);
+  packed_query[target + half] =
+      rdna_mul_f32(second, c1) + rdna_mul_f32(first, s1);
+  if (group == 0) {
+    const int k_source = row * key_stride + kv_head * dim + column;
+    const float k0 = __bfloat162float(key[k_source]);
+    const float k1 = __bfloat162float(key[k_source + half]);
+    const int kv_target = row * kv_heads * dim + kv_head * dim + column;
+    packed_key[kv_target] = rdna_mul_f32(k0, c0) + rdna_mul_f32(-k1, s0);
+    packed_key[kv_target + half] = rdna_mul_f32(k1, c1) + rdna_mul_f32(k0, s1);
+    const int v_source = row * value_stride + kv_head * dim + column;
+    packed_value[kv_target] = __bfloat162float(value[v_source]);
+    packed_value[kv_target + half] = __bfloat162float(value[v_source + half]);
+  }
+}
+
+// Group each KV head's query heads into consecutive GEMM rows.
+__global__ void attention_pack_q_rdna_kernel(const float *__restrict__ input,
+                                             float *__restrict__ output,
+                                             int size, int queries, int groups,
+                                             int dim, int query_stride) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size) {
+    const int column = index % dim, group = index / dim % groups;
+    const int query = index / (dim * groups) % queries;
+    const int kv_head = index / (dim * groups * queries);
+    output[index] =
+        input[query * query_stride + (kv_head * groups + group) * dim + column];
+  }
+}
+
+template <int Width, bool Grouped = false>
+__global__ __launch_bounds__(128) void attention_softmax_fp32_rdna_kernel(
+    const float *__restrict__ scores, const bool *__restrict__ mask,
+    float *__restrict__ probs, int rows, int queries, int keys, int groups,
+    float scale) {
+  const int row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (row >= rows)
+    return;
+  float values[Width / 32];
+  float maximum = -INFINITY;
+#pragma unroll
+  for (int i = 0; i < Width / 32; ++i) {
+    const int column = lane + i * 32;
+    values[i] =
+        column >= keys ? -INFINITY
+        : mask[((Grouped ? row / groups : row) % queries) * keys + column]
+            ? rdna_mul_f32(scores[row * keys + column], scale)
+            : -2.3819763e38f;
+    maximum = fmaxf(maximum, values[i]);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2)
+    maximum = fmaxf(maximum, __shfl_xor(maximum, offset, 32));
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < Width / 32; ++i) {
+    values[i] = rdna_exp_f32(values[i] - maximum);
+    sum += values[i];
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2)
+    sum += __shfl_xor(sum, offset, 32);
+#pragma unroll
+  for (int i = 0; i < Width / 32; ++i)
+    if (lane + i * 32 < keys)
+      probs[row * keys + lane + i * 32] = values[i] / sum;
+}
+
+template <bool Grouped = false>
+__global__ void
+attention_store_bf16_rdna_kernel(const float *__restrict__ input,
+                                 __hip_bfloat16 *__restrict__ output, int size,
+                                 int queries, int heads, int groups, int dim) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size) {
+    const int column = index % dim, head = index / dim % heads,
+              row = index / (heads * dim);
+    const int source_row =
+        Grouped ? (head / groups * queries + row) * groups + head % groups
+                : head * queries + row;
+    output[index] = __float2bfloat16(input[source_row * dim + column]);
+  }
+}
+
 } // namespace
 
 // ── Host launchers and shape contracts ──
@@ -374,4 +513,113 @@ void attention_decoder_gqa_splitkey_rdna(
         "attention_decoder_gqa_splitkey_rdna: keys/iteration must be 1/2/4/8");
   }
 #undef FLASHRT_LAUNCH_SPLITKEY
+}
+
+void attention_rope_pack_fp32_rdna(
+    const __hip_bfloat16 *query, const __hip_bfloat16 *key,
+    const __hip_bfloat16 *value, const float *cosine, const float *sine,
+    float *packed_query, float *packed_key, float *packed_value, int queries,
+    int heads, int kv_heads, int dim, int query_stride, int key_stride,
+    int value_stride, int cosine_stride, int sine_stride, hipStream_t stream) {
+  constexpr int threads = 256;
+  const int size = queries * heads * dim / 2;
+  attention_rope_pack_fp32_rdna_kernel<<<(size + threads - 1) / threads,
+                                         threads, 0, stream>>>(
+      query, key, value, cosine, sine, packed_query, packed_key, packed_value,
+      queries, heads, kv_heads, dim, query_stride, key_stride, value_stride,
+      cosine_stride, sine_stride);
+}
+
+void attention_pack_kv_rdna(const float *key, const float *value,
+                            const float *suffix_key,
+                            const __hip_bfloat16 *suffix_value,
+                            float *packed_key, float *packed_value,
+                            int prefix_rows, int suffix_rows, int heads,
+                            int kv_heads, int dim, int key_stride,
+                            int value_stride, int suffix_key_stride,
+                            int suffix_value_stride, hipStream_t stream) {
+  const int size = (prefix_rows + suffix_rows) * heads * dim;
+  attention_pack_kv_rdna_kernel<<<(size + 255) / 256, 256, 0, stream>>>(
+      key, value, suffix_key, suffix_value, packed_key, packed_value, size,
+      prefix_rows, heads, kv_heads, dim, key_stride, value_stride,
+      suffix_key_stride, suffix_value_stride);
+}
+
+void attention_softmax_fp32_rdna(const float *scores, const bool *mask,
+                                 float *probs, int queries, int keys, int heads,
+                                 float scale, hipStream_t stream) {
+  const int rows = queries * heads;
+#define FLASHRT_LAUNCH_SOFTMAX(w)                                              \
+  attention_softmax_fp32_rdna_kernel<w><<<(rows + 3) / 4, 128, 0, stream>>>(   \
+      scores, mask, probs, rows, queries, keys, 1, scale)
+  if (keys <= 32) {
+    FLASHRT_LAUNCH_SOFTMAX(32);
+  } else if (keys <= 64) {
+    FLASHRT_LAUNCH_SOFTMAX(64);
+  } else if (keys <= 128) {
+    FLASHRT_LAUNCH_SOFTMAX(128);
+  } else if (keys <= 256) {
+    FLASHRT_LAUNCH_SOFTMAX(256);
+  } else if (keys <= 512) {
+    FLASHRT_LAUNCH_SOFTMAX(512);
+  } else if (keys <= 1024) {
+    FLASHRT_LAUNCH_SOFTMAX(1024);
+  } else if (keys <= 2048) {
+    FLASHRT_LAUNCH_SOFTMAX(2048);
+  } else
+    throw std::invalid_argument("RDNA FP32 attention supports up to 2048 keys");
+#undef FLASHRT_LAUNCH_SOFTMAX
+}
+
+void attention_store_bf16_rdna(const float *input, __hip_bfloat16 *output,
+                               int queries, int heads, int dim,
+                               hipStream_t stream) {
+  const int size = queries * heads * dim;
+  attention_store_bf16_rdna_kernel<><<<(size + 255) / 256, 256, 0, stream>>>(
+      input, output, size, queries, heads, 1, dim);
+}
+
+void attention_store_gqa_bf16_rdna(const float *input, __hip_bfloat16 *output,
+                                   int queries, int heads, int groups, int dim,
+                                   hipStream_t stream) {
+  const int size = queries * heads * dim;
+  attention_store_bf16_rdna_kernel<true>
+      <<<(size + 255) / 256, 256, 0, stream>>>(input, output, size, queries,
+                                               heads, groups, dim);
+}
+
+void attention_pack_q_fp32_rdna(const float *input, float *output, int queries,
+                                int heads, int groups, int dim,
+                                int query_stride, hipStream_t stream) {
+  const int size = queries * heads * dim;
+  attention_pack_q_rdna_kernel<<<(size + 255) / 256, 256, 0, stream>>>(
+      input, output, size, queries, groups, dim, query_stride);
+}
+
+void attention_softmax_gqa_fp32_rdna(const float *scores, const bool *mask,
+                                     float *probs, int queries, int keys,
+                                     int heads, int groups, float scale,
+                                     hipStream_t stream) {
+  const int rows = queries * heads;
+#define FLASHRT_LAUNCH_SOFTMAX(w)                                              \
+  attention_softmax_fp32_rdna_kernel<w, true>                                  \
+      <<<(rows + 3) / 4, 128, 0, stream>>>(scores, mask, probs, rows, queries, \
+                                           keys, groups, scale)
+  if (keys <= 32) {
+    FLASHRT_LAUNCH_SOFTMAX(32);
+  } else if (keys <= 64) {
+    FLASHRT_LAUNCH_SOFTMAX(64);
+  } else if (keys <= 128) {
+    FLASHRT_LAUNCH_SOFTMAX(128);
+  } else if (keys <= 256) {
+    FLASHRT_LAUNCH_SOFTMAX(256);
+  } else if (keys <= 512) {
+    FLASHRT_LAUNCH_SOFTMAX(512);
+  } else if (keys <= 1024) {
+    FLASHRT_LAUNCH_SOFTMAX(1024);
+  } else if (keys <= 2048) {
+    FLASHRT_LAUNCH_SOFTMAX(2048);
+  } else
+    throw std::invalid_argument("RDNA FP32 attention supports up to 2048 keys");
+#undef FLASHRT_LAUNCH_SOFTMAX
 }

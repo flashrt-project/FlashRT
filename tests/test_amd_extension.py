@@ -166,18 +166,32 @@ _REQUIRED_CLASSES = ["FvkContext", "GemmRunner"]
 _REQUIRED_RDNA_FUNCS = [
     "build_info", "device_arch",
     "qkv_rope_rdna",
+    "rms_norm_affine_rdna", "ada_rms_norm_fp32_rdna", "residual_rms_affine_rdna",
+    "rotate_half_rdna", "silu_bf16_rdna",
+    "attention_pack_kv_rdna", "attention_rope_pack_fp32_rdna", "attention_softmax_fp32_rdna",
+    "attention_store_bf16_rdna", "attention_softmax_bf16_rdna",
+    "attention_store_bshd_rdna", "moe_topk_rdna",
+    "attention_pack_q_fp32_rdna", "attention_softmax_gqa_fp32_rdna",
+    "attention_store_gqa_bf16_rdna", "q_norm_rope_pack_rdna", "k_norm_rope_cache_rdna",
+    "residual_rms_router_rdna",
     "layer_norm_rdna", "rms_norm_rdna", "adarms_rdna",
     "gelu_rdna", "gelu_mul_rdna", "gelu_mul_merged_rdna", "silu_rdna",
     "residual_rdna", "residual_rms_rdna", "residual_adarms_rdna",
     "attention_decoder_gqa_rdna",
     "attention_decoder_gqa_splitkey_rdna",
     "attention_encoder_gqa_rdna",
+    "moe_forward_rdna", "moe_forward_packed_rdna",
+    "moe_pack_compact_rdna", "moe_forward_compact_rdna",
     "smallm_wmma_bf16_rdna",
     "smallm_wmma_bf16_residual_rdna",
 ]
 _REQUIRED_RDNA_CLASSES = ["RdnaGemmRunner"]
 _REQUIRED_RDNA_GEMM_METHODS = [
-    "bf16_nn", "bf16_nn_bias", "enable_lazy_autotune",
+    "bf16_nn", "bf16_nn_bias", "bf16_nt", "bf16_nt_rows", "bf16_nt_pair",
+    "bf16_bmm", "fp32_nt", "fp32_bmm", "fp32_gqa_bmm", "fp32_gqa_bmm_rows",
+    "enable_lazy_autotune",
+    "begin_bf16_nt_calibration", "end_bf16_nt_calibration",
+    "begin_fp32_gqa_pv_calibration", "end_fp32_gqa_pv_calibration",
     "autotune_bf16_nn", "autotune_bf16_nn_bias",
 ]
 

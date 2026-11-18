@@ -26,6 +26,7 @@ _AMD_FRONTENDS = [
     "flash_rt.amd.frontends.torch.pi05",
     "flash_rt.amd.frontends.torch.pi05_rdna",
     "flash_rt.amd.frontends.torch.groot_n17",
+    "flash_rt.amd.frontends.torch.lingbot_vla_v2_rdna",
 ]
 
 
