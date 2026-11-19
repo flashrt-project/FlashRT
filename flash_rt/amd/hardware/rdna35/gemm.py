@@ -10,11 +10,13 @@ import torch
 class Rdna35GemmBackend:
     """Run BF16 GEMMs through an instance-local hipBLASLt algorithm cache."""
 
-    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16, *, autotune=None):
+    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16, *, autotune=None,
+                 native_nt=False):
         if dtype is not torch.bfloat16:
             raise TypeError(f"RDNA 3.5 GEMM supports BF16 only, got {dtype}")
         self.dtype = dtype
         self.fvk = kernels
+        self.native_nt = native_nt
         self._runner = kernels.RdnaGemmRunner()
         # Targets may require a fixed heuristic for numerical reproducibility.
         # Existing callers retain the environment-controlled tuning policy.
@@ -131,11 +133,14 @@ class Rdna35GemmBackend:
                reference_rows=None):
         """BF16 linear with K-by-N weights, or explicit N-by-K Torch layout.
 
-        The latter describes nn.Linear storage directly through hipBLASLt.
-        reference_rows retains the padded-shape algorithm for compact rows.
+        N-by-K weights use Torch mm/addmm by default. Instances explicitly
+        configured with native_nt=True use hipBLASLt instead; only that policy
+        accepts reference_rows to retain the padded-shape algorithm for compact rows.
         Existing K-by-N callers retain their native hipBLASLt/small-M policy.
         Packing belongs to caller setup, never here.
         """
+        if reference_rows is not None and not (weight_transposed and self.native_nt):
+            raise ValueError("reference_rows requires weight_transposed=True and native_nt=True")
         tensors = (out, x, weight) if bias is None else (
             out, x, weight, bias)
         if any(t.device.type != "cuda" for t in tensors):
@@ -174,6 +179,12 @@ class Rdna35GemmBackend:
         if bias is not None and (bias.shape != (out2.shape[1],) or not bias.is_contiguous()):
             raise ValueError("unsupported RDNA 3.5 GEMM bias")
         if weight_transposed:
+            if not self.native_nt:
+                if bias is None:
+                    torch.mm(x2, weight.t(), out=out2)
+                else:
+                    torch.addmm(bias, x2, weight.t(), out=out2)
+                return
             if reference_rows is not None:
                 self._runner.bf16_nt_rows(
                     x2.data_ptr(), weight.data_ptr(), out2.data_ptr(),

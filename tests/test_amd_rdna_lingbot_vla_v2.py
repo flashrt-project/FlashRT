@@ -421,7 +421,7 @@ def test_mrope_preserves_dtype_rounded_inverse_frequencies():
 
 @pytest.mark.parametrize("shape", [(2, 7, 32)])
 def test_shared_gemm_provider_preserves_linear_layout(device, kernels, shape):
-    ops = _TransformerOps(kernels, gemm=Rdna35GemmBackend(kernels, autotune=False))
+    ops = _TransformerOps(kernels, gemm=Rdna35GemmBackend(kernels, autotune=False, native_nt=True))
     torch.manual_seed(137)
     x = torch.randn(shape, dtype=torch.bfloat16, device=device)
     original = torch.randn(48, 32, dtype=torch.bfloat16, device=device)
@@ -440,8 +440,8 @@ def test_exact_gemm_calibration_preserves_samples_and_output_stride(
 ):
     torch.manual_seed(157)
     rows, columns, inner = 7, 48, 32
-    baseline = Rdna35GemmBackend(kernels, autotune=False)
-    calibrated = Rdna35GemmBackend(kernels, autotune=False)
+    baseline = Rdna35GemmBackend(kernels, autotune=False, native_nt=True)
+    calibrated = Rdna35GemmBackend(kernels, autotune=False, native_nt=True)
     weight = torch.randn(columns, inner, dtype=torch.bfloat16, device=device)
     bias = torch.randn(columns, dtype=torch.bfloat16, device=device) if biased else None
     samples = [
@@ -573,7 +573,7 @@ def test_hip_silu_preserves_bf16_activation_before_multiplication(device, kernel
 def test_hip_paired_projections_preserve_reference_and_graph_updates(
     device, kernels, rows, reference_rows, inner, columns
 ):
-    ops = _TransformerOps(kernels, gemm=Rdna35GemmBackend(kernels, autotune=False))
+    ops = _TransformerOps(kernels, gemm=Rdna35GemmBackend(kernels, autotune=False, native_nt=True))
     torch.manual_seed(239)
     x = torch.randn(1, rows, inner, device=device, dtype=torch.bfloat16)
     weight = ops.prepare_weight(
