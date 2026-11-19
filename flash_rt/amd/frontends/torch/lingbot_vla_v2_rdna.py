@@ -129,7 +129,9 @@ class LingbotVlaV2TorchFrontendAmdRdna:
             props = torch.cuda.get_device_properties(self.device)
             self.hardware = load_capabilities(kernels, props.gcnArchName, hardware).hardware
             # Describe the official nn.Linear storage directly through hipBLASLt.
-            ops = _TransformerOps(kernels, gemm=Rdna35GemmBackend(kernels, autotune=False))
+            ops = _TransformerOps(
+                kernels, gemm=Rdna35GemmBackend(kernels, autotune=False, native_nt=True)
+            )
             weights = self._load_weights()
             self.pipeline = LingbotVlaV2PipelineRdna(
                 weights, self.qwen_config["vision_config"], ops

@@ -178,3 +178,12 @@ FLASH_RT_LINGBOT_VLA_V2_PROCESSOR=/path/to/Qwen3-VL-4B-Instruct \
 FLASH_RT_LINGBOT_VLA_V2_REFERENCE=/path/to/official_reference.pt \
 python -m pytest -q tests/test_amd_rdna_lingbot_vla_v2.py
 ```
+
+### Dense GEMM policy
+
+LingBot explicitly selects `Rdna35GemmBackend(..., native_nt=True)` for both
+its main and shared-expert backends. This keeps its existing native NT
+projections, reference-row calibration and Graph execution. The shared
+backend defaults to `native_nt=False`: N-by-K weights continue to use
+`torch.mm` / `torch.addmm`, including GR00T N1.7 on gfx1100 and gfx1201.
+Weight layout alone does not enable native NT, and no global policy changes.

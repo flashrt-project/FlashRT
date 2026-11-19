@@ -717,7 +717,7 @@ class LingbotVlaV2PipelineRdna:
             from flash_rt.amd.hardware.rdna35.gemm import Rdna35GemmBackend
 
             self.shared_ops = copy.copy(self.ops)
-            self.shared_ops.gemm = Rdna35GemmBackend(kernels, autotune=False)
+            self.shared_ops.gemm = Rdna35GemmBackend(kernels, autotune=False, native_nt=True)
             self.shared_stream = torch.cuda.Stream(device=weight.device)
         self._bind_suffix()
 
