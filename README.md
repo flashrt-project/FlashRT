@@ -58,7 +58,6 @@ More recordings and setup details: [demo gallery](docs/demos.md).
 - **Oct 2026** — [AMD MI300X support](https://github.com/flashrt-project/FlashRT/pull/214) is merged. Thanks to [Yiannis](https://github.com/yiannisha) and Cybernetic Physics; see the [porting story](https://cyberneticphysics.com/blog/real-time-vla-inference-on-amd-hardware).
 - **Oct 2026** — Thanks to [@tlitdc](https://github.com/tlitdc) for the [Hy-Embodied-0.5-VLA RTX SM120 backend](docs/hyvla05_rtx_sm120.md) ([#217](https://github.com/flashrt-project/FlashRT/pull/217)), extending the existing Thor model path to consumer Blackwell.
 - **Sep 2026** — Congratulations to [MindOn on Mind-1](https://www.mindon.tech/blog/mind-1/index.html), and thank you for supporting the FlashRT community.
-
 - **Aug 2026** — **AMD Instinct MI350X (CDNA4)** joins the VLA line: **Pi0.5 at 16.4 ms** (2.47× over `torch.compile` max-autotune, 7.1× over eager) and **GROOT N1.7 at 16.0 ms** full-frame (4.24× over eager). A standalone ROCm/HIP backend — hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture — arch-gated to gfx950 at both build and run time, carrying no CUDA assumptions. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md).
 - **Aug 2026** — **FlashRT Structures** ships: the kernel catalog attaches to an *unmodified* PyTorch host — `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang — with no fork and no edit to the host. Measured on VLA, VLM, LLM and video models across RTX 5090 and Jetson AGX Thor. Now its own package: [FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures). See also the [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines).
 - **Jul 2026** — **Cosmos3-Edge on Jetson AGX Thor** reaches **6.60x** no-cache AV denoise speedup; its NVFP4 Reasoner decodes text/image/video at **104.3 / 112.6 / 108.7 tok/s**. The earlier **Cosmos3-Nano RTX 5090** path reaches **4.8 s E2E** with FP8 for a 480p, 49-frame, 10-step workload. See [Cosmos3-Edge](docs/cosmos3_edge_thor.md) and [Cosmos3-Nano](docs/cosmos3_video_usage.md).
@@ -124,7 +123,7 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 
 Baseline comparisons and source methodology live in [Benchmark Comparison](docs/benchmark_comparison.md).
 
-#### Pi0.5
+### Pi0.5
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -143,7 +142,7 @@ over 10 seeds (5000 episodes; [protocol](docs/pi05_prefix_nvfp4.md#libero-10-clo
 
 **Guide:** [Thor](docs/thor/pi05.md) · [RTX 5090](examples/blackwell/README.md) · [AMD](docs/deployment_amd_pi05.md).
 
-#### Pi0
+### Pi0
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -154,7 +153,7 @@ over 10 seeds (5000 episodes; [protocol](docs/pi05_prefix_nvfp4.md#libero-10-clo
 
 **Guide:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
 
-#### GROOT N1.6
+### GROOT N1.6
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -165,14 +164,14 @@ over 10 seeds (5000 episodes; [protocol](docs/pi05_prefix_nvfp4.md#libero-10-clo
 
 **Guide:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
 
-#### GROOT N1.5
+### GROOT N1.5
 
 | Hardware | Mode | Latency | Source |
 |---|---|---:|---|
 | RTX 4090 | FP8 (default), 3-view, `infer` / graph replay | **30.8 ms** / 21.2 ms (upstream eager 81.2 ms) | [GROOT N1.5 SM89](docs/groot_n15_rtx_sm89.md) |
 | RTX 4090 | BF16, 3-view, `infer` / graph replay | **35.0 ms** / 24.9 ms | [GROOT N1.5 SM89](docs/groot_n15_rtx_sm89.md) |
 
-#### GROOT N1.7
+### GROOT N1.7
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -193,7 +192,7 @@ and `--cpu-threads 2`, measured separately from model inference.
 
 **Guide:** [Thor](docs/thor/groot-n17.md) · [RTX 5090](#groot-n17-rtx) · [AMD](docs/deployment_amd.md).
 
-#### Pi0-FAST
+### Pi0-FAST
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -202,7 +201,7 @@ and `--cpu-threads 2`, measured separately from model inference.
 
 **Guide:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
 
-#### LingBot-VLA
+### LingBot-VLA
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -212,7 +211,7 @@ and `--cpu-threads 2`, measured separately from model inference.
 
 **Guide:** [Thor](docs/lingbot_usage.md).
 
-#### Qwen3.6-27B
+### Qwen3.6-27B
 
 RTX 5090:
 
@@ -239,7 +238,7 @@ DGX Spark / GB10:
 
 **Guide:** [Thor](docs/qwen36_nvfp4.md#jetson-agx-thor-numbers) · [RTX 5090](docs/qwen36_nvfp4.md) · [DGX Spark](docs/qwen36_spark.md).
 
-#### Qwen3.6-35B-A3B
+### Qwen3.6-35B-A3B
 
 RTX 5090:
 
@@ -267,7 +266,7 @@ plain in the same process, emitting the same tokens as greedy decoding. See
 
 **Guide:** [Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) · [RTX 5090](docs/qwen36_moe_usage.md).
 
-#### Flint (official NVFP4 GGUF)
+### Flint (official NVFP4 GGUF)
 
 FlashRT W4A16 kernels and a torch frontend for RTX 5090. Batch 1, greedy,
 identical public token inputs; both executors use full-forward wall time.
@@ -294,7 +293,7 @@ llama.cpp F16 KV. [Protocol, accuracy and reproduction](docs/flint_usage.md).
 
 **Guide:** [RTX 5090 setup and limits](docs/flint_usage.md).
 
-#### Flint (MLX int4, Apple Silicon)
+### Flint (MLX int4, Apple Silicon)
 
 Native Metal plan for the `RecursiveSI/flint-int4` checkpoint on M4 Pro / M4
 Max, with the reference engine's precision (affine int4 g64 weights, BF16
@@ -314,7 +313,7 @@ Optional greedy lookup decoding (n-gram draft tokens, each verified row
 bit-identical to the greedy step) decodes the same tokens 10-17% faster on
 these code prompts (1K-32K).
 
-#### Qwen3.6-35B-A3B (MLX int4, Apple Silicon)
+### Qwen3.6-35B-A3B (MLX int4, Apple Silicon)
 
 Native Metal plan for the text decoder of `mlx-community/Qwen3.6-35B-A3B-4bit`
 on M4 Pro / M4 Max at the checkpoint's precision (affine int4 g64 weights, BF16
@@ -334,7 +333,7 @@ same token ids, batch 1, interleaved runs; the reference is mlx-lm 0.31.3.
 With the checkpoint's default sampling (temperature 1, top-p 0.95, top-k 20)
 decode is 24-33% faster than mlx-lm (109.6 against 82.6 tok/s at 1K).
 
-#### Qwen3-8B
+### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
 |---|---|---:|---:|---|
@@ -343,7 +342,7 @@ decode is 24-33% faster than mlx-lm (109.6 against 82.6 tok/s at 1K).
 
 **Guide:** [RTX 5090](docs/qwen3_8b_nvfp4.md).
 
-#### Qwen3-VL-8B
+### Qwen3-VL-8B
 
 RTX 5090, NVFP4 language stack + FP8 ViT, image + text:
 
@@ -354,7 +353,7 @@ RTX 5090, NVFP4 language stack + FP8 ViT, image + text:
 
 **Guide:** [RTX 5090](docs/qwen3_vl_nvfp4.md).
 
-#### Qwen3-VL-2B on Jetson
+### Qwen3-VL-2B on Jetson
 
 Official BF16 checkpoint, full-resolution image + text (1581 prompt tokens,
 6256 vision patches), with opt-in weight-only decode quantization:
@@ -372,7 +371,7 @@ prototype bought 0.3% there (GPU-bound), so it was not shipped; see
 
 **Guide:** [Thor](docs/qwen3_vl_thor.md) · [Orin](docs/qwen3_vl_rtx_bf16.md).
 
-#### Higgs Audio v3
+### Higgs Audio v3
 
 | Hardware | Mode | Latency | TTFA | Throughput | Source |
 |---|---|---:|---:|---:|---|
@@ -381,7 +380,7 @@ prototype bought 0.3% there (GPU-bound), so it was not shipped; see
 
 **Guide:** [RTX 5090](docs/higgs_audio_v3.md).
 
-#### Motus Stage3
+### Motus Stage3
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
@@ -390,7 +389,7 @@ prototype bought 0.3% there (GPU-bound), so it was not shipped; see
 
 **Guide:** [RTX 5090](docs/motus_usage_beta.md).
 
-#### Wan2.2 TI2V-5B
+### Wan2.2 TI2V-5B
 
 | Hardware | Mode | Generation time | Source |
 |---|---|---:|---|
@@ -399,7 +398,7 @@ prototype bought 0.3% there (GPU-bound), so it was not shipped; see
 
 **Guide:** [RTX 5090](docs/wan22_usage.md).
 
-#### Cosmos3-Edge AV inverse dynamics and Reasoner
+### Cosmos3-Edge AV inverse dynamics and Reasoner
 
 Jetson AGX Thor, 30-step denoise boundary, 15 hot back-to-back iterations:
 
@@ -418,7 +417,7 @@ the public 1705/911/1263-token text/image/video profile:
 
 **Guide:** [Thor](docs/cosmos3_edge_thor.md).
 
-#### Alpamayo 1.5 reasoning driving VLA
+### Alpamayo 1.5 reasoning driving VLA
 
 Jetson AGX Thor, nine PhysicalAI-AV clips x three seeds (1719 windows per
 arm), mean latency per request: 4 cameras x 4 frames, 128-token reasoning
@@ -440,7 +439,7 @@ error against its reference (paired ADE intervals include zero). Guide:
 | + FlashRT backend with its INT8 / INT8 / FP8 tiers (ms) | **345** |
 | Speedup | **2.1x / 2.8x** |
 
-#### Cosmos3-Nano text-to-video
+### Cosmos3-Nano text-to-video
 
 RTX 5090, 480p, 49 frames, 10-step UniPC:
 
