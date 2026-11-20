@@ -24,7 +24,7 @@ preferred-citation:
       given-names: "Kevin"
     - family-names: "Lv"
       given-names: "Teresa"
-  title: "FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI Inference"
+  title: "FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI"
   year: 2026
   doi: "10.48550/arXiv.2610.24349"
   url: "https://arxiv.org/abs/2610.24349"

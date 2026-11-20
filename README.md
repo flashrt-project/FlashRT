@@ -1052,7 +1052,7 @@ If FlashRT is useful in your project or research, please cite the paper and link
 
 ```bibtex
 @misc{su2026flashrtpai,
-  title={FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI Inference},
+  title={FlashRT-PAI: Fast Kernels Are Not Fast Pipelines for Physical AI},
   author={Liang Su and David Chen and Jason Li and Kevin Guo and Teresa Lv},
   year={2026},
   eprint={2610.24349},
