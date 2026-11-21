@@ -16,6 +16,8 @@
 #include "gemm/w4a16_affine_qmv.h"
 #include "gemm/w4a16_affine_tensor_ops.h"
 #include "inkling2/inkling2_decode_resident_bf16.h"
+#include "inkling2/inkling2_rows_bf16.h"
+#include "inkling2/inkling2_rows_gemm.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
 #include "kernels/gelu_bf16.h"
@@ -204,6 +206,32 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { return inkling2_decode_resident_bf16_source(); }},
     {"inkling2_decode_resident_reference_bf16", "inkling2_decode_resident_bf16",
      [] { Inkling2DecodeOptions o; o.trace = true; return inkling2_decode_resident_bf16_source(o); }},
+    // inkling2_loop row programs (prefill chunks and batched decode): per-row kernels and TensorOps products.
+    {"ink_embed_rows", "ink_embed_rows", inkling2_rows_bf16_source},
+    {"ink_attn_inputs_rows", "ink_attn_inputs_rows", inkling2_rows_bf16_source},
+    {"ink_gate_rows", "ink_gate_rows", inkling2_rows_bf16_source},
+    {"ink_heads_rows", "ink_heads_rows", inkling2_rows_bf16_source},
+    {"ink_bias_rows", "ink_bias_rows", inkling2_rows_bf16_source},
+    {"ink_attn_decode_rows", "ink_attn_decode_rows", inkling2_rows_bf16_source},
+    {"ink_post_attn_rows", "ink_post_attn_rows", inkling2_rows_bf16_source},
+    {"ink_route_rows", "ink_route_rows", inkling2_rows_bf16_source},
+    {"ink_expert_scan", "ink_expert_scan", inkling2_rows_bf16_source},
+    {"ink_expert_place_rows", "ink_expert_place_rows", inkling2_rows_bf16_source},
+    {"ink_combine_rows", "ink_combine_rows", inkling2_rows_bf16_source},
+    {"ink_ring_rows", "ink_ring_rows", inkling2_rows_bf16_source},
+    {"ink_final_rows", "ink_final_rows", inkling2_rows_bf16_source},
+    {"ink_argmax_rows", "ink_argmax_rows", inkling2_rows_bf16_source},
+    {"ink_trace_rows", "ink_trace_rows", inkling2_rows_bf16_source},
+    {"ink_gemm_bf16_rows", "ink_gemm_bf16_rows", [] { return inkling2_rows_gemm_source(); }},
+    {"ink_gemm_bf16_rows_m16", "ink_gemm_bf16_rows", [] { Inkling2GemmOptions o; o.tile_m = 16; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
+    {"ink_gemm_f32_rows", "ink_gemm_f32_rows", [] { return inkling2_rows_gemm_source(); }},
+    {"ink_gemm_f32_rows_m16", "ink_gemm_f32_rows", [] { Inkling2GemmOptions o; o.tile_m = 16; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
+    {"ink_gemm_logits_rows", "ink_gemm_logits_rows", [] { return inkling2_rows_gemm_source(); }},
+    {"ink_gemm_logits_rows_m16", "ink_gemm_logits_rows", [] { Inkling2GemmOptions o; o.tile_m = 16; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup", "ink_experts_gateup", [] { return inkling2_rows_gemm_source(); }},
+    {"ink_experts_gateup_m16", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 16; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_down", "ink_experts_down", [] { return inkling2_rows_gemm_source(); }},
+    {"ink_experts_down_m16", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 16; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {
