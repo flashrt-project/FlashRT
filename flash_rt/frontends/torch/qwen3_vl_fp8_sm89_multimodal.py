@@ -100,6 +100,11 @@ class Qwen3VlFp8Sm89Frontend:
         eos = cfg.get('eos_token_id')
         if eos is None:
             eos = cfg['text_config'].get('eos_token_id')
+        generation_config_path = os.path.join(
+            self.checkpoint_path, 'generation_config.json')
+        if os.path.isfile(generation_config_path):
+            with open(generation_config_path) as f:
+                eos = json.load(f).get('eos_token_id', eos)
         self._eos_token_ids = set(
             [] if eos is None else (eos if isinstance(eos, list) else [eos]))
         self.max_pixels = max_pixels
