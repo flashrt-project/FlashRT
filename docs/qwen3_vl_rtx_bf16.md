@@ -121,6 +121,11 @@ tokens. Pass `--max-pixels` only when deliberately trading visual resolution
 for latency; the BF16 frontend forwards this through the Qwen3-VL processor's
 smart-resize policy rather than manually resizing the image.
 
+EOS stopping uses `eos_token_id` from the checkpoint's
+`generation_config.json`, falling back to the model config when the file or
+field is absent. An integer or list is accepted; explicit `null` disables
+EOS stopping.
+
 ## Jetson Orin Validation
 
 Environment:
