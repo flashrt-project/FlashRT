@@ -16,6 +16,7 @@ checkpoint path for correctness bring-up and unsupported quantized targets.
 from __future__ import annotations
 
 import collections
+import copy
 import json
 import os
 from typing import Any
@@ -203,6 +204,11 @@ class Qwen3VlTorchFrontendRtxBF16:
             raise RuntimeError('Qwen3-VL config missing rope_scaling.mrope_section')
         self._mrope_section = tuple(rope_scaling['mrope_section'])
         eos = cfg.get('eos_token_id', text_cfg.get('eos_token_id'))
+        generation_config_path = os.path.join(
+            self.checkpoint_path, 'generation_config.json')
+        if os.path.isfile(generation_config_path):
+            with open(generation_config_path) as f:
+                eos = json.load(f).get('eos_token_id', eos)
         if eos is None:
             self._eos_token_ids: set[int] = set()
         else:
@@ -373,7 +379,8 @@ class Qwen3VlTorchFrontendRtxBF16:
         inputs = self.processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors='pt',
-            processor_kwargs=self._processor_kwargs).to(self.device)
+            # Transformers consumes nested image options while merging them.
+            images_kwargs=copy.deepcopy(self._processor_kwargs)).to(self.device)
         input_ids = inputs['input_ids'][0]
         S = int(input_ids.shape[0])
         if S > self.max_seq:

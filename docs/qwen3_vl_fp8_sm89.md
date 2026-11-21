@@ -81,6 +81,11 @@ By default, the SM89 prefill buffer is sized to `max_seq`, matching the SM120
 Qwen3-VL frontend. Pass `--max-prefill-seq` only to deliberately lower that
 capacity.
 
+EOS stopping uses `eos_token_id` from the checkpoint's
+`generation_config.json`, falling back to the model config when the file or
+field is absent. An integer or list is accepted; explicit `null` disables
+EOS stopping.
+
 For the development smoke benchmark:
 
 ```bash
