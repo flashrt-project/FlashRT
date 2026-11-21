@@ -68,9 +68,17 @@ def global_scale(amax: np.ndarray, denominator: np.ndarray) -> np.ndarray:
 class Inkling2Runtime:
     """Owns the Metal plan, the buffers and the decode programs (batch 1)."""
 
-    def __init__(self, checkpoint_dir: str, max_seq: int = 8192, library: Optional[str] = None):
-        if max_seq < 1:
-            raise ValueError("max_seq must be positive")
+    def __init__(self, checkpoint_dir: str, max_seq: int = 8192, library: Optional[str] = None,
+                 sequences: int = 1, row_capacity: int = 1024, row_shapes=None, trace_rows: bool = False):
+        """``sequences``: KV / conv-state slots (batched decode); ``row_capacity``: rows of a prefill chunk or a
+        batched decode step."""
+        if max_seq < 1 or sequences < 1 or row_capacity < 1:
+            raise ValueError("max_seq, sequences and row_capacity must be positive")
+        self.sequences, self.row_capacity = int(sequences), int(row_capacity)
+        self.trace_rows = bool(trace_rows)
+        self.row_shapes = None if row_shapes is None else [tuple(x) for x in row_shapes]
+        if self.row_shapes and any(r > self.row_capacity or not 1 <= lr <= r for r, lr in self.row_shapes):
+            raise ValueError("row shapes must satisfy 1 <= logit rows <= rows <= row_capacity")
         self.ckpt = Inkling2Checkpoint(checkpoint_dir)
         self.cfg = self.ckpt.config
         check_geometry(self.cfg)
@@ -83,7 +91,12 @@ class Inkling2Runtime:
         self._upload_weights()
         self.ckpt.close()
         self._allocate_state()
+        self._allocate_rows()
         self.programs = {name: self._record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
+        self.row_programs: Dict[tuple, int] = {}
+        for rows, logit_rows in self._row_shapes():
+            self.row_programs[(rows, logit_rows)] = self._record_rows(rows, logit_rows)
+        self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
         self.plan.finish(resident=True)
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
         self._packet = self.plan.view(self.buf["packet"], np.uint32, 17)
@@ -203,13 +216,207 @@ class Inkling2Runtime:
         v, H = self.cfg.vocab_size, self.cfg.hidden_size
         visits = len(self.cfg.visits())
         sizes = {
-            "kv": self.kv_elements * 2, "rings": self.ring_elements * 2, "params": 64,
+            "kv": self.kv_elements * 2 * self.sequences, "rings": self.ring_elements * 2 * self.sequences,
+            "params": 64,
             "noise": BLOCK * v * 4, "logits": BLOCK * v * 4, "trace": BLOCK * visits * H * 2,
             "packet": 17 * 4, "workspace": WORKSPACE, "debug": DEBUG_FLOATS * 4,
             "control": CONTROL * 4, "diagnostic": WORKERS * 4,
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
+
+    # ---------------------------------------------------------------- row programs
+    def _row_shapes(self):
+        """(rows, logit rows) programs recorded at load: prefill chunks (logits of the last row) and batched decode
+        steps (logits of every row)."""
+        shapes = getattr(self, "row_shapes", None)
+        return shapes if shapes is not None else [(self.row_capacity, 1)]
+
+    def _allocate_rows(self):
+        C, H = self.row_capacity, self.cfg.hidden_size
+        f32, bf = 4, 2
+        sizes = {
+            "r_tokens": C * 4, "r_info": C * 16, "r_h": C * H * bf, "r_prelude": C * H * bf, "r_bs": 6 * C * H * f32,
+            "r_bank": 2 * C * H * f32, "r_x": 3 * C * H * bf, "r_ain": 4 * C * H * f32, "r_s": 4 * C * 2 * H * bf,
+            "r_msg": C * 4 * H * f32, "r_mdown": 4 * C * 64 * bf, "r_forget": 4 * C * H * f32, "r_gain": 4 * C * H * f32,
+            "r_gated": C * H * f32, "r_proj": C * 8672 * bf, "r_qc": C * 3072 * bf, "r_rclip": C * 384 * bf,
+            "r_bias": C * 24 * 1024 * bf, "r_chunk": 2 * 8 * C * 128 * bf, "r_attn": C * 3072 * bf, "r_o": C * H * bf,
+            "r_resid": C * H * f32, "r_y": C * H * bf, "r_rlog": C * 128 * f32, "r_ids": C * 8 * 4, "r_rw": C * 8 * f32,
+            "r_slot": C * 8 * 4, "r_counts": 128 * 4, "r_starts": 129 * 4, "r_cursors": 128 * 4, "r_tiles": 129 * 4,
+            "r_xp": C * 8 * H * bf, "r_act": C * 8 * 1152 * bf, "r_ep": C * 8 * H * bf, "r_moe": C * H * bf,
+            "r_xf": C * H * bf, "r_logits": max(lr for _, lr in self._row_shapes()) * self.cfg.vocab_size * f32,
+            "r_out": C * 4,
+            "args": 4 << 20, "r_trace": (48 * C * H * bf if self.trace_rows else 4),
+        }
+        for name, nbytes in sizes.items():
+            self.buf[name] = self.plan.buffer(nbytes)
+        self.plan.view(self.buf["r_counts"], np.uint32, 128)[:] = 0
+        self._param_blob = bytearray()
+
+    def _param(self, blob: bytes) -> int:
+        self._param_blob += b"\0" * ((-len(self._param_blob)) % 256)
+        offset = len(self._param_blob)
+        self._param_blob += blob
+        return offset
+
+    def _visit_param(self, v: int, rows: int, nblocks: int, slots, bslot: int, pad: int = 0) -> int:
+        cfg = self.cfg
+        layer, pss = cfg.visits()[v]
+        row = self.table[cfg.num_layers + 1 + v]
+        d = self.table[layer]
+        flags = (1 if cfg.is_global(layer) else 0) | (2 if cfg.is_looped(layer) and pss > 0 else 0) | \
+                (4 if int(d[D_FLAGS]) & 4 else 0) | (8 if layer % cfg.layers_per_block == 0 else 0)
+        sl = list(slots) + [0] * (4 - len(slots))
+        blob = np.array([row[V_KV], self.kv_elements, row[V_RING], self.ring_elements], np.uint64).tobytes()
+        blob += np.array([layer, pss, row[V_CAP], rows, nblocks, bslot, *sl[:4], flags, pad], np.uint32).tobytes()
+        return self._param(blob)
+
+    def _gemm(self, kernel, x, x_off, x_stride, w, n, k, y, y_off, y_stride, y_col, rows, small, rowsp=None):
+        tm = 16 if small else 64
+        blob = np.array([rows, n, k, x_stride, y_stride, y_col, 0, 0], np.uint32).tobytes() + \
+            np.array([w], np.uint64).tobytes()
+        prm = self._param(blob)
+        name = kernel + ("_m16" if small else "")
+        self.plan.dispatch(name, [(x, x_off, READ), (self.buf["weights"], 0, READ), (y, y_off, READ_WRITE),
+                                  (self.buf["args"], prm, READ)],
+                           ((n + 63) // 64, (rows + tm - 1) // tm, 1), (2 if small else 4) * 32, label=name)
+
+    def _record_rows(self, R: int, logit_rows: int) -> int:
+        """Program for R rows (rows_info and tokens written per run): all 48 visits, then the logits of the last
+        ``logit_rows`` rows (softcapped FP32) and their greedy tokens."""
+        cfg, b, plan = self.cfg, self.buf, self.plan
+        H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
+        small = R <= 64
+        tm = 16 if small else 64
+        program = plan.program()
+        A = self.buf["args"]
+        rv0 = self._visit_param(0, R, 0, [], 0)
+        plan.dispatch("ink_embed_rows", [(b["weights"], 0, READ), (b["table"], 0, READ), (b["r_tokens"], 0, READ),
+                                         (b["r_h"], 0, WRITE), (A, rv0, READ)], (R, 1, 1), 256, label="embed")
+        nblocks, slots = 0, []
+        mode0 = self._param(np.array([0], np.uint32).tobytes())
+        mode1 = self._param(np.array([1], np.uint32).tobytes())
+        tmp = self._param(np.array([tm], np.uint32).tobytes())
+        for v, (layer, pss) in enumerate(cfg.visits()):
+            if v >= getattr(self, "max_visits", 48):
+                break
+            d = self.table[layer]
+            full, msgs = cfg.is_global(layer), cfg.is_looped(layer) and pss > 0
+            boundary = layer % cfg.layers_per_block == 0
+            if layer == cfg.loop_start:
+                nblocks, slots = 1, [0]
+            bslot = 0 if layer == 0 else (1 if layer == 6 else (2 + pss if layer == 12 else 5))
+            rv = self._visit_param(v, R, nblocks, slots, bslot)
+            vis = (A, rv, READ)
+            W = (b["weights"], 0, READ)
+            T = (b["table"], 0, READ)
+            plan.dispatch("ink_attn_inputs_rows", [W, T, (b["r_h"], 0, READ_WRITE), (b["r_bs"], 0, READ_WRITE),
+                          (b["r_x"], 0, WRITE), (b["r_ain"], 0, WRITE), (b["r_s"], 0, WRITE), (b["r_msg"], 0, READ_WRITE),
+                          (b["r_bank"], 0, READ), (b["r_prelude"], 0, READ_WRITE), vis], (R, 1, 1), 256, label="attn_in")
+            if msgs:
+                for g in range(3):
+                    self._gemm("ink_gemm_bf16_rows", b["r_s"], g * R * 2 * H * 2, 2 * H, int(d[D_MG + 3 * g]), 64, 2 * H,
+                               b["r_mdown"], g * R * 64 * 2, 64, 0, R, small)
+                for g in range(3):
+                    for which, buf in ((1, "r_forget"), (2, "r_gain")):
+                        self._gemm("ink_gemm_f32_rows", b["r_mdown"], g * R * 64 * 2, 64, int(d[D_MG + 3 * g + which]),
+                                   H, 64, b[buf], g * R * H * 4, H, 0, R, small)
+                plan.dispatch("ink_gate_rows", [W, T, (b["r_ain"], 0, READ), (b["r_msg"], 0, READ),
+                              (b["r_forget"], 0, READ), (b["r_gain"], 0, READ), (b["r_gated"], 0, WRITE),
+                              (b["r_x"], 0, WRITE), vis, (A, mode0, READ)], (R, 1, 1), 256, label="gate_attn")
+            P = b["r_proj"]
+            for col, idx, n, xj in ((0, D_WQ, 3072, 0), (3072, D_WK, 1024, 1), (4096, D_WV, 1024, 2), (5120, D_WR, 384, 0),
+                                    (5504, D_WG, 3072, 0), (8576, D_WS, 24, 0)) + \
+                    (((8608, D_KDYN, 32, 1), (8640, D_VDYN, 32, 2)) if full else ()):
+                self._gemm("ink_gemm_bf16_rows", b["r_x"], xj * R * H * 2, H, int(d[idx]), n, H, P, 0, 8672, col, R, small)
+            plan.dispatch("ink_heads_rows", [W, T, (P, 0, READ), (b["r_qc"], 0, WRITE), (b["r_rclip"], 0, WRITE),
+                          (b["kv"], 0, READ_WRITE), (b["r_chunk"], 0, WRITE), (b["rings"], 0, READ), vis,
+                          (b["r_info"], 0, READ)], (R, 1, 1), 256, label="heads")
+            plan.dispatch("ink_bias_rows", [W, T, (b["r_rclip"], 0, READ), (b["r_bias"], 0, WRITE), vis],
+                          (16, R, 1), 256, label="bias")
+            plan.dispatch("ink_attn_decode_rows", [(P, 0, READ), (b["r_qc"], 0, READ), (b["r_bias"], 0, READ),
+                          (b["kv"], 0, READ), (b["r_chunk"], 0, READ), (b["r_attn"], 0, WRITE), vis,
+                          (b["r_info"], 0, READ)], (8, R, 1), 256, label="attention")
+            self._gemm("ink_gemm_bf16_rows", b["r_attn"], 0, 3072, int(d[D_WO]), H, 3072, b["r_o"], 0, H, 0, R, small)
+            plan.dispatch("ink_post_attn_rows", [W, T, (b["r_o"], 0, READ), (b["r_h"], 0, READ), (b["r_bs"], 0, READ),
+                          (b["r_resid"], 0, WRITE), (b["r_y"], 0, WRITE), (b["r_ain"], 0, WRITE), (b["r_s"], 0, WRITE),
+                          (b["r_msg"], 0, READ), (b["rings"], 0, READ), vis, (b["r_info"], 0, READ)],
+                          (R, 1, 1), 256, label="post_attn")
+            if msgs:
+                self._gemm("ink_gemm_bf16_rows", b["r_s"], 3 * R * 2 * H * 2, 2 * H, int(d[D_MG + 9]), 64, 2 * H,
+                           b["r_mdown"], 3 * R * 64 * 2, 64, 0, R, small)
+                for which, buf in ((1, "r_forget"), (2, "r_gain")):
+                    self._gemm("ink_gemm_f32_rows", b["r_mdown"], 3 * R * 64 * 2, 64, int(d[D_MG + 9 + which]), H, 64,
+                               b[buf], 3 * R * H * 4, H, 0, R, small)
+                plan.dispatch("ink_gate_rows", [W, T, (b["r_ain"], 0, READ), (b["r_msg"], 0, READ),
+                              (b["r_forget"], 0, READ), (b["r_gain"], 0, READ), (b["r_gated"], 0, WRITE),
+                              (b["r_y"], 0, WRITE), vis, (A, mode1, READ)], (R, 1, 1), 256, label="gate_mlp")
+            self._gemm("ink_gemm_f32_rows", b["r_y"], 0, H, int(d[D_ROUTER]), E, H, b["r_rlog"], 0, E, 0, R, small)
+            plan.dispatch("ink_route_rows", [W, T, (b["r_rlog"], 0, READ), (b["r_ids"], 0, WRITE), (b["r_rw"], 0, WRITE),
+                          (b["r_counts"], 0, READ_WRITE), vis], ((R + 7) // 8, 1, 1), 256, label="route")
+            plan.dispatch("ink_expert_scan", [(b["r_counts"], 0, READ_WRITE), (b["r_starts"], 0, WRITE),
+                          (b["r_cursors"], 0, WRITE), (b["r_tiles"], 0, WRITE), (A, tmp, READ)], (1, 1, 1), 32,
+                          label="scan")
+            plan.dispatch("ink_expert_place_rows", [(b["r_ids"], 0, READ), (b["r_starts"], 0, READ),
+                          (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
+                          (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
+            mx = 1 if int(d[D_FLAGS]) & 4 else 0
+            tiles_y = (R * 8 + tm - 1) // tm + E
+            for name, w, s_, gs, k, n_out, src, dst in (
+                    ("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I, "r_xp", "r_act"),
+                    ("ink_experts_down", D_W2, D_S2, D_GS2, I, H, "r_act", "r_ep")):
+                blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
+                    np.array([d[w], d[s_], d[gs] if not mx else 0], np.uint64).tobytes()
+                prm = self._param(blob)
+                kn = name + ("_m16" if small else "")
+                plan.dispatch(kn, [(b[src], 0, READ), W, (b[dst], 0, WRITE), (A, prm, READ), (b["r_starts"], 0, READ),
+                              (b["r_tiles"], 0, READ)], ((n_out + 63) // 64, tiles_y, 1), (2 if small else 4) * 32,
+                              label=kn)
+            rv2 = self._visit_param(v, R, nblocks, slots, bslot, pad=1)
+            for prm, lbl in ((rv, "combine"), (rv2, "mlp_conv")):
+                plan.dispatch("ink_combine_rows", [W, T, (b["r_ep"], 0, READ), (b["r_slot"], 0, READ),
+                              (b["r_rw"], 0, READ), (b["r_resid"], 0, READ), (b["r_moe"], 0, READ_WRITE),
+                              (b["r_h"], 0, WRITE), (b["r_bank"], 0, WRITE), (b["rings"], 0, READ), (A, prm, READ),
+                              (b["r_info"], 0, READ)], (R, 1, 1), 256, label=lbl)
+            plan.dispatch("ink_ring_rows", [(P, 0, READ), (b["r_o"], 0, READ), (b["r_moe"], 0, READ),
+                          (b["r_chunk"], 0, READ), (b["rings"], 0, WRITE), (b["kv"], 0, READ_WRITE), vis,
+                          (b["r_info"], 0, READ)], (R, 1, 1), 256, label="ring")
+            if boundary:
+                slots = slots + [bslot]
+                nblocks += 1
+            if self.trace_rows:
+                n = R * H
+                cnt = self._param(np.array([n], np.uint32).tobytes())
+                plan.dispatch("ink_trace_rows", [(b["r_h"], 0, READ), (b["r_trace"], v * n * 2, WRITE), (A, cnt, READ)],
+                              ((n + 255) // 256, 1, 1), 256, label="trace")
+        first = self._param(np.array([R - logit_rows], np.uint32).tobytes())
+        rvf = self._visit_param(len(cfg.visits()) - 1, R, 4, [0, 1, 4, 5], 0)
+        plan.dispatch("ink_final_rows", [(b["weights"], 0, READ), (b["table"], 0, READ), (b["r_h"], 0, READ),
+                      (b["r_bs"], 0, READ), (b["r_xf"], 0, WRITE), (A, rvf, READ), (A, first, READ)],
+                      (logit_rows, 1, 1), 256, label="final")
+        f = self.table[cfg.num_layers]
+        self._gemm("ink_gemm_logits_rows", b["r_xf"], 0, H, int(f[D_HEAD]), cfg.vocab_size, H, b["r_logits"], 0,
+                   cfg.vocab_size, 0, logit_rows, logit_rows <= 64)
+        nrows = self._param(np.array([logit_rows], np.uint32).tobytes())
+        plan.dispatch("ink_argmax_rows", [(b["r_logits"], 0, READ), (b["r_out"], 0, WRITE), (A, nrows, READ)],
+                      (logit_rows, 1, 1), 256, label="argmax")
+        return program
+
+    def run_rows(self, tokens: Sequence[int], info: np.ndarray, logit_rows: int) -> np.ndarray:
+        """Run the row program for len(tokens) rows with rows_info ``info`` [rows, 4] (sequence, position, first,
+        last); returns the greedy tokens of the last ``logit_rows`` rows."""
+        R = len(tokens)
+        key = (R, logit_rows)
+        if key not in self.row_programs:
+            raise ValueError(f"no row program recorded for {key}; pass row_shapes")
+        self.plan.write(self.buf["r_tokens"], 0, np.asarray(tokens, np.uint32))
+        self.plan.write(self.buf["r_info"], 0, np.ascontiguousarray(info, np.uint32))
+        self.last_rows_timing = self.plan.run(self.row_programs[key])
+        return self.plan.read(self.buf["r_out"], 0, np.uint32, logit_rows).copy()
+
+    def rows_logits(self, row: int = 0) -> np.ndarray:
+        return self.plan.read(self.buf["r_logits"], row * self.cfg.vocab_size * 4, np.float32,
+                              self.cfg.unpadded_vocab_size)
 
     def _record_decode(self, kernel: str) -> int:
         b = self.buf
