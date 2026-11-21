@@ -556,6 +556,137 @@ kernel void ink_final_rows(const device uchar* weights [[buffer(0)]],const devic
     const device ushort* w=(const device ushort*)(weights+table[24u*64u+D_FINAL_NORM]);
     for(uint i=tid;i<FH;i+=256u)xf[size_t(g)*FH+i]=ubf(bfu(w[i])*(vr[i]*i2));
 }
+// ---- multi-row products for few rows (decode batches): every lane reads its weights once and multiplies them
+// with each row's inputs, so each row's arithmetic is the single-row MLX gemv / fp_qmv of the decode step.
+// Task table (uint4 per matrix): (weight byte offset lo, hi, rows, column in y) with x / y selectors packed in
+// RowsTasks; a SIMD group computes 4 output rows of one matrix for every input row (MAXR rows per pass).
+constant constexpr uint MAXR=16u;
+struct RowsMatrix { ulong w; uint rows, k, x_sel, y_col, y_stride, mode; };  // mode 0 gemv4, 1 bn8, 3 bn8 FP32 out
+struct RowsTasks { uint count, rows, pad0, pad1; RowsMatrix m[10]; };
+kernel void ink_gemv_rows(const device uchar* weights [[buffer(0)]],const device ushort* x0 [[buffer(1)]],
+    const device ushort* x1 [[buffer(2)]],const device ushort* x2 [[buffer(3)]],device ushort* y [[buffer(4)]],
+    device float* yf [[buffer(5)]],constant RowsTasks& p [[buffer(6)]],
+    uint gid [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+    uint task=gid*8u+simd;
+    uint mi=0;
+    while(mi<p.count){const uint units=p.m[mi].mode==0u?p.m[mi].rows/4u:p.m[mi].rows;
+        if(task<units)break;task-=units;++mi;}
+    if(mi>=p.count)return;
+    const RowsMatrix m=p.m[mi];
+    const uint R=p.rows,K=m.k;
+    const device ushort* x=m.x_sel==0u?x0:(m.x_sel==1u?x1:x2);
+    const device ushort* w=(const device ushort*)(weights+m.w);
+    for(uint r0=0;r0<R;r0+=MAXR) {
+        const uint nr=min(MAXR,R-r0);
+        if(m.mode==0u) {
+            const uint row0=task*4u;
+            float acc[4][MAXR];
+            for(uint tm=0;tm<4;++tm)for(uint r=0;r<MAXR;++r)acc[tm][r]=0.0f;
+            for(uint b=0;b<K;b+=128u) {
+                const uint c=b+lane*4u;
+                float wv[4][4];
+                for(uint tm=0;tm<4;++tm){const uint2 wr=*((const device uint2*)(w+size_t(row0+tm)*K+c));
+                    wv[tm][0]=lo_f(wr.x);wv[tm][1]=hi_f(wr.x);wv[tm][2]=lo_f(wr.y);wv[tm][3]=hi_f(wr.y);}
+                for(uint r=0;r<nr;++r) {
+                    const uint2 xr=*((const device uint2*)(x+size_t(r0+r)*K+c));
+                    const float v[4]={lo_f(xr.x),hi_f(xr.x),lo_f(xr.y),hi_f(xr.y)};
+                    for(uint tm=0;tm<4;++tm){acc[tm][r]+=wv[tm][0]*v[0];acc[tm][r]+=wv[tm][1]*v[1];acc[tm][r]+=wv[tm][2]*v[2];acc[tm][r]+=wv[tm][3]*v[3];}
+                }
+            }
+            for(uint r=0;r<nr;++r)for(uint tm=0;tm<4;++tm) {
+                float v=acc[tm][r];
+                for(ushort sn=16;sn>=1;sn>>=1)v+=simd_shuffle_down(v,sn);
+                if(lane==0)y[size_t(r0+r)*m.y_stride+m.y_col+row0+tm]=ubf(v);
+            }
+        } else {
+            // bn = 8 configuration, one weight row: BF16 out (mode 1) or FP32 out (mode 3, router logits)
+            const uint row=task;
+            for(uint r=0;r<nr;++r) {
+                const float v=gemv_bn8_row(w+size_t(row)*K,K,x+size_t(r0+r)*K,lane);
+                if(lane==0) {
+                    if(m.mode==1u)y[size_t(r0+r)*m.y_stride+m.y_col+row]=ubf(v);
+                    else yf[size_t(r0+r)*m.y_stride+m.y_col+row]=v;
+                }
+            }
+        }
+    }
+}
+// ---- experts for few rows per expert: task = (expert, 4 weight rows); the expert's assignments (contiguous in xp
+// after ink_expert_place_rows) multiply the rows read once. gate/up: the activation of the 2 channels -> act;
+// down -> ep. The per-row arithmetic is the decode step's fp_qmv.
+kernel void ink_experts_qmv_rows(const device uchar* weights [[buffer(0)]],const device ushort* xin [[buffer(1)]],
+    device ushort* out [[buffer(2)]],constant ulong4& wq [[buffer(3)]],const device uint* starts [[buffer(4)]],
+    constant uint4& shape [[buffer(5)]],
+    uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+    // shape: (gateup, mxfp8, weight rows per expert, inputs)
+    const uint e=g.y,row0=(g.x*8u+simd)*4u;
+    const uint gateup=shape.x,mx=shape.y,wrows=shape.z,K=shape.w;
+    if(row0>=wrows)return;
+    const uint a0=starts[e],a1=starts[e+1];
+    if(a0>=a1)return;
+    const device uchar* codes=weights+wq.x;
+    const device uchar* scales=weights+wq.y;
+    const float inv=mx?1.0f:fdiv(((const device float*)(weights+wq.z))[e],2688.0f);
+    const uint nout=gateup?wrows/2u:wrows;
+    for(uint b0=a0;b0<a1;b0+=MAXR) {
+        const uint nr=min(MAXR,a1-b0);
+        float acc[4][MAXR];
+        for(uint tm=0;tm<4;++tm)for(uint r=0;r<MAXR;++r)acc[tm][r]=0.0f;
+        if(!mx) {
+            for(uint b=0;b<K;b+=256u) {
+                const uint c=b+lane*8u;
+                if(c>=K)break;
+                for(uint r=0;r<nr;++r) {
+                    float xv[8];
+                    const device ushort* xr=xin+size_t(b0+r)*K+c;
+                    for(uint i=0;i<8;++i)xv[i]=bfu(xr[i]);
+                    for(uint tm=0;tm<4;++tm) {
+                        const size_t row=size_t(e)*wrows+row0+tm;
+                        acc[tm][r]+=qdot_nv(codes+row*(K/2u)+c/2u,xv,e4m3(scales[row*(K/16u)+c/16u]));
+                    }
+                }
+            }
+        } else if(K%256u==0u) {
+            for(uint b=0;b<K;b+=256u) {
+                const uint c=b+lane*8u;
+                for(uint r=0;r<nr;++r) {
+                    float xv[8];
+                    const device ushort* xr=xin+size_t(b0+r)*K+c;
+                    for(uint i=0;i<8;++i)xv[i]=bfu(xr[i]);
+                    for(uint tm=0;tm<4;++tm) {
+                        const size_t row=size_t(e)*wrows+row0+tm;
+                        acc[tm][r]+=qdot_mx<8>(codes+row*K+c,xv,e8m0(scales[row*(K/32u)+c/32u]));
+                    }
+                }
+            }
+        } else {
+            for(uint b=0;b<K;b+=128u) {
+                const uint c=b+lane*4u;
+                for(uint r=0;r<nr;++r) {
+                    float xv[4];
+                    const device ushort* xr=xin+size_t(b0+r)*K+c;
+                    for(uint i=0;i<4;++i)xv[i]=bfu(xr[i]);
+                    for(uint tm=0;tm<4;++tm) {
+                        const size_t row=size_t(e)*wrows+row0+tm;
+                        acc[tm][r]+=qdot_mx<4>(codes+row*K+c,xv,e8m0(scales[row*(K/32u)+c/32u]));
+                    }
+                }
+            }
+        }
+        for(uint r=0;r<nr;++r) {
+            float v[4];
+            for(uint tm=0;tm<4;++tm){v[tm]=simd_sum(acc[tm][r]);v[tm]=rb(mx?v[tm]:v[tm]*inv);}
+            if(lane==0) {
+                if(gateup) {
+                    out[size_t(b0+r)*nout+row0/2u]=ubf(softcapped_swiglu(v[0],v[1]));
+                    out[size_t(b0+r)*nout+row0/2u+1u]=ubf(softcapped_swiglu(v[2],v[3]));
+                } else for(uint tm=0;tm<4;++tm)out[size_t(b0+r)*nout+row0+tm]=ubf(v[tm]);
+            }
+        }
+    }
+}
 // ---- debug: copy the hidden rows after a visit into trace[visit]
 kernel void ink_trace_rows(const device ushort* h [[buffer(0)]],device ushort* trace [[buffer(1)]],
     constant uint& n [[buffer(2)]],uint i [[thread_position_in_grid]]) {if(i<n)trace[i]=h[i];}

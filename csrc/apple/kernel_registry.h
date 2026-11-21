@@ -222,6 +222,8 @@ inline constexpr KernelSource kernel_registry[] = {
     {"ink_final_rows", "ink_final_rows", inkling2_rows_bf16_source},
     {"ink_argmax_rows", "ink_argmax_rows", inkling2_rows_bf16_source},
     {"ink_trace_rows", "ink_trace_rows", inkling2_rows_bf16_source},
+    {"ink_gemv_rows", "ink_gemv_rows", inkling2_rows_bf16_source},
+    {"ink_experts_qmv_rows", "ink_experts_qmv_rows", inkling2_rows_bf16_source},
     {"ink_gemm_bf16_rows", "ink_gemm_bf16_rows", [] { return inkling2_rows_gemm_source(); }},
     {"ink_gemm_bf16_rows_m16", "ink_gemm_bf16_rows", [] { Inkling2GemmOptions o; o.tile_m = 16; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
     {"ink_gemm_f32_rows", "ink_gemm_f32_rows", [] { return inkling2_rows_gemm_source(); }},

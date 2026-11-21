@@ -281,6 +281,23 @@ class Inkling2Runtime:
                                   (self.buf["args"], prm, READ)],
                            ((n + 63) // 64, (rows + tm - 1) // tm, 1), (2 if small else 4) * 32, label=name)
 
+    def _gemv_rows(self, R, mats, xs, y, yf=None, label="gemv_rows"):
+        """Multi-row BF16 products (ink_gemv_rows): mats = [(weight offset, rows, k, x index, y column, y stride,
+        mode)]; xs = up to three (buffer, offset) inputs."""
+        blob = np.array([len(mats), R, 0, 0], np.uint32).tobytes()
+        units = 0
+        for w, rows, k, xsel, ycol, ystride, mode in mats:
+            blob += np.array([w], np.uint64).tobytes() + np.array([rows, k, xsel, ycol, ystride, mode], np.uint32).tobytes()
+            units += rows // 4 if mode == 0 else rows
+        blob += b"\0" * (32 * (10 - len(mats)))
+        prm = self._param(blob)
+        xs = list(xs) + [xs[0]] * (3 - len(xs))
+        yf = yf if yf is not None else y
+        self.plan.dispatch("ink_gemv_rows", [(self.buf["weights"], 0, READ), (xs[0][0], xs[0][1], READ),
+                           (xs[1][0], xs[1][1], READ), (xs[2][0], xs[2][1], READ), (y[0], y[1], READ_WRITE),
+                           (yf[0], yf[1], READ_WRITE), (self.buf["args"], prm, READ)],
+                           ((units + 7) // 8, 1, 1), 256, label=label)
+
     def _record_rows(self, R: int, logit_rows: int) -> int:
         """Program for R rows (rows_info and tokens written per run): all 48 visits, then the logits of the last
         ``logit_rows`` rows (softcapped FP32) and their greedy tokens."""
@@ -288,6 +305,8 @@ class Inkling2Runtime:
         H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
         small = R <= 64
         tm = 16 if small else 64
+        gemv = R <= 4               # multi-row gemv products (each row's arithmetic = the decode step's)
+        qmv_experts = R <= 4        # per-expert multi-row qmv (scalar: ALU-bound beyond a few rows)
         program = plan.program()
         A = self.buf["args"]
         rv0 = self._visit_param(0, R, 0, [], 0)
@@ -314,9 +333,13 @@ class Inkling2Runtime:
                           (b["r_x"], 0, WRITE), (b["r_ain"], 0, WRITE), (b["r_s"], 0, WRITE), (b["r_msg"], 0, READ_WRITE),
                           (b["r_bank"], 0, READ), (b["r_prelude"], 0, READ_WRITE), vis], (R, 1, 1), 256, label="attn_in")
             if msgs:
-                for g in range(3):
-                    self._gemm("ink_gemm_bf16_rows", b["r_s"], g * R * 2 * H * 2, 2 * H, int(d[D_MG + 3 * g]), 64, 2 * H,
-                               b["r_mdown"], g * R * 64 * 2, 64, 0, R, small)
+                if gemv:
+                    self._gemv_rows(R, [(int(d[D_MG + 3 * g]), 64, 2 * H, g, g * R * 64, 64, 1) for g in range(3)],
+                                    [(b["r_s"], g * R * 2 * H * 2) for g in range(3)], (b["r_mdown"], 0), label="msg_down")
+                else:
+                    for g in range(3):
+                        self._gemm("ink_gemm_bf16_rows", b["r_s"], g * R * 2 * H * 2, 2 * H, int(d[D_MG + 3 * g]), 64,
+                                   2 * H, b["r_mdown"], g * R * 64 * 2, 64, 0, R, small)
                 for g in range(3):
                     for which, buf in ((1, "r_forget"), (2, "r_gain")):
                         self._gemm("ink_gemm_f32_rows", b["r_mdown"], g * R * 64 * 2, 64, int(d[D_MG + 3 * g + which]),
@@ -325,10 +348,16 @@ class Inkling2Runtime:
                               (b["r_forget"], 0, READ), (b["r_gain"], 0, READ), (b["r_gated"], 0, WRITE),
                               (b["r_x"], 0, WRITE), vis, (A, mode0, READ)], (R, 1, 1), 256, label="gate_attn")
             P = b["r_proj"]
-            for col, idx, n, xj in ((0, D_WQ, 3072, 0), (3072, D_WK, 1024, 1), (4096, D_WV, 1024, 2), (5120, D_WR, 384, 0),
-                                    (5504, D_WG, 3072, 0), (8576, D_WS, 24, 0)) + \
-                    (((8608, D_KDYN, 32, 1), (8640, D_VDYN, 32, 2)) if full else ()):
-                self._gemm("ink_gemm_bf16_rows", b["r_x"], xj * R * H * 2, H, int(d[idx]), n, H, P, 0, 8672, col, R, small)
+            projs = ((0, D_WQ, 3072, 0, 0), (3072, D_WK, 1024, 1, 0), (4096, D_WV, 1024, 2, 0), (5120, D_WR, 384, 0, 0),
+                     (5504, D_WG, 3072, 0, 0), (8576, D_WS, 24, 0, 1)) + \
+                (((8608, D_KDYN, 32, 1, 1), (8640, D_VDYN, 32, 2, 1)) if full else ())
+            if gemv:
+                self._gemv_rows(R, [(int(d[idx]), n, H, xj, col, 8672, mode) for col, idx, n, xj, mode in projs],
+                                [(b["r_x"], j * R * H * 2) for j in range(3)], (P, 0), label="proj")
+            else:
+                for col, idx, n, xj, _ in projs:
+                    self._gemm("ink_gemm_bf16_rows", b["r_x"], xj * R * H * 2, H, int(d[idx]), n, H, P, 0, 8672, col, R,
+                               small)
             plan.dispatch("ink_heads_rows", [W, T, (P, 0, READ), (b["r_qc"], 0, WRITE), (b["r_rclip"], 0, WRITE),
                           (b["kv"], 0, READ_WRITE), (b["r_chunk"], 0, WRITE), (b["rings"], 0, READ), vis,
                           (b["r_info"], 0, READ)], (R, 1, 1), 256, label="heads")
@@ -337,21 +366,32 @@ class Inkling2Runtime:
             plan.dispatch("ink_attn_decode_rows", [(P, 0, READ), (b["r_qc"], 0, READ), (b["r_bias"], 0, READ),
                           (b["kv"], 0, READ), (b["r_chunk"], 0, READ), (b["r_attn"], 0, WRITE), vis,
                           (b["r_info"], 0, READ)], (8, R, 1), 256, label="attention")
-            self._gemm("ink_gemm_bf16_rows", b["r_attn"], 0, 3072, int(d[D_WO]), H, 3072, b["r_o"], 0, H, 0, R, small)
+            if gemv:
+                self._gemv_rows(R, [(int(d[D_WO]), H, 3072, 0, 0, H, 0)], [(b["r_attn"], 0)], (b["r_o"], 0), label="o_proj")
+            else:
+                self._gemm("ink_gemm_bf16_rows", b["r_attn"], 0, 3072, int(d[D_WO]), H, 3072, b["r_o"], 0, H, 0, R, small)
             plan.dispatch("ink_post_attn_rows", [W, T, (b["r_o"], 0, READ), (b["r_h"], 0, READ), (b["r_bs"], 0, READ),
                           (b["r_resid"], 0, WRITE), (b["r_y"], 0, WRITE), (b["r_ain"], 0, WRITE), (b["r_s"], 0, WRITE),
                           (b["r_msg"], 0, READ), (b["rings"], 0, READ), vis, (b["r_info"], 0, READ)],
                           (R, 1, 1), 256, label="post_attn")
             if msgs:
-                self._gemm("ink_gemm_bf16_rows", b["r_s"], 3 * R * 2 * H * 2, 2 * H, int(d[D_MG + 9]), 64, 2 * H,
-                           b["r_mdown"], 3 * R * 64 * 2, 64, 0, R, small)
+                if gemv:
+                    self._gemv_rows(R, [(int(d[D_MG + 9]), 64, 2 * H, 0, 3 * R * 64, 64, 1)],
+                                    [(b["r_s"], 3 * R * 2 * H * 2)], (b["r_mdown"], 0), label="msg_down")
+                else:
+                    self._gemm("ink_gemm_bf16_rows", b["r_s"], 3 * R * 2 * H * 2, 2 * H, int(d[D_MG + 9]), 64, 2 * H,
+                               b["r_mdown"], 3 * R * 64 * 2, 64, 0, R, small)
                 for which, buf in ((1, "r_forget"), (2, "r_gain")):
                     self._gemm("ink_gemm_f32_rows", b["r_mdown"], 3 * R * 64 * 2, 64, int(d[D_MG + 9 + which]), H, 64,
                                b[buf], 3 * R * H * 4, H, 0, R, small)
                 plan.dispatch("ink_gate_rows", [W, T, (b["r_ain"], 0, READ), (b["r_msg"], 0, READ),
                               (b["r_forget"], 0, READ), (b["r_gain"], 0, READ), (b["r_gated"], 0, WRITE),
                               (b["r_y"], 0, WRITE), vis, (A, mode1, READ)], (R, 1, 1), 256, label="gate_mlp")
-            self._gemm("ink_gemm_f32_rows", b["r_y"], 0, H, int(d[D_ROUTER]), E, H, b["r_rlog"], 0, E, 0, R, small)
+            if gemv:
+                self._gemv_rows(R, [(int(d[D_ROUTER]), E, H, 0, 0, E, 3)], [(b["r_y"], 0)], (b["r_rlog"], 0),
+                                (b["r_rlog"], 0), label="router")
+            else:
+                self._gemm("ink_gemm_f32_rows", b["r_y"], 0, H, int(d[D_ROUTER]), E, H, b["r_rlog"], 0, E, 0, R, small)
             plan.dispatch("ink_route_rows", [W, T, (b["r_rlog"], 0, READ), (b["r_ids"], 0, WRITE), (b["r_rw"], 0, WRITE),
                           (b["r_counts"], 0, READ_WRITE), vis], ((R + 7) // 8, 1, 1), 256, label="route")
             plan.dispatch("ink_expert_scan", [(b["r_counts"], 0, READ_WRITE), (b["r_starts"], 0, WRITE),
@@ -361,10 +401,18 @@ class Inkling2Runtime:
                           (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
                           (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
             mx = 1 if int(d[D_FLAGS]) & 4 else 0
+            if qmv_experts:
+                for gu, w, s_, gs, k, src, dst in ((1, D_W13, D_S13, D_GS13, H, "r_xp", "r_act"),
+                                                   (0, D_W2, D_S2, D_GS2, I, "r_act", "r_ep")):
+                    wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, 0], np.uint64).tobytes())
+                    sh = self._param(np.array([gu, mx, 2 * I if gu else H, k], np.uint32).tobytes())
+                    plan.dispatch("ink_experts_qmv_rows", [W, (b[src], 0, READ), (b[dst], 0, WRITE), (A, wq, READ),
+                                  (b["r_starts"], 0, READ), (A, sh, READ)], ((2 * I if gu else H) // 32, E, 1), 256,
+                                  label="experts_gateup" if gu else "experts_down")
             tiles_y = (R * 8 + tm - 1) // tm + E
-            for name, w, s_, gs, k, n_out, src, dst in (
+            for name, w, s_, gs, k, n_out, src, dst in (() if qmv_experts else (
                     ("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I, "r_xp", "r_act"),
-                    ("ink_experts_down", D_W2, D_S2, D_GS2, I, H, "r_act", "r_ep")):
+                    ("ink_experts_down", D_W2, D_S2, D_GS2, I, H, "r_act", "r_ep"))):
                 blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
                     np.array([d[w], d[s_], d[gs] if not mx else 0], np.uint64).tobytes()
                 prm = self._param(blob)
