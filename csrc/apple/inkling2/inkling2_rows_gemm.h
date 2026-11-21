@@ -75,6 +75,7 @@ struct ExpertGemm {
     ulong w, s, gs;                  // codes, scales, NVFP4 global scales (byte offsets)
 };
 inline float e2m1(uint b){half c=as_type<half>(ushort((b&7u)<<9));c*=16384.0h;return float((b&8u)?-c:c);}
+constant float E2M1_LUT[16]={0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f,-0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f};
 inline float e4m3(uint b){
     ushort v=ushort(b&127u);ushort sign=ushort(((b>>7)&1u)<<15);
     ushort u=ushort((v<<7)|(((v+1u)>>7)<<14)|sign);
@@ -95,7 +96,7 @@ inline void expert_tile(const device uchar* codes,const device uchar* scales,uin
         if(mx==0u) {
             const uint word=*((const device uint*)(codes+row*(K/2u)+c/2u));
             const float sc=e4m3(scales[row*(K/16u)+c/16u]);
-            for(uint q=0;q<8u;++q)out[q]=bfloat(e2m1((word>>(4u*q))&15u)*sc);
+            for(uint q=0;q<8u;++q)out[q]=bfloat(E2M1_LUT[(word>>(4u*q))&15u]*sc);
         } else {
             const uint2 word=*((const device uint2*)(codes+row*K+c));
             const float sc=e8m0(scales[row*(K/32u)+c/32u]);

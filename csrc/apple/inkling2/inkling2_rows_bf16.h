@@ -687,6 +687,90 @@ kernel void ink_experts_qmv_rows(const device uchar* weights [[buffer(0)]],const
         }
     }
 }
+// ---- experts as 8x8 MMAs with the weights dequantized in registers: C^T[n][a] = W[n] . x[a]. A SIMD group owns 32
+// weight rows (4 fragments of 8) of one expert and 8 of its assignments at a time; per 64-input chunk it loads the 8
+// x^T fragments once and the 4 x 8 weight fragments (a lane: one weight row, 2 consecutive inputs). No threadgroup
+// memory, no barriers. gate/up: rows 2c / 2c + 1 meet through simd_shuffle_xor(2), the softcapped SwiGLU -> act;
+// down -> ep. Accumulation FP32 (products exact); the NVFP4 global scale / (448 * 6) on the sum, then BF16.
+constant float FE2M1[16]={0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f,-0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f};
+kernel void ink_experts_mma(const device uchar* weights [[buffer(0)]],const device ushort* xin [[buffer(1)]],
+    device ushort* out [[buffer(2)]],constant ulong4& wq [[buffer(3)]],const device uint* starts [[buffer(4)]],
+    constant uint4& shape [[buffer(5)]],
+    uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+    const uint gateup=shape.x,mx=shape.y,wrows=shape.z,K=shape.w;
+    const uint e=g.y,n0=(g.x*4u+simd)*32u;
+    if(n0>=wrows)return;
+    const uint a0=starts[e],a1=starts[e+1];
+    if(a0>=a1)return;
+    const ushort fm=((lane/4u)&4u)+(lane/2u)%4u;
+    const ushort fn=((lane/4u)&2u)*2u+(lane%2u)*2u;
+    const device uchar* codes=weights+wq.x;
+    const device uchar* scales=weights+wq.y;
+    const float gsc=mx?1.0f:fdiv(((const device float*)(weights+wq.z))[e],2688.0f);
+    const uint nout=gateup?wrows/2u:wrows;
+    for(uint b0=a0;b0<a1;b0+=8u) {
+        simdgroup_float8x8 c[4];
+        for(uint f=0;f<4;++f)c[f]=simdgroup_float8x8(0.0f);
+        // x rows of this fragment's columns (assignments b0 + fn, b0 + fn + 1)
+        const bool v0=b0+fn<a1,v1=b0+fn+1u<a1;
+        const device ushort* xr0=xin+size_t(v0?b0+fn:a0)*K;
+        const device ushort* xr1=xin+size_t(v1?b0+fn+1u:a0)*K;
+        for(uint k0=0;k0<K;k0+=64u) {
+            simdgroup_float8x8 bx[8];
+            for(uint j=0;j<8;++j) {
+                const uint k=k0+8u*j+fm;
+                bx[j].thread_elements()[0]=v0?bfu(xr0[k]):0.0f;
+                bx[j].thread_elements()[1]=v1?bfu(xr1[k]):0.0f;
+            }
+            for(uint f=0;f<4;++f) {
+                const size_t row=size_t(e)*wrows+n0+f*8u+fm;
+                simdgroup_float8x8 aw;
+                if(!mx) {
+                    const device uint4* wp=(const device uint4*)(codes+row*(K/2u)+k0/2u);
+                    const uint4 w0=wp[0],w1=wp[1];
+                    const uint sw=*((const device uint*)(scales+row*(K/16u)+k0/16u));
+                    for(uint j=0;j<8;++j) {
+                        const uint byteidx=4u*j+fn/2u;        // (8j + fn) / 2
+                        const uint word=byteidx<16u?w0[byteidx/4u]:w1[(byteidx-16u)/4u];
+                        const uint byte=(word>>(8u*(byteidx%4u)))&255u;
+                        const float sc=e4m3((sw>>(8u*((8u*j+fn)/16u)))&255u);
+                        aw.thread_elements()[0]=FE2M1[byte&15u]*sc;
+                        aw.thread_elements()[1]=FE2M1[byte>>4]*sc;
+                        simdgroup_multiply_accumulate(c[f],aw,bx[j],c[f]);
+                    }
+                } else {
+                    const device ushort* wp=(const device ushort*)(codes+row*K+k0);
+                    const device uchar* sp=scales+row*(K/32u)+k0/32u;
+                    const float s0=e8m0(sp[0]),s1=e8m0(sp[1]);
+                    for(uint j=0;j<8;++j) {
+                        const uint pair=wp[(8u*j+fn)/2u];
+                        const float sc=j<4u?s0:s1;
+                        aw.thread_elements()[0]=e4m3(pair&255u)*sc;
+                        aw.thread_elements()[1]=e4m3(pair>>8)*sc;
+                        simdgroup_multiply_accumulate(c[f],aw,bx[j],c[f]);
+                    }
+                }
+            }
+        }
+        // C^T element (row fm, assignment fn / fn + 1) of each fragment
+        for(uint f=0;f<4;++f) {
+            const float r0v=rb(c[f].thread_elements()[0]*gsc),r1v=rb(c[f].thread_elements()[1]*gsc);
+            if(gateup) {
+                const float u0=simd_shuffle_xor(r0v,ushort(2)),u1=simd_shuffle_xor(r1v,ushort(2));
+                if((fm&1u)==0u) {
+                    const uint ch=(n0+f*8u+fm)/2u;
+                    if(v0)out[size_t(b0+fn)*nout+ch]=ubf(softcapped_swiglu(r0v,u0));
+                    if(v1)out[size_t(b0+fn+1u)*nout+ch]=ubf(softcapped_swiglu(r1v,u1));
+                }
+            } else {
+                const uint n=n0+f*8u+fm;
+                if(v0)out[size_t(b0+fn)*nout+n]=ubf(r0v);
+                if(v1)out[size_t(b0+fn+1u)*nout+n]=ubf(r1v);
+            }
+        }
+    }
+}
 // ---- debug: copy the hidden rows after a visit into trace[visit]
 kernel void ink_trace_rows(const device ushort* h [[buffer(0)]],device ushort* trace [[buffer(1)]],
     constant uint& n [[buffer(2)]],uint i [[thread_position_in_grid]]) {if(i<n)trace[i]=h[i];}
