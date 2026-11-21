@@ -15,6 +15,7 @@
 #include "gemm/bf16_tensor_ops.h"
 #include "gemm/w4a16_affine_qmv.h"
 #include "gemm/w4a16_affine_tensor_ops.h"
+#include "inkling2/inkling2_decode_resident_bf16.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
 #include "kernels/gelu_bf16.h"
@@ -197,6 +198,12 @@ inline constexpr KernelSource kernel_registry[] = {
     {"qwen35moe_expert_combine_rows_bf16", "qwen35moe_expert_combine_rows_bf16", qwen35moe_prefill_rows_bf16_source},
     {"gqa8_d256_causal_gated_prefill_mma_bf16", "gqa8_d256_causal_gated_prefill_mma_bf16",
      gqa8_d256_causal_gated_prefill_mma_bf16_source},
+    // inkling2_loop (Inkling 2 Mini) resident decode step (BF16 attention, NVFP4 / MXFP8 experts): greedy and
+    // greedy with the per-visit trace used for bit-exact qualification (one arithmetic).
+    {"inkling2_decode_resident_bf16", "inkling2_decode_resident_bf16",
+     [] { return inkling2_decode_resident_bf16_source(); }},
+    {"inkling2_decode_resident_reference_bf16", "inkling2_decode_resident_bf16",
+     [] { Inkling2DecodeOptions o; o.trace = true; return inkling2_decode_resident_bf16_source(o); }},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {
