@@ -144,3 +144,28 @@ def test_sampling(tokens):
         assert all(0 <= t < fe.cfg.unpadded_vocab_size for t in a + c)
     finally:
         fe.rt.close()
+
+
+def test_mma_expert_copy_matches_the_reference_arrangement():
+    """The load-time re-arranged NVFP4 experts (ink_nv_arrange) against nvfp4_mma_arrangement, first and last
+    NVFP4 layer, first and last expert, gate/up and down."""
+    from flash_rt.frontends.torch import _inkling2_mps_runtime as m
+    rt = _runtime(max_seq=64, row_capacity=8, row_shapes=[(8, 1)])
+    try:
+        cfg = rt.cfg
+        H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
+        layers = sorted(rt._arranged)
+        for layer in (layers[0], layers[-1]):
+            d, offs = rt.table[layer], rt._arranged[layer]
+            for (rows, k), (w, s), (ao, so) in zip(((2 * I, H), (H, I)), ((m.D_W13, m.D_S13), (m.D_W2, m.D_S2)),
+                                                   ((offs[0], offs[1]), (offs[2], offs[3]))):
+                cb, sb = rows * k // 2, rows * k // 16
+                for e in (0, E - 1):
+                    codes = rt.plan.read(rt.buf["weights"], int(d[w]) + e * cb, np.uint8, cb).reshape(rows, k // 2)
+                    scales = rt.plan.read(rt.buf["weights"], int(d[s]) + e * sb, np.uint8, sb).reshape(rows, k // 16)
+                    want_c, want_s = m.nvfp4_mma_arrangement(codes, scales)
+                    got_c = rt.plan.read(rt.buf["arranged"], ao + e * cb, np.uint8, cb).reshape(want_c.shape)
+                    got_s = rt.plan.read(rt.buf["arranged"], so + e * sb, np.uint8, sb).reshape(want_s.shape)
+                    assert np.array_equal(got_c, want_c) and np.array_equal(got_s, want_s), (layer, rows, k, e)
+    finally:
+        rt.close()

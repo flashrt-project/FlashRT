@@ -3,7 +3,9 @@
 Weights stay in the released precisions: BF16 attention, gates, embedding and LM head; NVFP4 / MXFP8 routed
 experts (codes and scales copied byte for byte). Derived data: each NVFP4 expert's FP32 global scale
 ``amax * (448 * 6 / outer_scale_denominator)`` (as mlx-lm computes it) and the combined message queries of the
-looped layers. Everything lives in one shared Metal buffer addressed through a per-layer descriptor table.
+looped layers. Everything lives in one shared Metal buffer addressed through a per-layer descriptor table. Row
+programs with SIMD-group MMA experts (see ``expert_mma``) add a second copy of the NVFP4 experts, re-arranged on
+the GPU at load (11.5 GB).
 Model state per layer visit (48 per token: the looped layers 6..17 run three times with their own caches): BF16
 KV (a 1024-slot ring for sliding-window layers, ``max_seq`` slots for the global ones) and the last three inputs
 of the four short convolutions (BF16, a four-slot ring, slot = position mod 4).
@@ -60,6 +62,26 @@ class _Layout:
         self.items.append((offset, np.ascontiguousarray(array)))
         self.size += array.nbytes
         return offset
+
+
+def nvfp4_mma_arrangement(codes: np.ndarray, scales: np.ndarray):
+    """Reference of ink_nv_arrange for one expert matrix: codes [rows][K / 2] (two E2M1 per byte, low nibble first),
+    scales [rows][K / 16] -> (codes [rows / 8][K / 128][32 lanes][16 fragments], scales [rows / 8][K / 128][8][8]).
+    Lane l (8x8 fragment place fm, fn) of fragment f = 4q + j holds weight rows fn and fn + 1 (low / high nibble) at
+    input 32q + 8 * (fm // 2) + 2j + fm % 2 of its 128-input block."""
+    rows, half = codes.shape
+    K = 2 * half
+    nrb, nkb = rows // 8, K // 128
+    lane = np.arange(32)
+    fm = ((lane // 4) & 4) + (lane // 2) % 4
+    fn = ((lane // 4) & 2) * 2 + (lane % 2) * 2
+    f = np.arange(16)
+    k = (f[None, :] // 4) * 32 + (fm[:, None] & 6) * 4 + (f[None, :] % 4) * 2 + (fm[:, None] & 1)   # [lane][f]
+    blocks = codes.reshape(nrb, 8, nkb, 64).transpose(0, 2, 1, 3)                     # [nrb][nkb][row][byte]
+    shift = (4 * (k & 1)).astype(np.uint8)
+    lo = (blocks[:, :, fn[:, None], k // 2] >> shift) & 15                            # [nrb][nkb][lane][f]
+    hi = (blocks[:, :, (fn + 1)[:, None], k // 2] >> shift) & 15
+    return np.ascontiguousarray((lo | (hi << 4)).astype(np.uint8)), np.ascontiguousarray(scales.reshape(nrb, 8, nkb, 8).transpose(0, 2, 1, 3))
 
 
 def global_scale(amax: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -120,6 +142,7 @@ class Inkling2Runtime(_MTPMixin):
             self._mtp_file.close()
         self._allocate_state()
         self._allocate_rows()
+        self._arranged: Optional[Dict[int, tuple]] = None   # allocated by the first row program with MMA experts
         if self.mtp:
             self._mtp_allocate()
         self.programs = {name: self._record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
@@ -129,11 +152,15 @@ class Inkling2Runtime(_MTPMixin):
             self.row_programs[(rows, logit_rows)] = self._record_rows(rows, logit_rows)
         if self.mtp:
             self._mtp_record()
+        if self._arranged is not None:
+            self.programs["arrange"] = self._record_arrange()
         if len(self._param_blob) > ARGS_BYTES:
             raise ValueError(f"recorded programs need {len(self._param_blob)} parameter bytes (> {ARGS_BYTES}): "
                              "fewer row shapes / MTP batch sizes")
         self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
         self.plan.finish(resident=True)
+        if self._arranged is not None:
+            self.plan.run(self.programs["arrange"])     # NVFP4 experts re-arranged per MMA fragment, once
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
         self._packet = self.plan.view(self.buf["packet"], np.uint32, 17)
         self._diagnostic = self.plan.view(self.buf["diagnostic"], np.uint32, WORKERS)
@@ -319,6 +346,12 @@ class Inkling2Runtime(_MTPMixin):
     gemv_rows = 4
     hybrid_rows = 3
     hybrid_limit = 1 << 30
+    # NVFP4 experts (layers 0-19) of programs with more than gemv_rows and at most mma_limit rows: SIMD-group MMAs
+    # over a load-time re-arranged copy of the expert weights (+11.5 GB; ink_nv_arrange / ink_experts_mma_*)
+    # instead of TensorOps tiles, experts with at most mma_rows rows on qmv. expert_mma = 0: no copy, TensorOps.
+    expert_mma = 1
+    mma_rows = 2
+    mma_limit = 512
     expert_k32 = 64             # up to this many rows the gate/up tiles dequantize 32-input slices (64 otherwise)
     # expert tiles by row count (8 assignments per row over 128 experts: R / 16 rows per expert on average)
     expert_tiles = {64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
@@ -495,9 +528,11 @@ class Inkling2Runtime(_MTPMixin):
                           (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
                           (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
             mx = 1 if int(d[D_FLAGS]) & 4 else 0
-            if gemv or hybrid:
-                # per-expert qmv: every expert (gemv) or the experts with at most hybrid_rows rows (hybrid)
-                limit = self.hybrid_rows if hybrid else 0
+            mma = bool(self.expert_mma) and not gemv and not mx and R <= self.mma_limit
+            few = (self.mma_rows if mma else self.hybrid_rows) if hybrid else 0
+            if gemv or few:
+                # per-expert qmv: every expert (gemv) or the experts with at most `few` rows (hybrid)
+                limit = few
                 for gu, w, s_, gs, k, src, dst in ((1, D_W13, D_S13, D_GS13, H, "r_xp", "r_act"),
                                                    (0, D_W2, D_S2, D_GS2, I, "r_act", "r_ep")):
                     wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, limit], np.uint64).tobytes())
@@ -505,8 +540,20 @@ class Inkling2Runtime(_MTPMixin):
                     plan.dispatch("ink_experts_qmv_rows", [W, (b[src], 0, READ), (b[dst], 0, WRITE), (A, wq, READ),
                                   (b["r_starts"], 0, READ), (A, sh, READ)], ((2 * I if gu else H) // 32, E, 1), 256,
                                   label="experts_gateup" if gu else "experts_down")
+            if mma:
+                if self._arranged is None:
+                    self._allocate_arranged()
+                ag, ags, ad, ads = self._arranged[layer]
+                for name, codes, scales, gs, k, wrows, nout, src, dst in (
+                        ("ink_experts_mma_gateup", ag, ags, D_GS13, H, 2 * I, I, "r_xp", "r_act"),
+                        ("ink_experts_mma_down", ad, ads, D_GS2, I, H, H, "r_act", "r_ep")):
+                    prm = self._param(np.array([codes, scales, d[gs]], np.uint64).tobytes() +
+                                      np.array([k, wrows, few, nout], np.uint32).tobytes())
+                    plan.dispatch(name, [W, (b["arranged"], 0, READ), (b[src], 0, READ), (b[dst], 0, WRITE),
+                                         (A, prm, READ), (b["r_starts"], 0, READ)], (wrows // 64, E, 1), 256,
+                                  label=name)
             tiles_y = (R * 8 + tm - 1) // tm + E
-            for name, w, s_, gs, k, n_out, src, dst in (() if gemv else (
+            for name, w, s_, gs, k, n_out, src, dst in (() if (gemv or mma) else (
                     ("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I, "r_xp", "r_act"),
                     ("ink_experts_down", D_W2, D_S2, D_GS2, I, H, "r_act", "r_ep"))):
                 blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
@@ -632,6 +679,40 @@ class Inkling2Runtime(_MTPMixin):
     def rows_logits(self, row: int = 0) -> np.ndarray:
         return self.plan.read(self.buf["r_logits"], row * self.cfg.vocab_size * 4, np.float32,
                               self.cfg.unpadded_vocab_size)
+
+    def _allocate_arranged(self) -> None:
+        """NVFP4 experts re-arranged for ink_experts_mma_* (codes per lane and fragment, scales per 8-row block)."""
+        cfg = self.cfg
+        H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
+        self._arranged = {}
+        size = 0
+        for layer in range(cfg.num_layers):
+            if int(self.table[layer][D_FLAGS]) & 4:
+                continue                                 # MXFP8 layers keep the TensorOps tiles
+            offs = []
+            for rows, k in ((2 * I, H), (H, I)):
+                codes, scales = E * rows * k // 2, E * rows * k // 16
+                offs += [size, size + codes]
+                size += codes + scales
+                size += (-size) % 256
+            self._arranged[layer] = tuple(offs)
+        self.buf["arranged"] = self.plan.buffer(max(size, 256))
+
+    def _record_arrange(self) -> int:
+        cfg, b = self.cfg, self.buf
+        H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
+        program = self.plan.program()
+        for layer, (gc, gs_, dc, ds) in self._arranged.items():
+            d = self.table[layer]
+            for (rows, k), (w, sc), (ac, asc) in zip(((2 * I, H), (H, I)), ((D_W13, D_S13), (D_W2, D_S2)),
+                                                    ((gc, gs_), (dc, ds))):
+                prm = self._param(np.array([d[w], d[sc], ac, asc], np.uint64).tobytes() +
+                                  np.array([E, rows, k, 0], np.uint32).tobytes())
+                n = E * (rows // 8) * (k // 128) * 32
+                self.plan.dispatch("ink_nv_arrange", [(b["weights"], 0, READ), (b["arranged"], 0, WRITE),
+                                                      (b["args"], prm, READ)], ((n + 255) // 256, 1, 1), 256,
+                                   label="arrange")
+        return program
 
     def _record_noise(self, program: int) -> int:
         """Gumbel noise rows [steps][vocab] for the sampled step from (seed, position) (gumbel_noise_f32, whose
