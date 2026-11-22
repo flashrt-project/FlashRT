@@ -173,10 +173,11 @@ def test_mma_expert_copy_matches_the_reference_arrangement():
 
 def test_mma_tiles_match_per_expert_passes(tokens):
     """Above mma_tile_rows the expert MMAs run one 32-row pass per threadgroup (scan tiles) instead of all of an
-    expert's passes in one threadgroup: the same passes, so the same logits bit for bit."""
+    expert's passes in one threadgroup: the same passes, so the same logits bit for bit. A repeated token gives a
+    few experts most of the rows (several tiles each)."""
     from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
     n = 96
-    ids = (tokens * 8)[:n]
+    ids = [tokens[0]] * 64 + (tokens * 8)[:n - 64]
     info = np.array([[0, i, 0, n - 1] for i in range(n)], np.uint32)
     saved, out = Inkling2Runtime.mma_tile_rows, []
     try:
@@ -186,6 +187,8 @@ def test_mma_tiles_match_per_expert_passes(tokens):
             try:
                 rt.run_rows(ids, info, 1)
                 out.append(rt.rows_logits(0).copy())
+                starts = rt.plan.read(rt.buf["r_starts"], 0, np.uint32, rt.cfg.num_experts + 1)
+                assert int(np.diff(starts.astype(np.int64)).max()) > 32       # the last visit: an expert with 2+ tiles
             finally:
                 rt.close()
     finally:
