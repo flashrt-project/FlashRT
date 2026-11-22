@@ -43,8 +43,8 @@ def detect_arch() -> str:
         ``"amd_rdna3"``  — AMD RDNA 3 (gfx1100 / Radeon Pro W7900D)
         ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
         ``"amd_rdna4"``  — AMD RDNA 4 (gfx1201 / Radeon AI PRO R9700)
-        ``"apple_mps"`` — Apple Silicon (Pi0.5 BF16 via PyTorch MPS; Flint and Qwen3.6-35B-A3B on the
-                          native Metal plan)
+        ``"apple_mps"`` — Apple Silicon (Pi0.5 BF16 via PyTorch MPS; Flint, Qwen3.6-35B-A3B and Inkling 2
+                          Mini on the native Metal plan)
 
     Raises RuntimeError if no supported accelerator is available or the
     card has an unsupported SM level. Deliberately strict: silently
@@ -159,6 +159,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # plan (no torch at runtime): text LLM, constructed directly (see flash_rt/api.py).
     ("flint", "torch", "apple_mps"):
         ("flash_rt.frontends.torch.flint_mps", "FlintTorchFrontendMps"),
+    # Inkling 2 Mini (thinkingmachines/Inkling-2-Mini, NVFP4 / MXFP8 experts) on Apple Silicon through the native
+    # Metal plan (no torch at runtime), with its DSpark drafter: text LLM, constructed directly (see flash_rt/api.py).
+    ("inkling2", "torch", "apple_mps"):
+        ("flash_rt.frontends.torch.inkling2_mps", "Inkling2TorchFrontendMps"),
 
     # DM05 uses its own Gemma3 prefix and action expert; it is not a Pi0.5 checkpoint.
     ("dm05", "torch", "rtx_sm120"):

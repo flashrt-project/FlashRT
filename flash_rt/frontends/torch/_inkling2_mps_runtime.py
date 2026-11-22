@@ -31,6 +31,7 @@ DEBUG_FLOATS = 24 * 4096
 CONTROL = 1024
 RING_FRAME = 6656
 SLIDING_SLOTS = 1024
+ARGS_BYTES = 16 << 20          # parameter blocks of every recorded program (~0.3 MB per row program)
 
 # descriptor indices (csrc/apple/inkling2/inkling2_decode_resident_bf16.h)
 D_FLAGS, D_ATTN_Q, D_MLP_Q, D_IN_NORM, D_K_NORM, D_V_NORM, D_POST_NORM = range(7)
@@ -64,6 +65,19 @@ def global_scale(amax: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     """mlx-lm: amax * ((6 * 448) / denominator), FP32 operations."""
     scale = np.float32(6.0 * 448.0) / denominator.astype(np.float32)
     return (amax.astype(np.float32) * scale).astype(np.float32)
+
+
+def chunk_plan(n: int, sizes: Sequence[int]) -> List[int]:
+    """Prefill chunks for ``n`` positions from the recorded program sizes: the largest that fits, repeatedly."""
+    sizes = sorted(set(int(c) for c in sizes), reverse=True)
+    if n < 1 or not sizes or sizes[-1] != 1:
+        raise ValueError("chunk_plan needs n >= 1 and a one-row size")
+    out = []
+    while n:
+        c = next(r for r in sizes if r <= n)
+        out.append(c)
+        n -= c
+    return out
 
 
 class Inkling2Runtime(_MTPMixin):
@@ -111,6 +125,9 @@ class Inkling2Runtime(_MTPMixin):
             self.row_programs[(rows, logit_rows)] = self._record_rows(rows, logit_rows)
         if self.mtp:
             self._mtp_record()
+        if len(self._param_blob) > ARGS_BYTES:
+            raise ValueError(f"recorded programs need {len(self._param_blob)} parameter bytes (> {ARGS_BYTES}): "
+                             "fewer row shapes / MTP batch sizes")
         self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
         self.plan.finish(resident=True)
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
@@ -264,7 +281,7 @@ class Inkling2Runtime(_MTPMixin):
             "r_xf": C * H * bf, "r_logits": max([lr for _, lr in self._row_shapes()] +
                                                 [MTP_BLOCK * c for c in self.mtp_batches]) * self.cfg.vocab_size * f32,
             "r_out": C * 4,
-            "args": 4 << 20, "r_trace": (48 * C * H * bf if self.trace_rows else 4),
+            "args": ARGS_BYTES, "r_trace": (48 * C * H * bf if self.trace_rows else 4),
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
@@ -356,11 +373,13 @@ class Inkling2Runtime(_MTPMixin):
                            (yf[0], yf[1], READ_WRITE), (self.buf["args"], prm, READ)],
                            ((units + 7) // 8, 1, 1), 256, label=label)
 
-    def _record_rows(self, R: int, logit_rows: int, stage: bool = False, features: bool = False) -> int:
+    def _record_rows(self, R: int, logit_rows: int, stage: bool = False, features: bool = False,
+                     then=None) -> int:
         """Program for R rows (rows_info and tokens written per run): all 48 visits, then the logits of the last
         ``logit_rows`` rows (softcapped FP32) and their greedy tokens. ``stage``: conv frames and sliding K / V
         staged for ink_commit_rows (speculative verification); ``features``: the drafter features of every row
-        (m_feat: the hidden state after visits 4, 22, 40 and the final normalized state)."""
+        (m_feat: the hidden state after visits 4, 22, 40 and the final normalized state). ``then``: records more
+        dispatches at the end of the same program."""
         cfg, b, plan = self.cfg, self.buf, self.plan
         H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
         small = R <= 64
@@ -541,7 +560,48 @@ class Inkling2Runtime(_MTPMixin):
         nrows = self._param(np.array([logit_rows], np.uint32).tobytes())
         plan.dispatch("ink_argmax_rows", [(b["r_logits"], 0, READ), (b["r_out"], 0, WRITE), (A, nrows, READ)],
                       (logit_rows, 1, 1), 256, label="argmax")
+        if then is not None:
+            then()
         return program
+
+    def prefill_chunks(self, features: bool = False) -> List[int]:
+        """Row counts of the recorded prefill programs (one logit row; with drafter features when ``features``)."""
+        if features:
+            return sorted((k[1] for k in getattr(self, "mtp_programs", {}) if k[0] == "prefill"), reverse=True)
+        return sorted((r for r, lr in self.row_programs if lr == 1), reverse=True)
+
+    def prefill(self, ids: Sequence[int], seq: int = 0, start: int = 0, features: bool = False) -> int:
+        """Prefill positions ``start .. start + len(ids) - 1`` of sequence ``seq`` in chunks of the recorded prefill
+        programs (largest first); returns the greedy next token. ``features``: the programs that also write the
+        drafter features and the drafter context of their positions."""
+        if not ids:
+            raise ValueError("ids must be non-empty")
+        if not 0 <= seq < self.sequences:
+            raise ValueError("sequence slot out of range")
+        if start + len(ids) > self.max_seq:
+            raise ValueError(f"prefill range exceeds max_seq {self.max_seq}")
+        if any(not 0 <= int(t) < self.cfg.unpadded_vocab_size for t in ids):
+            raise ValueError("token id outside the checkpoint vocabulary")
+        sizes = self.prefill_chunks(features)
+        if not sizes or sizes[-1] != 1:
+            raise ValueError("prefill needs programs down to one row (row_shapes / mtp_prefill)")
+        done, token = 0, 0
+        for c in chunk_plan(len(ids), sizes):
+            first = start + done
+            info = np.array([[seq, first + i, first, first + c - 1] for i in range(c)], np.uint32)
+            self.plan.write(self.buf["r_tokens"], 0, np.asarray(ids[done:done + c], np.uint32))
+            self.plan.write(self.buf["r_info"], 0, info)
+            if features:            # the program ends with the drafter context of these positions
+                ci = np.zeros((c, 4), np.uint32)
+                ci[:, 0], ci[:, 1], ci[:, 2] = seq, np.arange(first, first + c), 1
+                if done + c == len(ids):
+                    ci[-1, 3] = 1
+                self.plan.write(self.buf["m_cinfo"], 0, ci)
+            self.last_rows_timing = self.plan.run(self.mtp_programs[("prefill", c)] if features else
+                                                  self.row_programs[(c, 1)])
+            token = int(self.plan.read(self.buf["r_out"], 0, np.uint32, 1)[0])
+            done += c
+        return token
 
     def run_rows(self, tokens: Sequence[int], info: np.ndarray, logit_rows: int) -> np.ndarray:
         """Run the row program for len(tokens) rows with rows_info ``info`` [rows, 4] (sequence, position, first,
