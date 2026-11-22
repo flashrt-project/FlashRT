@@ -29,6 +29,12 @@ __global__ void accept_kernel(const __grid_constant__ AcceptParams p) {
   *after_wait(p.accepted) = n;
   *after_wait(p.next_token) = target[n];
   *after_wait(p.next_pos) = *after_wait(p.pos) + n + 1;
+  if (p.log) {
+    int* count = after_wait(p.log_count);
+    int* log = after_wait(p.log) + *count;
+    for (int j = 0; j <= n; ++j) log[j] = toks[j];
+    *count += n + 1;
+  }
 }
 
 // grid (visits): table rows of kCommitFields pointers per visit.

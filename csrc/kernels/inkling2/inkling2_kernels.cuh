@@ -275,16 +275,90 @@ struct LmHeadParams {
   const uint16_t* norm_w;           // final norm
   const uint16_t* weight;           // [vocab rows][kHidden]
   int vocab;                        // unpadded vocabulary
-  float softcap;
+  float softcap;                    // 0: none
   int blocks;
-  float* logits;                    // optional [vocab] FP32 softcapped
+  float* logits;                    // optional [rows][vocab] FP32 (softcapped)
   float* block_best;                // [blocks][rows]
   int* block_index;
   int* counter;                     // zero between launches
   int* token;                       // greedy token
+  uint16_t* normed_out;             // optional [rows][kHidden]: the normalized rows (the drafter's final feature)
   Prefetch prefetch;
 };
 void lm_head(const LmHeadParams& p, cudaStream_t stream);
+
+// ---- DSpark drafter, one sequence (inkling2_mtp.cu); the projections run on gemv_multi
+constexpr int kMtpBlock = 8;              // block positions: the anchor and 7 drafts
+constexpr int kMtpLayers = 3;
+constexpr int kMtpRank = 256;
+constexpr int kMtpInter = 9216;
+struct MtpParams {
+  // context of committed positions: rows j < *count + count_add at pos - count + j
+  const uint16_t* feat[4];          // target features [rows][kHidden] (hidden after visits 4 / 22 / 40, final norm)
+  const int* count;
+  int count_add;
+  float alpha[16];                  // fuse mixes [4][4]: layers 0..2, the Markov head
+  const uint16_t* norm[4];          // their dflare norms
+  const uint16_t* kvc;              // [3][2][8][1024] context k / v projections
+  const uint16_t* k_norm[3];        // k_norm_ctx per layer
+  // shared
+  const int* pos;                   // target position after the step = the block start (the anchor's position)
+  uint16_t* kv;                     // [3][2][8][cap][128] drafter K / V
+  int cap;
+  float theta;
+  int layer;                        // block kernels: the layer
+  int window;                       // attention: keys from start - (window + 1) (0: all)
+  uint16_t* x;                      // normalized rows: context [3][8][kHidden], block [8][kHidden]
+  uint16_t* frnn;                   // [kHidden] the Markov feature
+  // block
+  const int* anchor;
+  const uint16_t* embed;
+  const uint16_t* embed_norm;
+  const uint16_t* mask_embed;
+  float* dh;                        // [8][kHidden] the block's residual stream
+  const uint16_t* add;              // norm: added to dh first (optional)
+  const float* add_part[2];         // norm: or two FP32 partial sums (a projection split along k)
+  const uint16_t* norm_w;
+  const uint16_t* q_in;             // [8][3072]
+  const uint16_t* k_in;             // [8][1024]
+  const uint16_t* v_in;             // [8][1024]
+  const uint16_t* q_norm;
+  const uint16_t* kb_norm;          // the block's k head norm
+  uint16_t* q_out;                  // [8][3072] normalized, rotated queries
+  uint16_t* attn_out;               // [8][3072]
+  const uint16_t* gate;             // [8][9216]
+  const uint16_t* up;
+  uint16_t* act;
+  // Markov walk
+  int step;
+  int* drafts;                      // [7]
+  const uint16_t* markov_w1;        // [vocab][256]
+  const uint16_t* hn;               // [8][kHidden] the block's final normalized rows
+  uint16_t* rnn_in;                 // [5120]
+  const float* proj;                // [768] rnn_proj output (no bias)
+  const uint16_t* rnn_bias;         // [768]
+  uint16_t* state;                  // [256]
+  uint16_t* latent;                 // [256]
+  const float* logits;              // [7][vocab_stride] base logits of block rows 1..7
+  int vocab_stride;
+  int vocab;                        // unpadded
+  const uint16_t* fold_w;           // [vocab][256]
+  const uint16_t* fold_b;           // [vocab]
+  float* pick_best;                 // [mtp_pick_blocks()]
+  int* pick_index;
+  int* pick_counter;                // zero between launches
+};
+void mtp_context_mix(const MtpParams& p, cudaStream_t stream);
+void mtp_context_write(const MtpParams& p, cudaStream_t stream);
+void mtp_block_embed(const MtpParams& p, cudaStream_t stream);
+void mtp_norm(const MtpParams& p, cudaStream_t stream);
+void mtp_qk(const MtpParams& p, cudaStream_t stream);
+void mtp_attention(const MtpParams& p, cudaStream_t stream);
+void mtp_silu(const MtpParams& p, cudaStream_t stream);
+void mtp_rnn_in(const MtpParams& p, cudaStream_t stream);
+void mtp_gates(const MtpParams& p, cudaStream_t stream);
+void mtp_pick(const MtpParams& p, cudaStream_t stream);
+int mtp_pick_blocks();
 
 // ---- speculative verification bookkeeping (inkling2_spec.cu)
 struct AcceptParams {
@@ -296,6 +370,8 @@ struct AcceptParams {
   int* tokens;                      // [rows] the step's tokens: drafts[0 .. n), target[n]
   int* next_token;                  // the next anchor (target[n])
   int* next_pos;                    // pos + n + 1
+  int* log;                         // optional: the step's tokens appended at log[*log_count], *log_count += n + 1
+  int* log_count;
 };
 void accept(const AcceptParams& p, cudaStream_t stream);
 

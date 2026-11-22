@@ -42,6 +42,10 @@ __global__ void __launch_bounds__(kThreads) lm_head_kernel(const __grid_constant
     for (int i = threadIdx.x; i < kHidden; i += kThreads) xb[r * kHidden + i] = f32_to_bf16_bits(in[i] * inv * bf16_to_f32(p.norm_w[i]));
   }
   __syncthreads();
+  if (p.normed_out && blockIdx.x == 0) {
+    uint4* o = reinterpret_cast<uint4*>(after_wait(p.normed_out));
+    for (int i = threadIdx.x; i < R * kHidden / 8; i += kThreads) o[i] = reinterpret_cast<const uint4*>(xb)[i];
+  }
   float best[kMaxRows];
   int bidx[kMaxRows];
 #pragma unroll
@@ -71,7 +75,7 @@ __global__ void __launch_bounds__(kThreads) lm_head_kernel(const __grid_constant
         }
       }
       acc = warp_sum(acc);
-      const float c = tanhf(acc / p.softcap) * p.softcap;
+      const float c = p.softcap > 0.0f ? tanhf(acc / p.softcap) * p.softcap : acc;
       if (lane == 0) {
         if (out) out[size_t(r) * p.vocab + v] = c;
         if (c > best[r] || (c == best[r] && v < bidx[r])) { best[r] = c; bidx[r] = v; }
