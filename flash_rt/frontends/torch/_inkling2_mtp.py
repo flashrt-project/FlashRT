@@ -270,12 +270,13 @@ class _MTPMixin:
         tokens of every sequence (the first yield: each prompt's first token). A sequence with ``limit`` tokens
         is frozen (its rows still run, nothing is committed); the caller stops iterating when it is done."""
         C = len(prompts)
-        if ("draft", C) not in self.mtp_programs:
+        if ("draft", C) not in getattr(self, "mtp_programs", {}):
             raise ValueError(f"no MTP programs for {C} sequences (mtp_batches)")
         if any(not p for p in prompts):
             raise ValueError("prompts must be non-empty")
-        if any(len(p) + limit + MTP_BLOCK > self.max_seq for p in prompts):
-            raise ValueError("prompt + new tokens exceed max_seq")
+        # a sequence can pass `limit` by W - 1 tokens and keeps verifying W rows after that
+        if any(len(p) + limit + 2 * MTP_BLOCK > self.max_seq for p in prompts):
+            raise ValueError("prompt + new tokens + 16 exceed max_seq")
         plan, b = self.plan, self.buf
         W = self.mtp_width(C)
         R = W * C

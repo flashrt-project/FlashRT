@@ -45,6 +45,7 @@ V_LAYER, V_PASS, V_KV, V_CAP, V_RING = range(5)
 DECODE_KERNELS = {
     "greedy": "inkling2_decode_resident_bf16",
     "reference": "inkling2_decode_resident_reference_bf16",
+    "sampled": "inkling2_decode_resident_sampled_bf16",
 }
 
 
@@ -100,6 +101,8 @@ class Inkling2Runtime(_MTPMixin):
         self.sequences, self.row_capacity = int(sequences), int(row_capacity)
         self.trace_rows = bool(trace_rows)
         self.row_shapes = None if row_shapes is None else [tuple(x) for x in row_shapes]
+        if self.row_shapes is not None and not self.row_shapes:
+            raise ValueError("row_shapes must name at least one (rows, logit rows) program")
         if self.row_shapes and any(r > self.row_capacity or not 1 <= lr <= r for r, lr in self.row_shapes):
             raise ValueError("row shapes must satisfy 1 <= logit rows <= rows <= row_capacity")
         self.ckpt = Inkling2Checkpoint(checkpoint_dir)
@@ -120,6 +123,7 @@ class Inkling2Runtime(_MTPMixin):
         if self.mtp:
             self._mtp_allocate()
         self.programs = {name: self._record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
+        self.programs["noise"] = self._record_noise(self.plan.program())
         self.row_programs: Dict[tuple, int] = {}
         for rows, logit_rows in self._row_shapes():
             self.row_programs[(rows, logit_rows)] = self._record_rows(rows, logit_rows)
@@ -254,7 +258,7 @@ class Inkling2Runtime(_MTPMixin):
             "params": 64,
             "noise": BLOCK * v * 4, "logits": BLOCK * v * 4, "trace": BLOCK * visits * H * 2,
             "packet": 17 * 4, "workspace": WORKSPACE, "debug": DEBUG_FLOATS * 4,
-            "control": CONTROL * 4, "diagnostic": WORKERS * 4,
+            "control": CONTROL * 4, "diagnostic": WORKERS * 4, "noise_params": 64,
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
@@ -317,7 +321,7 @@ class Inkling2Runtime(_MTPMixin):
     hybrid_limit = 1 << 30
     expert_k32 = 64             # up to this many rows the gate/up tiles dequantize 32-input slices (64 otherwise)
     # expert tiles by row count (8 assignments per row over 128 experts: R / 16 rows per expert on average)
-    expert_tiles = {4: (8, 64, 4), 64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
+    expert_tiles = {64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
 
     @staticmethod
     def _pick(table, rows):
@@ -396,8 +400,6 @@ class Inkling2Runtime(_MTPMixin):
         mode1 = self._param(np.array([1], np.uint32).tobytes())
         tmp = self._param(np.array([tm, self.hybrid_rows if hybrid else 0], np.uint32).tobytes())
         for v, (layer, pss) in enumerate(cfg.visits()):
-            if v >= getattr(self, "max_visits", 48):
-                break
             d = self.table[layer]
             full, msgs = cfg.is_global(layer), cfg.is_looped(layer) and pss > 0
             boundary = layer % cfg.layers_per_block == 0
@@ -610,8 +612,20 @@ class Inkling2Runtime(_MTPMixin):
         key = (R, logit_rows)
         if key not in self.row_programs:
             raise ValueError(f"no row program recorded for {key}; pass row_shapes")
+        info = np.ascontiguousarray(info, np.uint32)
+        if info.shape != (R, 4):
+            raise ValueError("info must be [rows, 4]: (sequence, position, first, last)")
+        seq, pos, first, last = info.T
+        if (seq >= self.sequences).any() or (last >= self.max_seq).any() or (pos < first).any() or (pos > last).any():
+            raise ValueError("rows_info out of range: sequence < sequences, first <= position <= last < max_seq")
+        # rows of a sequence at positions first..last must be consecutive rows of the dispatch
+        prev_pos, prev_seq = np.r_[np.uint32(0xFFFFFFFF), pos[:-1]], np.r_[np.uint32(0xFFFFFFFF), seq[:-1]]
+        if ((pos > first) & ((prev_pos != pos - 1) | (prev_seq != seq))).any():
+            raise ValueError("rows of one sequence must hold consecutive positions in consecutive rows")
+        if any(not 0 <= int(t) < self.cfg.unpadded_vocab_size for t in tokens):
+            raise ValueError("token id outside the checkpoint vocabulary")
         self.plan.write(self.buf["r_tokens"], 0, np.asarray(tokens, np.uint32))
-        self.plan.write(self.buf["r_info"], 0, np.ascontiguousarray(info, np.uint32))
+        self.plan.write(self.buf["r_info"], 0, info)
         self.last_rows_timing = self.plan.run(self.row_programs[key])
         return self.plan.read(self.buf["r_out"], 0, np.uint32, logit_rows).copy()
 
@@ -619,9 +633,21 @@ class Inkling2Runtime(_MTPMixin):
         return self.plan.read(self.buf["r_logits"], row * self.cfg.vocab_size * 4, np.float32,
                               self.cfg.unpadded_vocab_size)
 
+    def _record_noise(self, program: int) -> int:
+        """Gumbel noise rows [steps][vocab] for the sampled step from (seed, position) (gumbel_noise_f32, whose
+        parameter words live in noise_params: position [1], steps [2], seed [12], [13], enable [14])."""
+        v = self.cfg.vocab_size
+        prm = self._param(np.array([v], np.uint32).tobytes())
+        self.plan.dispatch("gumbel_noise_f32", [(self.buf["noise"], 0, WRITE), (self.buf["noise_params"], 0, READ),
+                                                (self.buf["args"], prm, READ)], ((BLOCK * v + 255) // 256, 1, 1), 256,
+                           label="gumbel_noise_f32")
+        return program
+
     def _record_decode(self, kernel: str) -> int:
         b = self.buf
         program = self.plan.program()
+        if kernel == DECODE_KERNELS["sampled"]:
+            self._record_noise(program)
         self.plan.dispatch(kernel, [
             (b["weights"], 0, READ), (b["table"], 0, READ), (b["kv"], 0, READ_WRITE), (b["rings"], 0, READ_WRITE),
             (b["params"], 0, READ), (b["noise"], 0, READ), (b["logits"], 0, WRITE), (b["trace"], 0, WRITE),
@@ -637,8 +663,48 @@ class Inkling2Runtime(_MTPMixin):
         self.rotation = 0
 
     # ------------------------------------------------------------------- decode
+    def _set_noise(self, position: int, steps: int, seed: int) -> None:
+        q = np.zeros(16, np.uint32)
+        q[1], q[2], q[12], q[13], q[14] = position, steps, seed & 0xFFFFFFFF, (seed >> 32) & 0xFFFFFFFF, 1
+        self.plan.write(self.buf["noise_params"], 0, q)
+
+    @staticmethod
+    def _check_sampling(top_k: int, top_p: float, temperature: float) -> None:
+        if not temperature > 0:
+            raise ValueError("sampling needs temperature > 0 (temperature 0 is the greedy program)")
+        if not 1 <= int(top_k) <= 32 or not 0.0 < float(top_p) <= 1.0:
+            raise ValueError("the sampled program needs 1 <= top_k <= 32 and 0 < top_p <= 1")
+
+    def sample_logits(self, logits: np.ndarray, position: int, seed: int, top_k: int, top_p: float,
+                      temperature: float) -> int:
+        """The sampled step's selection rule on the host (the first token after a prefill): the top_k largest
+        logits (ties: larger id first), cut to the nucleus top_p of the full-vocabulary probabilities (mlx-lm:
+        cumulative from the largest), then the maximum of log-probability / temperature + Gumbel noise of
+        (seed, position) (ties: lowest id)."""
+        self._check_sampling(top_k, top_p, temperature)
+        self._set_noise(position, 1, seed)
+        self.plan.run(self.programs["noise"])
+        noise = self.plan.read(self.buf["noise"], 0, np.float32, self.cfg.unpadded_vocab_size)
+        x = np.asarray(logits, np.float32)[:self.cfg.unpadded_vocab_size].astype(np.float64)
+        lse = x.max() + np.log(np.exp(x - x.max()).sum())
+        ids = np.arange(x.size)
+        order = np.lexsort((-ids, -x))[:int(top_k)]          # value descending, then larger id first
+        lp = x[order] - lse
+        before = np.concatenate([[0.0], np.cumsum(np.exp(lp))[:-1]])
+        kept = (float(top_p) >= 1.0) | ((1.0 - before) > (1.0 - float(top_p)))
+        score = np.where(kept, lp / float(temperature) + noise[order], -np.inf)
+        best = score.max()
+        return int(order[score == best].min())
+
     def decode(self, token: int, position: int, steps: int, program: str = "greedy",
-               eos: Sequence[int] = ()) -> List[int]:
+               eos: Sequence[int] = (), top_k: int = 20, top_p: float = 1.0, temperature: float = 1.0,
+               seed: int = 0) -> List[int]:
+        """``steps`` (1..8) tokens after ``token`` at ``position``. ``program="sampled"``: fused top-k / top-p
+        selection with Gumbel noise drawn from ``seed`` and each step's position (reproducible per seed)."""
+        if program not in ("greedy", "reference", "sampled"):
+            raise ValueError("program must be greedy, reference or sampled")
+        if program == "sampled":
+            self._check_sampling(top_k, top_p, temperature)
         if not 1 <= steps <= BLOCK:
             raise ValueError(f"steps must be in [1, {BLOCK}]")
         if position + steps > self.max_seq:
@@ -651,6 +717,10 @@ class Inkling2Runtime(_MTPMixin):
         p[0], p[1], p[2], p[3] = token, position, steps, len(eos)
         p[4:4 + len(eos)] = list(eos)
         p[11], p[12], p[13] = self.rotation, 0, self.debug_visit
+        if program == "sampled":
+            p[8] = int(top_k)
+            p[9:11] = np.array([top_p, 1.0 / temperature], np.float32).view(np.uint32)
+            self._set_noise(position, steps, int(seed))
         self._params[:] = p
         self._control[:] = 0
         self._diagnostic[:] = 0

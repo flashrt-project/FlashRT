@@ -102,3 +102,45 @@ def test_chat_and_input_checks():
             fe.generate([1] * 500, max_new_tokens=64)
     finally:
         fe.rt.close()
+
+
+def test_row_program_input_checks(tokens):
+    rt = _runtime(max_seq=64, sequences=2, row_capacity=4, row_shapes=[(4, 1), (2, 2)])
+    try:
+        ok = np.array([[0, i, 0, 3] for i in range(4)], np.uint32)
+        rt.run_rows(tokens[:4], ok, 1)
+        bad = [np.array([[0, i, 0, 3] for i in (0, 2, 1, 3)], np.uint32),     # positions out of row order
+               np.array([[0, i, 0, 3] for i in (0, 1, 2, 64)], np.uint32),    # beyond max_seq
+               np.array([[2, i, 0, 3] for i in range(4)], np.uint32)]         # no such sequence slot
+        for info in bad:
+            with pytest.raises(ValueError):
+                rt.run_rows(tokens[:4], info, 1)
+        with pytest.raises(ValueError):
+            rt.run_rows([rt.cfg.unpadded_vocab_size, 1], np.array([[0, 0, 0, 0], [1, 0, 0, 0]], np.uint32), 2)
+        with pytest.raises(ValueError):
+            rt.mtp_generate([tokens], 8)                                       # no MTP programs recorded
+    finally:
+        rt.close()
+
+
+def test_sampling(tokens):
+    """top_k = 1 samples a largest logit (on an exact tie the sampler ranks the larger id first, as mlx-lm's top-p
+    ordering does; greedy takes the lowest id); a seed reproduces its sequence; another seed draws another one."""
+    from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
+    fe = Inkling2TorchFrontendMps(CKPT, max_seq=256)
+    try:
+        rt, n = fe.rt, len(tokens)
+        first = rt.prefill(tokens)
+        for step in range(4):
+            greedy = rt.decode(first, n + step, 1, program="greedy")[0]
+            logits = rt.logits(0).copy()
+            pick = rt.decode(first, n + step, 1, program="sampled", top_k=1, top_p=1.0, temperature=1.0, seed=3)[0]
+            assert logits[pick] == logits.max() == logits[greedy]
+            first = greedy
+        a = fe.generate(tokens, max_new_tokens=20, stop_ids=(), temperature=1.5, top_k=32, top_p=0.95, seed=7)
+        b = fe.generate(tokens, max_new_tokens=20, stop_ids=(), temperature=1.5, top_k=32, top_p=0.95, seed=7)
+        c = fe.generate(tokens, max_new_tokens=20, stop_ids=(), temperature=1.5, top_k=32, top_p=0.95, seed=8)
+        assert a == b and a != c
+        assert all(0 <= t < fe.cfg.unpadded_vocab_size for t in a + c)
+    finally:
+        fe.rt.close()

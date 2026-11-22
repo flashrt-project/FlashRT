@@ -25,7 +25,7 @@
 namespace flashrt::apple::shaders {
 
 struct Inkling2DecodeOptions {
-    bool sampled = false;   // gumbel top-k / top-p selection instead of greedy argmax
+    bool sampled = false;   // fused top-k (<= 32) / top-p selection with Gumbel noise instead of greedy argmax
     bool trace = false;     // write the hidden state after every visit and a visit's intermediates
     int workers = 36;       // resident threadgroups (>= 36: 12 per message gate). All must be co-resident for the
                             // grid barriers: 40 (2 per core of the 20-core GPU) is 2% faster but leaves no slack,
@@ -40,6 +40,8 @@ inline std::string inkling2_decode_resident_bf16_source(const Inkling2DecodeOpti
 static_assert(FRT_WORKERS>=36u,"message gates use threadgroups 0..35 (12 per gate)");
 constant constexpr uint FRT_GROUPS=FRT_WORKERS*8u;        // SIMD groups in the grid
 constant constexpr uint FRT_THREADS=FRT_WORKERS*256u;
+constant constexpr uint FRT_PER_THREAD=(FVOCAB_USED+FRT_THREADS-1u)/FRT_THREADS;   // sampler: vocabulary per thread
+static_assert(FRT_PER_THREAD<=32u,"the sampler keeps a 32-bit mask of a thread's taken candidates");
 struct DecodeParams {
     uint token, position, steps, eos_count;
     uint eos[4];
@@ -103,6 +105,9 @@ kernel void inkling2_decode_resident_bf16(
     threadgroup ushort vh[FH];             // the hidden state between visits (BF16)
     threadgroup float vr[FH];              // FP32: attention input, then the residual
     threadgroup float vxs[3456];           // BF16 [3][2304] projection inputs | FP32 [2304] + BF16 [2304]
+#if FRT_SAMPLED
+    threadgroup float frt_cv[256];threadgroup uint frt_cw[256];
+#endif
     threadgroup ushort* vx=(threadgroup ushort*)vxs;
 
     device float* bs=(device float*)(workspace+WS_BS);
@@ -752,6 +757,95 @@ kernel void inkling2_decode_resident_bf16(
             }
         }
         SYNC();
+#if FRT_SAMPLED
+        // Fused top-k / top-p: group-local maximum, sum of exponentials and sorted top-K, one barrier, then every
+        // group merges the per-group lists and selects the same token. Ties rank the larger token id first
+        // (mlx-lm top-p: ascending argsort, cumulative > 1 - p); Gumbel noise rows come from `sampling`.
+        {
+            device float* logits=block_logits+step*FVOCAB;
+            const uint frt_k=params.top_k;
+            const float frt_p=params.top_p,frt_inv_t=params.inverse_temperature;
+            float xs[FRT_PER_THREAD];
+            float tmax=-FRT_INF;
+            for(uint j=0;j<FRT_PER_THREAD;++j){const uint w=index+j*FRT_THREADS;
+                const float x=w<FVOCAB_USED?logits[w]:-FRT_INF;xs[j]=x;tmax=max(tmax,x);}
+            const float smax=simd_max(tmax);
+            if(lane==0)red[simd]=smax;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float gmax=red[0];for(uint i=1;i<8u;++i)gmax=max(gmax,red[i]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float se=0.0f;for(uint j=0;j<FRT_PER_THREAD;++j)se+=metal::precise::exp(xs[j]-gmax);
+            se=simd_sum(se);
+            if(lane==0)red[simd]=se;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float gsum=0.0f;for(uint i=0;i<8u;++i)gsum+=red[i];
+            uint removed=0u;
+            for(uint r=0;r<frt_k;++r) {
+                float bestv=-FRT_INF;uint bw=0u,bj=0u;bool any=false;
+                for(uint j=0;j<FRT_PER_THREAD;++j) {
+                    const uint w=index+j*FRT_THREADS;
+                    if(((removed>>j)&1u)==0u && w<FVOCAB_USED && (!any || xs[j]>bestv || (xs[j]==bestv && w>bw))){
+                        bestv=xs[j];bw=w;bj=j;any=true;}
+                }
+                const float peak=simd_max(bestv);
+                const uint win=simd_max((any && bestv==peak)?bw:0u);
+                if(any && bw==win && bestv==peak)removed|=1u<<bj;
+                if(lane==0){frt_cv[simd*32u+r]=peak;frt_cw[simd*32u+r]=win;}
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            device float* cand=(device float*)part;
+            if(simd==0) {
+                uint ptr=0u;
+                for(uint r=0;r<frt_k;++r) {
+                    const float hv=(lane<8u && ptr<frt_k)?frt_cv[lane*32u+ptr]:-FRT_INF;
+                    const uint hw=(lane<8u && ptr<frt_k)?frt_cw[lane*32u+ptr]:0u;
+                    const float peak=simd_max(hv);
+                    const uint win=simd_max(hv==peak?hw:0u);
+                    if(lane<8u && ptr<frt_k && hv==peak && hw==win)++ptr;
+                    if(lane==0){cand[(group*32u+r)*2u]=peak;((device uint*)cand)[(group*32u+r)*2u+1u]=win;}
+                }
+                if(lane==0){stats[group*2u]=gmax;stats[group*2u+1u]=gsum;}
+            }
+            SYNC();
+            if(simd==0) {
+                float M=-FRT_INF;
+                for(uint g=lane;g<FRT_WORKERS;g+=32u)M=max(M,stats[g*2u]);
+                M=simd_max(M);
+                float S=0.0f;
+                for(uint g=lane;g<FRT_WORKERS;g+=32u)S+=stats[g*2u+1u]*metal::precise::exp(stats[g*2u]-M);
+                S=simd_sum(S);
+                const float lse=M+metal::precise::log(S);
+                uint p0=0u,p1=0u;
+                float myv=-FRT_INF;uint myw=0xffffffffu;
+                for(uint r=0;r<frt_k;++r) {
+                    const uint g0=lane,g1=lane+32u;
+                    const bool v0=g0<FRT_WORKERS && p0<frt_k,v1=g1<FRT_WORKERS && p1<frt_k;
+                    const float h0=v0?cand[(g0*32u+p0)*2u]:-FRT_INF;
+                    const uint w0=v0?((device uint*)cand)[(g0*32u+p0)*2u+1u]:0u;
+                    const float h1=v1?cand[(g1*32u+p1)*2u]:-FRT_INF;
+                    const uint w1=v1?((device uint*)cand)[(g1*32u+p1)*2u+1u]:0u;
+                    const bool first=v0 && (!v1 || h0>h1 || (h0==h1 && w0>w1));
+                    const float hv=first?h0:h1;const uint hw=first?w0:w1;
+                    const bool live=v0||v1;
+                    const float peak=simd_max(hv);
+                    const uint win=simd_max((live && hv==peak)?hw:0u);
+                    if(live && hv==peak && hw==win){if(first)++p0;else ++p1;}
+                    if(lane==r){myv=peak;myw=win;}
+                }
+                const float lp=myv-lse;
+                const float prob=lane<frt_k?metal::precise::exp(lp):0.0f;
+                const float before=simd_prefix_exclusive_sum(prob);
+                const bool kept=lane<frt_k && (frt_p>=1.0f || (1.0f-before)>(1.0f-frt_p));
+                const float score=kept?lp*frt_inv_t+sampling[step*FVOCAB+myw]:-FRT_INF;
+                const float top=simd_max(score);
+                const uint pick=simd_min(score==top && kept?myw:0xffffffffu);
+                if(lane==0)red[32]=as_type<float>(pick);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            input_token=as_type<uint>(red[32]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+#else
         {
             device float* logits=block_logits+step*FVOCAB;
             float best=-FRT_INF;
@@ -786,6 +880,7 @@ kernel void inkling2_decode_resident_bf16(
             input_token=as_type<uint>(red[32]);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+#endif
         if(index==0){packet[step*2+1]=input_token;packet[16]=step+1u;}
         bool stop=false;
         for(uint e=0;e<params.eos_count;++e)stop=stop||input_token==params.eos[e];

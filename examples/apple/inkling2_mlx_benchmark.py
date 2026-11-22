@@ -5,6 +5,8 @@ engine behind ``mlx_lm.server``), with an mlx-lm that supports ``inkling2_loop``
 C concurrent sequences of ``--prompt`` corpus tokens (the same slices as ``inkling2_benchmark.py``), exactly ``--gen``
 new tokens each, greedy. Per run: prefill seconds (until every sequence has its first token) and decode seconds /
 tokens per second after that, aggregate and per sequence. Run 0 is a warm-up; the median of the others is printed.
+``--stream``: one sequence through ``stream_generate`` instead (mlx-lm's single-sequence path, faster than the
+batch engine at concurrency 1).
 """
 from __future__ import annotations
 
@@ -24,16 +26,38 @@ def main():
     ap.add_argument("--prompt", type=int, default=1024)
     ap.add_argument("--gen", type=int, default=1024)
     ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument("--stream", action="store_true", help="concurrency 1 through stream_generate")
     args = ap.parse_args()
     import mlx.core as mx
     from mlx_lm import load
     from mlx_lm.generate import BatchGenerator
     from mlx_lm.sample_utils import make_sampler
 
-    model, _ = load(args.model)
+    model, _tokenizer = load(args.model)
     corpus = np.fromfile(args.corpus, dtype="<i4")
     sampler = make_sampler(temp=0.0)
     P, G = args.prompt, args.gen
+    if args.stream:
+        from mlx_lm import stream_generate
+        rows = []
+        for rep in range(args.reps + 1):
+            prompt = corpus[7919 * rep: 7919 * rep + P].tolist()
+            t0, t_first, n = time.perf_counter(), None, 0
+            for _ in stream_generate(model, _tokenizer, prompt, max_tokens=G, sampler=sampler):
+                n += 1
+                if t_first is None:
+                    t_first = time.perf_counter()
+            t1 = time.perf_counter()
+            row = dict(prefill_s=t_first - t0, decode_s=t1 - t_first, agg_tps=(n - 1) / (t1 - t_first))
+            row["per_seq_tps"] = row["agg_tps"]
+            print(json.dumps({"conc": 1, "stream": True, "rep": rep, **{k: round(v, 3) for k, v in row.items()}}),
+                  flush=True)
+            if rep:
+                rows.append(row)
+            mx.clear_cache()
+        median = {k: round(statistics.median(r[k] for r in rows), 3) for k in rows[0]}
+        print(json.dumps({"conc": 1, "stream": True, "median": median}), flush=True)
+        return
     for C in [int(c) for c in args.conc.split(",")]:
         rows = []
         for rep in range(args.reps + 1):
