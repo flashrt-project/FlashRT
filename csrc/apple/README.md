@@ -49,6 +49,13 @@ qwen35moe/                        kernels specialized to the qwen3_5_moe geometr
   qwen35moe_prefill_rows_bf16.h   prefill rows: embedding, DeltaNet conv / recurrence / gated norm,
                                   Q/K norm + RoPE, expert count / placement / combine
   qwen35moe_router_rows_bf16.h    prefill router: TensorOps logits, softmax top-8, shared-expert gate
+inkling2/                         kernels specialized to Inkling 2 Mini (inkling2_loop; ink_* entries)
+  inkling2_common.h               device functions shared by the decode step and the row kernels
+  inkling2_decode_resident_bf16.h resident decode step (NVFP4 / MXFP8 experts, BF16 attention)
+  inkling2_rows_bf16.h            row kernels: embedding, block attention residuals, message gates, attention,
+                                  routing, expert placement / combination, few-row gemv and expert products
+  inkling2_rows_gemm.h            TensorOps products of the row programs (BF16, logits, expert tiles)
+  inkling2_mtp_bf16.h             speculative decoding: verify staging / commit, DSpark drafter
 kernel_registry.h                dispatch name -> source builder / entry point
 ```
 

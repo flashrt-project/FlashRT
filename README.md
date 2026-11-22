@@ -333,6 +333,31 @@ same token ids, batch 1, interleaved runs; the reference is mlx-lm 0.31.3.
 With the checkpoint's default sampling (temperature 1, top-p 0.95, top-k 20)
 decode is 24-33% faster than mlx-lm (109.6 against 82.6 tok/s at 1K).
 
+### Inkling 2 Mini (NVFP4 / MXFP8, Apple Silicon)
+
+Native Metal plan for the text decoder of `thinkingmachines/Inkling-2-Mini` on
+M4 Pro at the checkpoint's precision (BF16 attention, NVFP4 / MXFP8 experts),
+with the checkpoint's DSpark drafter for speculative decoding. One-token decode
+steps are bit-identical to mlx-lm's (2100 consecutive steps). The model card's
+benchmark shape: 1024-token prompts, exactly 1024 generated tokens, greedy,
+C concurrent sequences; decode tokens/s aggregated over the sequences (prefill
+excluded), same Mac (M4 Pro, 64 GB), same token ids, interleaved runs against
+mlx-lm with Inkling 2 support (BatchGenerator; `stream_generate` at C = 1).
+[Protocol, equivalence and reproduction](docs/inkling2_apple_usage.md).
+
+| Concurrency | mlx-lm tok/s | FlashRT tok/s | FlashRT + DSpark tok/s |
+|---:|---:|---:|---:|
+| 1 | 28.4 (`stream_generate`) | **35.2** | **54.2** |
+| 4 | 52.2 | **64.0** | **81.3** |
+| 16 | 70.6 | **101.9** | **131.3** |
+| 64 | 114.9 | **169.1** | **185.6** |
+
+Prefill of the 1024-token prompts matches mlx-lm (2.16 s against 2.17-2.25 s
+at C = 1). DSpark's gain depends on the text (source code here) and shrinks as
+the batch grows, since the M4 Pro is compute-bound from C = 16. A FlashRT token
+at C = 1 takes 28.4 ms; the model card's SGLang run on one B300 reports 29.7 ms
+without the drafter (whole-benchmark throughput, prefill included).
+
 ### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
@@ -997,7 +1022,7 @@ have been built and tested, and the dispatch map that selects them.
 | AMD Instinct MI350X | gfx950 (CDNA4) | Supported | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Uses the gfx950 source set, checked at build and runtime. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300X | gfx942 (CDNA3) | Supported | Architecture-specific BF16/FP8 FNUZ kernels and HIP graphs. See [AMD deployment](docs/deployment_amd.md), [π0.5](docs/deployment_amd_pi05.md), and [GR00T N1.7](docs/deployment_amd_groot_n17.md). |
 | Ascend 910B4 | Ascend NPU | Supported | Pi0.5 and GR00T N1.7 backend with native AscendC kernels and NPU graphs. See [π0.5 deployment](docs/deployment_npu.md) and [GR00T N1.7 deployment](docs/deployment_npu_groot_n17.md). |
-| Apple Silicon | Metal / PyTorch MPS | Experimental | Pi0.5 BF16 eager execution using the shared torch pipeline. No CUDA build required; checkpoint accuracy and production latency remain unqualified. See [Apple setup with uv](docs/deployment_apple.md). Flint MLX int4 on the native Metal plan (M4 Pro / M4 Max), bit-identical prefill to rec; see [Flint on Apple Silicon](docs/flint_apple_usage.md). Qwen3.6-35B-A3B MLX int4 on the same plan, one-token decode steps bit-identical to mlx-lm; see [Qwen3.6-35B-A3B on Apple Silicon](docs/qwen36_moe_apple_usage.md). |
+| Apple Silicon | Metal / PyTorch MPS | Experimental | Pi0.5 BF16 eager execution using the shared torch pipeline. No CUDA build required; checkpoint accuracy and production latency remain unqualified. See [Apple setup with uv](docs/deployment_apple.md). Flint MLX int4 on the native Metal plan (M4 Pro / M4 Max), bit-identical prefill to rec; see [Flint on Apple Silicon](docs/flint_apple_usage.md). Qwen3.6-35B-A3B MLX int4 on the same plan, one-token decode steps bit-identical to mlx-lm; see [Qwen3.6-35B-A3B on Apple Silicon](docs/qwen36_moe_apple_usage.md). Inkling 2 Mini (NVFP4 / MXFP8) with DSpark speculative decoding; see [Inkling 2 Mini on Apple Silicon](docs/inkling2_apple_usage.md). |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
 | RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission, Hy-Embodied-0.5-VLA (`config="hyvla"`, SM120 FP8 / NVFP4 ViT+prefill), LaWAM (`config="lawam"`, 18.85 ms E2E), MolmoAct2 (`config="molmoact2"`, 51.0 ms graph replay, 7.87x), and VLA-JEPA (`config="vla_jepa"`, 8.12 ms p50, 8.58x over LeRobot eager); see [Community benchmarks](#community-hardware-benchmarks), [HyVLA RTX notes](docs/hyvla05_rtx_sm120.md), [LaWAM RTX notes](docs/lawam_rtx.md), [MolmoAct2 usage](docs/molmoact2_usage.md), and [VLA-JEPA usage](docs/vla_jepa_rtx.md). |
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |
