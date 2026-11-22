@@ -102,6 +102,7 @@ kernel void ink_attn_inputs_rows(const device uchar* weights [[buffer(0)]],const
         depth_attention<4>(bsr,bk,1u,(const device float*)(bank+(size_t(p.pass-1u)*R+row)*FH),1.0f,
                            (const device float*)(weights+table[24u*64u+D_MSG_Q])+(p.layer-6u)*4u*FH,
                            mr,red,tid,lane,zero);
+        threadgroup_barrier(mem_flags::mem_device);   // the messages are read back by other threads below
     }
     const uint nq=(full || messages)?3u:1u;
     for(uint j=0;j<nq;++j) {

@@ -13,7 +13,7 @@ greedy continuation up to near-ties in the verification's rounding).
     fe = Inkling2TorchFrontendMps("<path-to-Inkling-2-Mini>", max_seq=8192)
     text = fe.chat([{"role": "user", "content": "Write a quicksort in Python."}], max_new_tokens=512)
 
-Text only (the vision tower is not loaded), greedy decoding. Constructed directly rather than through
+Text only (the vision tower is not loaded); greedy or top-k / top-p sampling. Constructed directly rather than through
 ``load_model`` (a text decoder has no VLA ``predict`` surface); PyTorch is not imported. See
 ``docs/inkling2_apple_usage.md``.
 """
@@ -32,7 +32,7 @@ PREFILL_CHUNKS = (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 
 
 class Inkling2TorchFrontendMps:
-    """Greedy generation over the native inkling2_loop Metal runtime (one sequence)."""
+    """Generation over the native inkling2_loop Metal runtime (one sequence)."""
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, speculative: bool = False,
                  chat_template: Optional[str] = None, library: Optional[str] = None):
@@ -48,10 +48,13 @@ class Inkling2TorchFrontendMps:
         self._template = None
 
     def stream(self, prompt_ids: Sequence[int], max_new_tokens: int = 256,
-               stop_ids: Optional[Sequence[int]] = None) -> Iterator[List[int]]:
-        """Greedy continuation of ``prompt_ids`` as it is produced (blocks of up to eight tokens; with
-        ``speculative`` the accepted tokens of each draft / verify step). Stops after an end-of-generation token
-        (included); ``stop_ids=()`` disables stopping."""
+               stop_ids: Optional[Sequence[int]] = None, temperature: float = 0.0, top_p: float = 1.0,
+               top_k: int = 20, seed: int = 0) -> Iterator[List[int]]:
+        """Continuation of ``prompt_ids`` as it is produced (blocks of up to eight tokens; with ``speculative`` the
+        accepted tokens of each draft / verify step). Stops after an end-of-generation token (included);
+        ``stop_ids=()`` disables stopping. ``temperature=0`` (the default) is greedy; otherwise top-k (1..32) /
+        top-p sampling with Gumbel noise drawn on the GPU from ``seed`` and the token position (speculative
+        decoding is greedy only)."""
         if not prompt_ids:
             raise ValueError("prompt_ids must be non-empty")
         if max_new_tokens < 1:
@@ -59,9 +62,16 @@ class Inkling2TorchFrontendMps:
         if any(t < 0 or t >= self.cfg.unpadded_vocab_size for t in prompt_ids):
             raise ValueError("prompt token id outside the checkpoint vocabulary")
         n = len(prompt_ids)
-        if n + max_new_tokens + BLOCK > self.rt.max_seq:
-            raise ValueError(f"prompt {n} + {max_new_tokens} new tokens exceeds max_seq {self.rt.max_seq}")
+        margin = 2 * BLOCK if self.speculative else BLOCK
+        if n + max_new_tokens + margin > self.rt.max_seq:
+            raise ValueError(f"prompt {n} + {max_new_tokens} new tokens (+{margin}) exceeds max_seq {self.rt.max_seq}")
         stop = set(self.eog if stop_ids is None else stop_ids)
+        sampled = temperature > 0
+        if sampled and self.speculative:
+            raise ValueError("speculative decoding is greedy (temperature 0)")
+        if temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        sampling = dict(top_k=top_k, top_p=top_p, temperature=temperature, seed=seed) if sampled else {}
         produced = 0
         if self.speculative:
             for step in self.rt.mtp_steps([list(prompt_ids)], max_new_tokens):
@@ -76,6 +86,8 @@ class Inkling2TorchFrontendMps:
                     return
             return
         first = self.rt.prefill(list(prompt_ids))
+        if sampled:
+            first = self.rt.sample_logits(self.rt.rows_logits(0), n - 1, **sampling)
         yield [first]
         if first in stop or max_new_tokens == 1:
             return
@@ -83,7 +95,8 @@ class Inkling2TorchFrontendMps:
         eos = sorted(stop)[:4]
         while produced < max_new_tokens:
             steps = min(BLOCK, max_new_tokens - produced)
-            block = self.rt.decode(token, position, steps, program="greedy", eos=eos)
+            block = self.rt.decode(token, position, steps, program="sampled" if sampled else "greedy", eos=eos,
+                                   **sampling)
             produced += len(block)
             position += len(block)
             token = block[-1]
@@ -94,9 +107,9 @@ class Inkling2TorchFrontendMps:
             yield block
 
     def generate(self, prompt_ids: Sequence[int], max_new_tokens: int = 256,
-                 stop_ids: Optional[Sequence[int]] = None) -> List[int]:
+                 stop_ids: Optional[Sequence[int]] = None, **sampling) -> List[int]:
         out: List[int] = []
-        for block in self.stream(prompt_ids, max_new_tokens, stop_ids):
+        for block in self.stream(prompt_ids, max_new_tokens, stop_ids, **sampling):
             out.extend(block)
         return out
 
@@ -130,9 +143,11 @@ class Inkling2TorchFrontendMps:
                                      **template_kwargs)
 
     def chat(self, messages: List[Dict], tools: Optional[List[Dict]] = None, max_new_tokens: int = 1024,
-             skip_special: bool = False, **template_kwargs) -> str:
+             skip_special: bool = False, sampling: Optional[Dict] = None, **template_kwargs) -> str:
+        """``sampling``: keyword arguments of ``stream`` (temperature, top_p, top_k, seed); greedy by default.
+        Other keyword arguments go to the chat template (e.g. ``reasoning_effort``)."""
         prompt = self.apply_chat_template(messages, tools=tools, **template_kwargs)
-        ids = self.generate(self.tokenizer.encode(prompt), max_new_tokens=max_new_tokens)
+        ids = self.generate(self.tokenizer.encode(prompt), max_new_tokens=max_new_tokens, **(sampling or {}))
         if ids and ids[-1] in self.eog:
             ids = ids[:-1]
         return self.tokenizer.decode(ids, skip_special=skip_special)

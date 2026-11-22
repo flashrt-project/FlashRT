@@ -171,3 +171,11 @@ def test_config_is_not_mutated():
     config_from_json(raw)
     check_mtp_config(raw)
     assert raw == snapshot
+
+
+@pytest.mark.parametrize("top_k,top_p,temperature", [(0, 1.0, 1.0), (33, 1.0, 1.0), (20, 0.0, 1.0),
+                                                      (20, 1.5, 1.0), (20, 0.9, 0.0)])
+def test_sampling_parameters_are_checked(top_k, top_p, temperature):
+    from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
+    with pytest.raises(ValueError):
+        Inkling2Runtime._check_sampling(top_k, top_p, temperature)
