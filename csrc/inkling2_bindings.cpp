@@ -66,20 +66,39 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   m.attr("GEMV_PLAIN") = int(ik::kGemvPlain);
   m.attr("GEMV_NORM") = int(ik::kGemvNorm);
   m.attr("GEMV_GATE") = int(ik::kGemvGate);
-  // tasks: (w, x, y, n, k, x_f32, y_f32, prologue, aux); prefetch: (ptr, bytes)
+  // tasks: (w, x, y, n, k, x_f32, y_f32, prologue, aux[, rows]); prefetch: (ptr, bytes)
   m.def("gemv_multi",
-        [](const std::vector<std::tuple<uintptr_t, uintptr_t, uintptr_t, int, int, int, int, int, uintptr_t>>& tasks,
-           const std::vector<std::tuple<uintptr_t, uint64_t>>& prefetch, uintptr_t stream) {
+        [](const std::vector<py::tuple>& tasks, const std::vector<std::tuple<uintptr_t, uint64_t>>& prefetch,
+           uintptr_t stream) {
           if (tasks.empty() || tasks.size() > ik::kMaxGemvTasks) throw std::invalid_argument("gemv_multi: 1 to 8 tasks");
           ik::GemvTask t[ik::kMaxGemvTasks] = {};
           for (size_t i = 0; i < tasks.size(); ++i) {
-            const auto& [w, x, y, n, k, xf, yf, pro, aux] = tasks[i];
+            const py::tuple& a = tasks[i];
+            if (a.size() < 9 || a.size() > 11) throw std::invalid_argument("gemv_multi: task of 9 to 11 fields");
+            const int pro = a[7].cast<int>();
+            const uintptr_t aux = a[8].cast<uintptr_t>();
             if (pro != ik::kGemvPlain && !aux) throw std::invalid_argument("gemv_multi: prologue needs aux");
-            t[i] = {ptr<const void>(w), ptr<const void>(x), ptr<void>(y), ptr<const void>(aux), n, k, xf, yf, pro};
+            t[i] = {ptr<const void>(a[0].cast<uintptr_t>()), ptr<const void>(a[1].cast<uintptr_t>()),
+                    ptr<void>(a[2].cast<uintptr_t>()), ptr<const void>(aux), a[3].cast<int>(), a[4].cast<int>(),
+                    a[5].cast<int>(), a[6].cast<int>(), pro, a.size() >= 10 ? a[9].cast<int>() : 1,
+                    a.size() == 11 ? a[10].cast<int>() : 0};
           }
           ik::gemv_multi(t, int(tasks.size()), to_prefetch(prefetch), to_stream(stream));
         },
         py::arg("tasks"), py::arg("prefetch"), py::arg("stream"));
+
+  // tasks: (x, x_f32, x_stride, w, out, rows, k)
+  m.def("norm_rows",
+        [](const std::vector<std::tuple<uintptr_t, int, int, uintptr_t, uintptr_t, int, int>>& tasks, uintptr_t stream) {
+          if (tasks.empty() || tasks.size() > ik::kMaxNormTasks) throw std::invalid_argument("norm_rows: 1 to 4 tasks");
+          ik::NormRowsTask t[ik::kMaxNormTasks] = {};
+          for (size_t i = 0; i < tasks.size(); ++i) {
+            const auto& [x, x_f32, x_stride, w, out, rows, k] = tasks[i];
+            t[i] = {ptr<const void>(x), ptr<const uint16_t>(w), ptr<uint16_t>(out), k, x_f32, rows, x_stride};
+          }
+          ik::norm_rows(t, int(tasks.size()), to_stream(stream));
+        },
+        py::arg("tasks"), py::arg("stream"));
 
   m.attr("HIDDEN") = ik::kHidden;
   m.attr("TOPK") = ik::kTopK;
@@ -88,6 +107,8 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
 
   m.def("visit_boundary", [](const py::dict& d, uintptr_t stream) {
     ik::BoundaryParams p = {};
+    p.rows = dint(d, "rows", 1);
+    p.stage = dptr<uint16_t>(d, "stage");
     p.finish = dint(d, "finish");
     p.expert_out = dptr<const uint16_t>(d, "expert_out");
     p.route_w = dptr<const float>(d, "route_w");
@@ -118,6 +139,8 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   });
   m.def("post_attention", [](const py::dict& d, uintptr_t stream) {
     ik::PostAttentionParams p = {};
+    p.rows = dint(d, "rows", 1);
+    p.stage = dptr<uint16_t>(d, "stage");
     p.attn_out = dptr<const uint16_t>(d, "attn_out");
     p.block_residual = dptr<const uint16_t>(d, "block_residual");
     p.attn_conv_state = dptr<uint16_t>(d, "attn_conv_state");
@@ -134,6 +157,10 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   });
   m.def("gate_mix", [](const py::dict& d, uintptr_t stream) {
     ik::GateMixParams p = {};
+    p.rows = dint(d, "rows", 1);
+    p.h_stride = dint(d, "h_stride", ik::kHidden);
+    p.m_stride = dint(d, "m_stride", ik::kHidden);
+    p.out_stride = dint(d, "out_stride", ik::kHidden);
     p.count = dlist(d, "forget", p.forget);
     if (dlist(d, "gain", p.gain) != p.count || dlist(d, "states", p.states) != p.count ||
         dlist(d, "h", p.h) != p.count || dlist(d, "m", p.m) != p.count || dlist(d, "out", p.out) != p.count)
@@ -169,8 +196,11 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.prefetch = dprefetch(d);
     ik::attn_prologue(p, to_stream(stream));
   });
-  m.def("attn_decode", [](const py::dict& d, uintptr_t stream) {
+  auto attn_params = [](const py::dict& d) {
     ik::AttnDecodeParams p = {};
+    p.rows = dint(d, "rows", 1);
+    p.stage_kv = dptr<uint16_t>(d, "stage_kv");
+    p.stage_in = dptr<uint16_t>(d, "stage_in");
     p.sliding = dint(d, "sliding");
     p.pos = dptr<const int>(d, "pos");
     p.q_lin = dptr<const uint16_t>(d, "q_lin");
@@ -198,9 +228,13 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.counters = dptr<int>(d, "counters");
     p.max_splits = dint(d, "max_splits");
     p.out = dptr<uint16_t>(d, "out");
+    p.gate = dptr<const uint16_t>(d, "gate");
+    p.q_pre = dptr<float>(d, "q_pre");
     p.prefetch = dprefetch(d);
-    ik::attn_decode(p, to_stream(stream));
-  });
+    return p;
+  };
+  m.def("attn_decode", [attn_params](const py::dict& d, uintptr_t stream) { ik::attn_decode(attn_params(d), to_stream(stream)); });
+  m.def("kv_rows", [attn_params](const py::dict& d, uintptr_t stream) { ik::kv_rows(attn_params(d), to_stream(stream)); });
   m.def("router", [](const py::dict& d, uintptr_t stream) {
     ik::RouterParams p = {};
     p.in = dptr<const float>(d, "in");
@@ -221,6 +255,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   auto expert = [](const py::dict& d) {
     ik::ExpertParams p = {};
     p.mxfp8 = dint(d, "mxfp8");
+    p.rows = dint(d, "rows", 1);
     p.ids = dptr<const int>(d, "ids");
     p.codes = dptr<const void>(d, "codes");
     p.scales = dptr<const void>(d, "scales");
@@ -251,12 +286,21 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
       }
     }
     p.prefetch = dprefetch(d);
+    p.xq = dptr<void>(d, "xq");
+    p.xq_scale = dptr<float>(d, "xq_scale");
+    p.xq_amax = dptr<float>(d, "xq_amax");
     return p;
   };
   m.def("expert_w13", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13(expert(d), to_stream(stream)); });
   m.def("expert_w2", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w2(expert(d), to_stream(stream)); });
+  m.def("expert_route", [expert](const py::dict& d, uintptr_t stream) { ik::expert_route(expert(d), to_stream(stream)); });
+  m.def("expert_w13_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13_flat(expert(d), to_stream(stream)); });
+  m.def("expert_act_quant", [expert](const py::dict& d, uintptr_t stream) { ik::expert_act_quant(expert(d), to_stream(stream)); });
+  m.def("expert_w2_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w2_flat(expert(d), to_stream(stream)); });
   m.def("lm_head", [](const py::dict& d, uintptr_t stream) {
     ik::LmHeadParams p = {};
+    p.rows = dint(d, "rows", 1);
+    p.in_stride = dint(d, "in_stride", 3 * ik::kHidden);
     p.in = dptr<const float>(d, "in");
     p.norm_w = dptr<const uint16_t>(d, "norm_w");
     p.weight = dptr<const uint16_t>(d, "weight");
@@ -270,5 +314,26 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.token = dptr<int>(d, "token");
     p.prefetch = dprefetch(d);
     ik::lm_head(p, to_stream(stream));
+  });
+  m.attr("COMMIT_FIELDS") = ik::kCommitFields;
+  m.def("accept", [](const py::dict& d, uintptr_t stream) {
+    ik::AcceptParams p = {};
+    p.rows = dint(d, "rows");
+    p.drafts = dptr<const int>(d, "drafts");
+    p.target = dptr<const int>(d, "target");
+    p.pos = dptr<const int>(d, "pos");
+    p.accepted = dptr<int>(d, "accepted");
+    p.tokens = dptr<int>(d, "tokens");
+    p.next_token = dptr<int>(d, "next_token");
+    p.next_pos = dptr<int>(d, "next_pos");
+    ik::accept(p, to_stream(stream));
+  });
+  m.def("commit", [](const py::dict& d, uintptr_t stream) {
+    ik::CommitParams p = {};
+    p.visits = dint(d, "visits");
+    p.table = dptr<const uint64_t>(d, "table");
+    p.accepted = dptr<const int>(d, "accepted");
+    p.pos = dptr<const int>(d, "pos");
+    ik::commit(p, to_stream(stream));
   });
 }

@@ -34,6 +34,9 @@ constexpr int kMaxGemvTasks = 8;
 //   kGemvPlain: x as given; kGemvNorm: x = bf16(rms_norm(x) * aux), aux the BF16 norm weight (eps 1e-6);
 //   kGemvGate:  x = bf16(x * sigmoid(aux)), aux the BF16 gate (the attention output gate).
 enum GemvPrologue { kGemvPlain = 0, kGemvNorm = 1, kGemvGate = 2 };
+// rows > 1 (up to kMaxRows): x [rows][k], y [rows][n], a gate aux [rows][k]; every row's arithmetic is the one-row
+// kernel's (same staging order, same per-lane accumulation and warp sum), so row r equals a one-row launch on row r.
+constexpr int kMaxRows = 8;
 struct GemvTask {
   const void* w;     // [n][k] BF16
   const void* x;     // [k] BF16 or FP32 (x_f32)
@@ -42,8 +45,21 @@ struct GemvTask {
   int n, k;
   int x_f32, y_f32;
   int prologue;
+  int rows;          // 0 or 1: one row
+  int x_stride;      // elements between input rows (0: k)
 };
 void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cudaStream_t stream);
+
+// The kGemvNorm prologue computed once per row: out [rows][k] = bf16(rms_norm(x) * w) in the one-row GEMV's order
+// (a kGemvPlain task on out equals a kGemvNorm task on x). One block per (task, row).
+constexpr int kMaxNormTasks = 4;
+struct NormRowsTask {
+  const void* x;     // [rows][x_stride] BF16 or FP32 (x_f32)
+  const uint16_t* w; // [k] BF16
+  uint16_t* out;     // [rows][k] BF16
+  int k, x_f32, rows, x_stride;
+};
+void norm_rows(const NormRowsTask* tasks, int count, cudaStream_t stream);
 
 // ---- model shape
 constexpr int kHidden = 2304;
@@ -53,8 +69,14 @@ constexpr int kInter = 1152;
 constexpr int kMaxBlocks = 5;       // attention-residual block states seen by one visit (4) + the new one
 
 // ---- per-visit vector kernels (inkling2_visit.cu), one block each
+// Vector kernels over `rows` rows (one block per row; 0 / 1 = one row): per-row buffers are [rows][...] with the
+// strides of one row, gate_in [3][rows][2 kHidden]. stage != null: a verification step, the conv state is read
+// only, row r's window takes the inputs of rows r - 3 .. r - 1 of this step, and every row's conv input goes to
+// stage [rows][kHidden] for the commit.
 struct BoundaryParams {
   Prefetch prefetch;                // weights of later kernels (issued by kPrefetchBlocks extra blocks)
+  int rows;
+  uint16_t* stage;                  // MLP conv inputs [rows][kHidden] (verification)
   // finish the previous visit: hidden_out = bf16(residual + mlp_conv(bf16(sum_s y_s w_s)))
   int finish;
   const uint16_t* expert_out;       // [kTopK][kHidden] BF16
@@ -89,6 +111,8 @@ void visit_boundary(const BoundaryParams& p, cudaStream_t stream);
 
 struct PostAttentionParams {
   Prefetch prefetch;                // weights of later kernels (issued by kPrefetchBlocks extra blocks)
+  int rows;
+  uint16_t* stage;                  // attention conv inputs [rows][kHidden] (verification)
   const uint16_t* attn_out;         // o_proj output [kHidden] BF16
   const uint16_t* block_residual;   // the visit input
   uint16_t* attn_conv_state;
@@ -99,13 +123,15 @@ struct PostAttentionParams {
   const float* blocks[kMaxBlocks];
   const float* mlp_query;           // [kHidden]
   float* mlp_in;                    // [kHidden] FP32
-  const float* message;             // loop passes 2, 3: the MLP message, else null
+  const float* message;             // loop passes 2, 3: the MLP message (row stride 4 kHidden), else null
   uint16_t* gate_in;                // [2 kHidden] BF16
 };
 void post_attention(const PostAttentionParams& p, cudaStream_t stream);
 
 struct GateMixParams {
   int count;                        // gates (1..3)
+  int rows;                         // rows (0 / 1: one); states [rows][64], h / m / out rows at the strides below
+  int h_stride, m_stride, out_stride;
   const uint16_t* forget[3];        // [kHidden][64]
   const uint16_t* gain[3];
   const uint16_t* states[3];        // [64] BF16 (down projection output)
@@ -143,6 +169,9 @@ void attn_prologue(const AttnPrologueParams& p, cudaStream_t stream);
 
 struct AttnDecodeParams {
   Prefetch prefetch;                // weights of later kernels, prefetched into L2 before the PDL wait
+  int rows;                         // a verification step (rows > 1 with stage_kv set): rows at pos .. pos + rows - 1
+  uint16_t* stage_kv;               // verification: the new rows' K / V [rows][2][8][128] (sliding layers)
+  uint16_t* stage_in;               // verification: the k / v conv inputs [rows][2][1024] (kv_rows)
   int sliding;
   const int* pos;
   // the projections and the prologue's operands (see AttnPrologueParams): the attention block that holds the new
@@ -164,12 +193,17 @@ struct AttnDecodeParams {
   uint16_t* k_cache;
   uint16_t* v_cache;
   const uint16_t* sinks;            // [24]
-  float* partial;                   // [8][max_splits][3][130]
-  int* counters;                    // [8], zero between launches
+  float* partial;                   // [8][max_splits][rows][3][130]
+  int* counters;                    // [8][rows], zero between launches
+  float* q_pre;                     // verification: the prepared queries and relative queries per row and KV head
+                                    // ([rows][8][3 * 128 + 3 * 16], written by kv_rows, read by the split blocks)
   int max_splits;
-  uint16_t* out;                    // [24 * 128] BF16
+  uint16_t* out;                    // [rows][24 * 128] BF16
+  const uint16_t* gate;             // optional [rows][24 * 128]: out = bf16(bf16(attention) * sigmoid(gate)), the
+                                    // kGemvGate prologue of the output projection applied once
 };
 void attn_decode(const AttnDecodeParams& p, cudaStream_t stream);
+void kv_rows(const AttnDecodeParams& p, cudaStream_t stream);
 int attn_split_keys();
 
 // ---- routed experts (inkling2_moe.cu)
@@ -192,6 +226,7 @@ void router(const RouterParams& p, cudaStream_t stream);
 
 struct ExpertParams {
   int mxfp8;
+  int rows;                         // token rows (0 / 1: one); slots row * 8 + k grouped by expert
   const int* ids;                   // [kTopK]
   const void* codes;                // [128][rows][k / 2] NVFP4 or [128][rows][k] FP8
   const void* scales;               // [128][rows][k / 16] E4M3 or [128][rows][k / 32] UE8M0
@@ -216,12 +251,26 @@ struct ExpertParams {
   const uint8_t* w2_base[2];
   uint64_t w2_bytes[2];
   Prefetch prefetch;                // w2: weights of the next visit (host ranges)
+  // flat passes: the staged quantized inputs per row (expert_route -> expert_w13_flat) or per slot
+  // (expert_act_quant -> expert_w2_flat): NVFP4 codes as f16x2 pairs / MXFP8 values as half ([n][k * 2 bytes]),
+  // FP32 block scales ([n][k / 16]), the NVFP4 amax ([n])
+  void* xq;
+  float* xq_scale;
+  float* xq_amax;
 };
 void expert_w13(const ExpertParams& p, cudaStream_t stream);
 void expert_w2(const ExpertParams& p, cudaStream_t stream);
+// The same experts as passes over all rows of a step: routing + input quantization once per row, w13 over the flat
+// (group, pair) items, the activations quantized once per slot, w2 over the flat (group, rows) items.
+void expert_route(const ExpertParams& p, cudaStream_t stream);
+void expert_w13_flat(const ExpertParams& p, cudaStream_t stream);
+void expert_act_quant(const ExpertParams& p, cudaStream_t stream);
+void expert_w2_flat(const ExpertParams& p, cudaStream_t stream);
 
 // ---- LM head + greedy (inkling2_lmhead.cu)
 struct LmHeadParams {
+  int rows;                         // 0 / 1: one row; in / logits / token / block arrays per row
+  int in_stride;                    // elements between rows of `in`
   const float* in;                  // final depth-attention output (FP32)
   const uint16_t* norm_w;           // final norm
   const uint16_t* weight;           // [vocab rows][kHidden]
@@ -229,13 +278,37 @@ struct LmHeadParams {
   float softcap;
   int blocks;
   float* logits;                    // optional [vocab] FP32 softcapped
-  float* block_best;                // [blocks]
+  float* block_best;                // [blocks][rows]
   int* block_index;
   int* counter;                     // zero between launches
   int* token;                       // greedy token
   Prefetch prefetch;
 };
 void lm_head(const LmHeadParams& p, cudaStream_t stream);
+
+// ---- speculative verification bookkeeping (inkling2_spec.cu)
+struct AcceptParams {
+  int rows;                         // verified rows (anchor + rows - 1 drafts)
+  const int* drafts;                // [rows - 1]
+  const int* target;                // [rows] greedy tokens of the verification rows
+  const int* pos;                   // the step's first position
+  int* accepted;                    // drafts accepted (n)
+  int* tokens;                      // [rows] the step's tokens: drafts[0 .. n), target[n]
+  int* next_token;                  // the next anchor (target[n])
+  int* next_pos;                    // pos + n + 1
+};
+void accept(const AcceptParams& p, cudaStream_t stream);
+
+// per visit: k / v / attention / MLP conv states, staged k-v conv inputs [rows][2][1024], staged attention and MLP
+// conv inputs [rows][kHidden], ring K, ring V, staged K / V rows [rows][2][1024], sliding flag
+constexpr int kCommitFields = 11;
+struct CommitParams {
+  int visits;
+  const uint64_t* table;            // [visits][kCommitFields]
+  const int* accepted;
+  const int* pos;
+};
+void commit(const CommitParams& p, cudaStream_t stream);
 
 }  // namespace inkling2
 }  // namespace flash_rt

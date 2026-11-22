@@ -115,10 +115,10 @@ __device__ __forceinline__ void depth_attention(const V4 (&src)[MaxN], int n, co
   }
 }
 
-// Short convolution of the new row for 4 channels (mlx ShortConvolution, decode): window and conv in BF16 (FP32
-// sum, one rounding), (conv + x) / sqrt(K + 1) in BF16; state = the last K - 1 inputs, oldest first, shifted by one.
-__device__ __forceinline__ V4 short_conv4(uint16_t* __restrict__ state, const uint16_t* __restrict__ w, int t, const V4& x) {
-  const V4 s0 = load_b4(state, t), s1 = load_b4(state + kHidden, t), s2 = load_b4(state + 2 * kHidden, t);
+// Short convolution of one row for 4 channels (mlx ShortConvolution): window (s0, s1, s2 the three previous inputs,
+// oldest first, and x) and conv in BF16 (FP32 sum, one rounding), (conv + x) / sqrt(K + 1) in BF16.
+__device__ __forceinline__ V4 conv4(const V4& s0, const V4& s1, const V4& s2, const V4& x, const uint16_t* __restrict__ w,
+                                    int t) {
   const uint4 w01 = reinterpret_cast<const uint4*>(w)[2 * t], w23 = reinterpret_cast<const uint4*>(w)[2 * t + 1];
   const uint32_t ww[8] = {w01.x, w01.y, w01.z, w01.w, w23.x, w23.y, w23.z, w23.w};   // channel c: 4 taps = 2 words
   V4 out;
@@ -130,18 +130,40 @@ __device__ __forceinline__ V4 short_conv4(uint16_t* __restrict__ state, const ui
     conv = fmaf(bf16hi(ww[2 * i + 1]), x.x[i], conv);
     out.x[i] = round_bf16((round_bf16(conv) + x.x[i]) / sqrtf(5.0f));
   }
+  return out;
+}
+
+// Decode: the window from the state, which then shifts in x.
+__device__ __forceinline__ V4 short_conv4(uint16_t* __restrict__ state, const uint16_t* __restrict__ w, int t, const V4& x) {
+  const V4 s0 = load_b4(state, t), s1 = load_b4(state + kHidden, t), s2 = load_b4(state + 2 * kHidden, t);
+  const V4 out = conv4(s0, s1, s2, x, w, t);
   store_b4(state, t, s1);
   store_b4(state + kHidden, t, s2);
   store_b4(state + 2 * kHidden, t, x);
   return out;
 }
 
+// Verification row r: previous inputs from this step's rows r - 3 .. r - 1 (prev[3 - j] = row r - j) or the state.
+__device__ __forceinline__ V4 staged_conv4(const uint16_t* __restrict__ state, const V4 (&prev)[3], int r,
+                                           const uint16_t* __restrict__ w, int t, const V4& x) {
+  V4 s[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {                 // window slot j holds input r - 3 + j
+    const int src = r - 3 + j;
+    s[j] = src >= 0 ? prev[j] : load_b4(state + (3 + src) * kHidden, t);
+  }
+  return conv4(s[0], s[1], s[2], x, w, t);
+}
+
 __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_constant__ BoundaryParams p) {
   __shared__ float red[24][33];
-  if (prefetch_block(p.prefetch, 1)) return;
+  const int R = p.rows < 1 ? 1 : p.rows;
+  if (prefetch_block(p.prefetch, R)) return;
   pdl_wait();
   pdl_launch();
   const int t = threadIdx.x;
+  const int r = blockIdx.x;                       // the row
+  const size_t D1 = kHidden;
   auto mark = [&](int i) {
     if (p.timing && t == 0) {
       unsigned long long g;
@@ -155,28 +177,42 @@ __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_c
   if (p.finish) {
     const uint16_t* __restrict__ y = after_wait(p.expert_out);
     const float* __restrict__ rw = after_wait(p.route_w);
-    V4 ys[kTopK];
+    // the MLP output of row q: bf16(sum_s y_s w_s) in slot order
+    auto moe_of = [&](int q) {
+      V4 ys[kTopK];
 #pragma unroll
-    for (int s = 0; s < kTopK; ++s) ys[s] = load_b4(y + s * kHidden, t);
-    const V4 res = load_f4(after_wait(p.residual), t);
-    float w[kTopK];
+      for (int s = 0; s < kTopK; ++s) ys[s] = load_b4(y + (size_t(q) * kTopK + s) * kHidden, t);
+      float w[kTopK];
 #pragma unroll
-    for (int s = 0; s < kTopK; ++s) w[s] = rw[s];
-    V4 moe;
+      for (int s = 0; s < kTopK; ++s) w[s] = rw[q * kTopK + s];
+      V4 moe;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      float acc = 0.0f;
+      for (int i = 0; i < 4; ++i) {
+        float acc = 0.0f;
 #pragma unroll
-      for (int s = 0; s < kTopK; ++s) acc = __fadd_rn(acc, __fmul_rn(ys[s].x[i], w[s]));
-      moe.x[i] = round_bf16(acc);
+        for (int s = 0; s < kTopK; ++s) acc = __fadd_rn(acc, __fmul_rn(ys[s].x[i], w[s]));
+        moe.x[i] = round_bf16(acc);
+      }
+      return moe;
+    };
+    const V4 moe = moe_of(r);
+    const V4 res = load_f4(after_wait(p.residual) + r * D1, t);
+    V4 c;
+    if (p.stage) {
+      V4 prev[3];
+#pragma unroll
+      for (int j = 0; j < 3; ++j) prev[j] = r - 3 + j >= 0 ? moe_of(r - 3 + j) : V4{};
+      c = staged_conv4(after_wait(p.mlp_conv_state), prev, r, p.mlp_conv_w, t, moe);
+      store_b4(after_wait(p.stage) + r * D1, t, moe);
+    } else {
+      c = short_conv4(after_wait(p.mlp_conv_state), p.mlp_conv_w, t, moe);
     }
-    const V4 c = short_conv4(after_wait(p.mlp_conv_state), p.mlp_conv_w, t, moe);
 #pragma unroll
     for (int i = 0; i < 4; ++i) h.x[i] = round_bf16(res.x[i] + c.x[i]);
-    store_b4(after_wait(p.hidden_out), t, h);
+    store_b4(after_wait(p.hidden_out) + r * D1, t, h);
     have_h = true;
   } else if (p.embed) {
-    const int tok = *after_wait(p.token);
+    const int tok = after_wait(p.token)[r];
     const V4 e = load_b4(p.embed_table + size_t(tok) * kHidden, t);
     float v[1] = {sumsq(e)};
     block_sums<1>(v, red);
@@ -184,7 +220,7 @@ __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_c
     const V4 nw = load_b4(p.embed_norm, t);
 #pragma unroll
     for (int i = 0; i < 4; ++i) h.x[i] = round_bf16(e.x[i] * inv * nw.x[i]);
-    store_b4(after_wait(p.hidden_out), t, h);
+    store_b4(after_wait(p.hidden_out) + r * D1, t, h);
     have_h = true;
   }
   mark(1);
@@ -195,11 +231,11 @@ __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_c
     V4 b;
 #pragma unroll
     for (int i = 0; i < 4; ++i) b.x[i] = h.x[i] * inv;
-    store_f4(after_wait(p.bank_partial), t, b);
+    store_f4(after_wait(p.bank_partial) + r * D1, t, b);
   }
   if (!p.next_hidden) return;
   // the next visit: block residual (the output just computed, or the prelude output at a pass start)
-  const V4 x = (have_h && p.next_hidden == p.hidden_out) ? h : load_b4(after_wait(p.next_hidden), t);
+  const V4 x = (have_h && p.next_hidden == p.hidden_out) ? h : load_b4(after_wait(p.next_hidden) + r * D1, t);
   V4 nr;
   {
     float v[1] = {sumsq(x)};
@@ -207,15 +243,15 @@ __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_c
     const float inv = inv_rms(v[0], kHidden);
 #pragma unroll
     for (int i = 0; i < 4; ++i) nr.x[i] = x.x[i] * inv;
-    store_f4(after_wait(p.normed_res), t, nr);
+    store_f4(after_wait(p.normed_res) + r * D1, t, nr);
   }
   mark(2);
-  float* att = after_wait(p.att_in);
+  float* att = after_wait(p.att_in) + r * 3 * D1;
   V4 att_v[3];
   if (p.nq) {
     V4 src[kMaxBlocks + 1];
 #pragma unroll
-    for (int s = 0; s < kMaxBlocks; ++s) src[s] = s < p.n_blocks ? load_f4(after_wait(p.blocks[s]), t) : V4{};
+    for (int s = 0; s < kMaxBlocks; ++s) src[s] = s < p.n_blocks ? load_f4(after_wait(p.blocks[s]) + r * D1, t) : V4{};
     // the partial (normed residual) is source n_blocks
 #pragma unroll
     for (int s = 0; s <= kMaxBlocks; ++s)
@@ -231,9 +267,9 @@ __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_c
   // loop passes 2 and 3: messages over the bank, and the gate inputs concat(rms(h_g), rms(m_g)) in BF16
   V4 msg[4];
   {
-    V4 src[2] = {load_f4(after_wait(p.bank_block), t), load_f4(after_wait(p.bank_state), t)};
+    V4 src[2] = {load_f4(after_wait(p.bank_block) + r * D1, t), load_f4(after_wait(p.bank_state) + r * D1, t)};
     depth_attention<2, 4>(src, 2, p.message_query, 4, msg, red);
-    float* mo = after_wait(p.messages_out);
+    float* mo = after_wait(p.messages_out) + r * 4 * D1;
 #pragma unroll
     for (int q = 0; q < 4; ++q) store_f4(mo + q * kHidden, t, msg[q]);
   }
@@ -255,28 +291,42 @@ __global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_c
       a.x[i] = hg.x[i] * ih;
       b.x[i] = msg[g].x[i] * im;
     }
-    store_b4(gin + g * 2 * kHidden, t, a);
-    store_b4(gin + g * 2 * kHidden + kHidden, t, b);
+    uint16_t* gr = gin + (size_t(g) * R + r) * 2 * kHidden;
+    store_b4(gr, t, a);
+    store_b4(gr + kHidden, t, b);
   }
   mark(4);
 }
 
 __global__ void __launch_bounds__(kThreads) post_attention_kernel(const __grid_constant__ PostAttentionParams p) {
   __shared__ float red[8][33];
-  if (prefetch_block(p.prefetch, 1)) return;
+  const int R = p.rows < 1 ? 1 : p.rows;
+  if (prefetch_block(p.prefetch, R)) return;
   pdl_wait();
   pdl_launch();
   const int t = threadIdx.x;
-  const V4 o = load_b4(after_wait(p.attn_out), t);
-  const V4 br = load_b4(after_wait(p.block_residual), t);
+  const int row = blockIdx.x;
+  const size_t D1 = kHidden;
+  const uint16_t* ao = after_wait(p.attn_out);
+  const V4 o = load_b4(ao + row * D1, t);
+  const V4 br = load_b4(after_wait(p.block_residual) + row * D1, t);
   V4 src[kMaxBlocks + 1];
 #pragma unroll
-  for (int s = 0; s < kMaxBlocks; ++s) src[s] = s < p.n_blocks ? load_f4(after_wait(p.blocks[s]), t) : V4{};
-  const V4 c = short_conv4(after_wait(p.attn_conv_state), p.attn_conv_w, t, o);
+  for (int s = 0; s < kMaxBlocks; ++s) src[s] = s < p.n_blocks ? load_f4(after_wait(p.blocks[s]) + row * D1, t) : V4{};
+  V4 c;
+  if (p.stage) {
+    V4 prev[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) prev[j] = row - 3 + j >= 0 ? load_b4(ao + (row - 3 + j) * D1, t) : V4{};
+    c = staged_conv4(after_wait(p.attn_conv_state), prev, row, p.attn_conv_w, t, o);
+    store_b4(after_wait(p.stage) + row * D1, t, o);
+  } else {
+    c = short_conv4(after_wait(p.attn_conv_state), p.attn_conv_w, t, o);
+  }
   V4 r;
 #pragma unroll
   for (int i = 0; i < 4; ++i) r.x[i] = p.boundary ? c.x[i] : br.x[i] + c.x[i];
-  store_f4(after_wait(p.residual), t, r);
+  store_f4(after_wait(p.residual) + row * D1, t, r);
   float v[1] = {sumsq(r)};
   block_sums<1>(v, red);
   const float inv = inv_rms(v[0], kHidden);
@@ -288,9 +338,9 @@ __global__ void __launch_bounds__(kThreads) post_attention_kernel(const __grid_c
     if (s == p.n_blocks) src[s] = nr;
   V4 mi[1];
   depth_attention<kMaxBlocks + 1, 1>(src, p.n_blocks + 1, p.mlp_query, 1, mi, red);
-  store_f4(after_wait(p.mlp_in), t, mi[0]);
+  store_f4(after_wait(p.mlp_in) + row * D1, t, mi[0]);
   if (!p.message) return;
-  const V4 m = load_f4(after_wait(p.message), t);
+  const V4 m = load_f4(after_wait(p.message) + row * 4 * D1, t);
   float u[2] = {sumsq(mi[0]), sumsq(m)};
   block_sums<2>(u, red);
   const float ih = inv_rms(u[0], kHidden), im = inv_rms(u[1], kHidden);
@@ -300,7 +350,7 @@ __global__ void __launch_bounds__(kThreads) post_attention_kernel(const __grid_c
     a.x[i] = mi[0].x[i] * ih;
     b.x[i] = m.x[i] * im;
   }
-  uint16_t* gin = after_wait(p.gate_in);
+  uint16_t* gin = after_wait(p.gate_in) + row * 2 * D1;
   store_b4(gin, t, a);
   store_b4(gin + kHidden, t, b);
 }
@@ -310,8 +360,9 @@ __global__ void __launch_bounds__(kThreads) post_attention_kernel(const __grid_c
 __global__ void __launch_bounds__(256) gate_mix_kernel(const __grid_constant__ GateMixParams p) {
   const int D = kHidden;
   const int lane8 = threadIdx.x & 7;
-  const int j = (blockIdx.x * 256 + threadIdx.x) >> 3;          // output over all gates
-  const int g = j / D, c = j - g * D;
+  const int R = p.rows < 1 ? 1 : p.rows;
+  const int j = (blockIdx.x * 256 + threadIdx.x) >> 3;          // output over all gates and rows
+  const int g = j / (D * R), rc = j - g * D * R, r = rc / D, c = rc - r * D;
   const bool live = g < p.count;
   const uint4 fw = live ? ldg_stream(static_cast<const uint16_t*>(p.forget[g]) + size_t(c) * 64 + lane8 * 8) : uint4{};
   const uint4 gw = live ? ldg_stream(static_cast<const uint16_t*>(p.gain[g]) + size_t(c) * 64 + lane8 * 8) : uint4{};
@@ -319,7 +370,7 @@ __global__ void __launch_bounds__(256) gate_mix_kernel(const __grid_constant__ G
   pdl_launch();
   float f = 0.0f, gn = 0.0f;
   if (live) {
-    const uint16_t* s = after_wait(p.states[g]) + lane8 * 8;
+    const uint16_t* s = after_wait(p.states[g]) + r * 64 + lane8 * 8;
     const uint32_t fv[4] = {fw.x, fw.y, fw.z, fw.w}, gv[4] = {gw.x, gw.y, gw.z, gw.w};
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -333,8 +384,8 @@ __global__ void __launch_bounds__(256) gate_mix_kernel(const __grid_constant__ G
   f = warp_sum<8>(f);
   gn = warp_sum<8>(gn);
   if (live && lane8 == 0) {
-    const float h = after_wait(p.h[g])[c], m = after_wait(p.m[g])[c];
-    after_wait(p.out[g])[c] = (1.0f - tanhf(f)) * h + tanhf(gn) * m;
+    const float h = after_wait(p.h[g])[size_t(r) * p.h_stride + c], m = after_wait(p.m[g])[size_t(r) * p.m_stride + c];
+    after_wait(p.out[g])[size_t(r) * p.out_stride + c] = (1.0f - tanhf(f)) * h + tanhf(gn) * m;
   }
 }
 
@@ -343,17 +394,21 @@ __global__ void __launch_bounds__(256) gate_mix_kernel(const __grid_constant__ G
 void visit_boundary(const BoundaryParams& p, cudaStream_t stream) {
   if (p.n_blocks < 0 || p.n_blocks > kMaxBlocks || p.nq < 0 || p.nq > 3)
     throw std::invalid_argument("visit_boundary: bad block or query count");
-  launch_pdl(visit_boundary_kernel, dim3(p.prefetch.count ? 1 + kPrefetchBlocks : 1), dim3(kThreads), 0, stream, p);
+  const int R = p.rows < 1 ? 1 : p.rows;
+  if (R > kMaxRows) throw std::invalid_argument("visit_boundary: at most 8 rows");
+  launch_pdl(visit_boundary_kernel, dim3(R + (p.prefetch.count ? kPrefetchBlocks : 0)), dim3(kThreads), 0, stream, p);
 }
 
 void post_attention(const PostAttentionParams& p, cudaStream_t stream) {
   if (p.n_blocks < 1 || p.n_blocks > kMaxBlocks) throw std::invalid_argument("post_attention: bad block count");
-  launch_pdl(post_attention_kernel, dim3(p.prefetch.count ? 1 + kPrefetchBlocks : 1), dim3(kThreads), 0, stream, p);
+  const int R = p.rows < 1 ? 1 : p.rows;
+  if (R > kMaxRows) throw std::invalid_argument("post_attention: at most 8 rows");
+  launch_pdl(post_attention_kernel, dim3(R + (p.prefetch.count ? kPrefetchBlocks : 0)), dim3(kThreads), 0, stream, p);
 }
 
 void gate_mix(const GateMixParams& p, cudaStream_t stream) {
   if (p.count < 1 || p.count > 3) throw std::invalid_argument("gate_mix: 1 to 3 gates");
-  const int outputs = p.count * kHidden;
+  const int outputs = p.count * kHidden * (p.rows < 1 ? 1 : p.rows);
   launch_pdl(gate_mix_kernel, dim3((outputs * 8 + 255) / 256), dim3(256), 0, stream, p);
 }
 

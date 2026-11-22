@@ -126,7 +126,178 @@ __global__ void __launch_bounds__(kThreads) gemv_multi_kernel(const __grid_const
   }
 }
 
+// Several rows: the inputs staged as BF16 [rows][k] (the values the one-row kernel computes in FP32 are BF16
+// values), the same prologue arithmetic per row, R accumulators per lane in the one-row order.
+__global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_constant__ GemvParams p) {
+  extern __shared__ __align__(16) uint16_t xb[];
+  int t = 0;
+  while (t + 1 < p.count && int(blockIdx.x) >= p.block_start[t + 1]) ++t;
+  const GemvTask& task = p.task[t];
+  const int row = (int(blockIdx.x) - p.block_start[t]) * kRows + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  const int k = task.k, R = task.rows < 1 ? 1 : task.rows;
+  const size_t xs = task.x_stride ? task.x_stride : k;
+  const bool live = row < task.n;
+  const uint4* w = reinterpret_cast<const uint4*>(task.w) + (live ? size_t(row) * (k / 8) : 0);
+  prefetch_share(p.prefetch);
+  pdl_wait();
+  pdl_launch();
+  const void* xin = after_wait(task.x);
+  // all rows at once: each thread visits the elements t, t + 256, ... of every row in the one-row order
+  if (task.prologue == kGemvNorm) {
+    __shared__ float rp[kRows][kMaxRows];
+    float ss[kMaxRows];
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) ss[r] = 0.0f;
+    for (int i = threadIdx.x; i < k; i += kThreads) {
+#pragma unroll
+      for (int r = 0; r < kMaxRows; ++r) {
+        if (r >= R) break;
+        const float v = task.x_f32 ? static_cast<const float*>(xin)[r * xs + i]
+                                   : bf16_to_f32(static_cast<const uint16_t*>(xin)[r * xs + i]);
+        ss[r] = fmaf(v, v, ss[r]);
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) {
+      if (r >= R) break;
+      const float s = warp_sum(ss[r]);
+      if ((threadIdx.x & 31) == 0) rp[threadIdx.x >> 5][r] = s;
+    }
+    __syncthreads();
+    float inv[kMaxRows];
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) {
+      float tot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kRows; ++i) tot += r < R ? rp[i][r] : 0.0f;
+      inv[r] = 1.0f / sqrtf(tot / float(k) + 1e-6f);
+    }
+    const uint16_t* nw = static_cast<const uint16_t*>(task.aux);
+    for (int i = threadIdx.x; i < k; i += kThreads) {
+      const float wv = bf16_to_f32(nw[i]);
+#pragma unroll
+      for (int r = 0; r < kMaxRows; ++r) {
+        if (r >= R) break;
+        const float v = task.x_f32 ? static_cast<const float*>(xin)[r * xs + i]
+                                   : bf16_to_f32(static_cast<const uint16_t*>(xin)[r * xs + i]);
+        xb[r * k + i] = f32_to_bf16_bits(v * inv[r] * wv);
+      }
+    }
+  } else if (task.prologue == kGemvGate) {
+    const uint16_t* gate = static_cast<const uint16_t*>(after_wait(task.aux));
+    for (int i = threadIdx.x; i < k; i += kThreads)
+#pragma unroll
+      for (int r = 0; r < kMaxRows; ++r) {
+        if (r >= R) break;
+        const float x = bf16_to_f32(static_cast<const uint16_t*>(xin)[r * xs + i]);
+        xb[r * k + i] = f32_to_bf16_bits(x * (1.0f / (1.0f + expf(-bf16_to_f32(gate[size_t(r) * k + i])))));
+      }
+  } else {
+    for (int i = threadIdx.x; i < k / 8; i += kThreads)
+#pragma unroll
+      for (int r = 0; r < kMaxRows; ++r) {
+        if (r >= R) break;
+        reinterpret_cast<uint4*>(xb + r * k)[i] = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(xin) + r * xs)[i];
+      }
+  }
+  __syncthreads();
+  if (!live) return;
+  float acc[kMaxRows];
+#pragma unroll
+  for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.0f;
+  const int k8 = k / 8;
+  auto step = [&](const uint4& v, int i) {
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) {
+      if (r >= R) break;
+      const uint4 xv = reinterpret_cast<const uint4*>(xb + r * k)[i];
+      const float xf[8] = {bf16lo(xv.x), bf16hi(xv.x), bf16lo(xv.y), bf16hi(xv.y),
+                           bf16lo(xv.z), bf16hi(xv.z), bf16lo(xv.w), bf16hi(xv.w)};
+      acc[r] += dot8(v, xf);
+    }
+  };
+  constexpr int kUnroll = 9;
+  int i = lane;
+  for (; i + 32 * (kUnroll - 1) < k8; i += 32 * kUnroll) {
+    uint4 v[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) v[u] = ldg_stream(w + i + 32 * u);
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) step(v[u], i + 32 * u);
+  }
+  for (; i < k8; i += 32) step(ldg_stream(w + i), i);
+  void* y = after_wait(task.y);
+#pragma unroll
+  for (int r = 0; r < kMaxRows; ++r) {
+    if (r >= R) break;
+    const float s = warp_sum(acc[r]);
+    if (lane == 0) {
+      if (task.y_f32) static_cast<float*>(y)[size_t(r) * task.n + row] = s;
+      else static_cast<uint16_t*>(y)[size_t(r) * task.n + row] = f32_to_bf16_bits(s);
+    }
+  }
+}
+
+struct NormRowsParams {
+  NormRowsTask task[kMaxNormTasks];
+  int block_start[kMaxNormTasks + 1];
+  int count;
+};
+
+// One block per (task, row): the staging and the arithmetic of gemv_multi_kernel's kGemvNorm prologue.
+__global__ void __launch_bounds__(kThreads) norm_rows_kernel(const __grid_constant__ NormRowsParams p) {
+  extern __shared__ float xs[];
+  __shared__ float part[kRows];
+  int t = 0;
+  while (t + 1 < p.count && int(blockIdx.x) >= p.block_start[t + 1]) ++t;
+  const NormRowsTask& task = p.task[t];
+  const int r = int(blockIdx.x) - p.block_start[t];
+  const int k = task.k;
+  const size_t stride = task.x_stride ? task.x_stride : k;
+  pdl_wait();
+  pdl_launch();
+  const void* xin = after_wait(task.x);
+  for (int i = threadIdx.x; i < k; i += kThreads)
+    xs[i] = task.x_f32 ? static_cast<const float*>(xin)[r * stride + i]
+                       : bf16_to_f32(static_cast<const uint16_t*>(xin)[r * stride + i]);
+  __syncthreads();
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < k; i += kThreads) ss = fmaf(xs[i], xs[i], ss);
+  ss = warp_sum(ss);
+  if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  float tot = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kRows; ++i) tot += part[i];
+  const float inv = 1.0f / sqrtf(tot / float(k) + 1e-6f);
+  uint16_t* out = after_wait(task.out) + size_t(r) * k;
+  for (int i = threadIdx.x; i < k; i += kThreads) out[i] = f32_to_bf16_bits(xs[i] * inv * bf16_to_f32(task.w[i]));
+}
+
 }  // namespace
+
+void norm_rows(const NormRowsTask* tasks, int count, cudaStream_t stream) {
+  if (count < 1 || count > kMaxNormTasks) throw std::invalid_argument("norm_rows: 1 to 4 tasks");
+  NormRowsParams p = {};
+  p.count = count;
+  int blocks = 0, max_k = 0;
+  for (int t = 0; t < count; ++t) {
+    const NormRowsTask& task = tasks[t];
+    if (!task.x || !task.w || !task.out || task.k < 8 || task.rows < 1 || task.rows > kMaxRows)
+      throw std::invalid_argument("norm_rows: task needs pointers, k >= 8 and 1 to 8 rows");
+    p.task[t] = task;
+    p.block_start[t] = blocks;
+    blocks += task.rows;
+    max_k = task.k > max_k ? task.k : max_k;
+  }
+  p.block_start[count] = blocks;
+  const size_t smem = size_t(max_k) * sizeof(float);
+  if (smem > 48 * 1024)
+    check_cuda(cudaFuncSetAttribute(norm_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
+               "norm_rows smem");
+  launch_pdl(norm_rows_kernel, dim3(blocks), dim3(kThreads), smem, stream, p);
+}
 
 void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cudaStream_t stream) {
   if (count < 1 || count > kMaxGemvTasks) throw std::invalid_argument("gemv_multi: 1 to 8 tasks");
@@ -144,6 +315,22 @@ void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cuda
   }
   p.block_start[count] = blocks;
   p.prefetch = prefetch;
+  int max_rows = 1;
+  for (int t = 0; t < count; ++t) max_rows = tasks[t].rows > max_rows ? tasks[t].rows : max_rows;
+  if (max_rows > 1) {
+    size_t smem = 0;
+    for (int t = 0; t < count; ++t) {
+      const GemvTask& task = tasks[t];
+      const int r = task.rows < 1 ? 1 : task.rows;
+      if (r > kMaxRows) throw std::invalid_argument("gemv_multi: at most 8 rows");
+      if (task.x_f32 && task.prologue != kGemvNorm) throw std::invalid_argument("gemv_multi: FP32 rows need the norm");
+      smem = smem > size_t(r) * task.k * 2 ? smem : size_t(r) * task.k * 2;
+    }
+    check_cuda(cudaFuncSetAttribute(gemv_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
+               "gemv_rows smem");
+    launch_pdl(gemv_rows_kernel, dim3(blocks), dim3(kThreads), smem, stream, p);
+    return;
+  }
   const size_t smem = size_t(p.max_k) * sizeof(float);
   if (smem > 48 * 1024)
     check_cuda(cudaFuncSetAttribute(gemv_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
