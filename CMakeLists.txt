@@ -1900,6 +1900,40 @@ else()
   message(STATUS "Flint kernels: DISABLED (set FLASHRT_ENABLE_FLINT=ON on sm_120)")
 endif()
 
+# ── Inkling-2-Mini (thinkingmachines) NVFP4 / MXFP8 kernels ──
+# Separate module, sm_120 only (block-scaled FP4 / FP8 mma.sync, RTX shared-memory budget). Without fast-math:
+# the softmax / sigmoid / softcap rounding follows the reference's IEEE operations.
+option(FLASHRT_ENABLE_INKLING2 "Build Inkling-2-Mini SM120 model kernels" OFF)
+if(FLASHRT_ENABLE_INKLING2 AND NOT GPU_ARCH STREQUAL "120")
+  message(FATAL_ERROR "FLASHRT_ENABLE_INKLING2 requires GPU_ARCH=120")
+endif()
+if(FLASHRT_ENABLE_INKLING2)
+  pybind11_add_module(flash_rt_inkling2
+    csrc/inkling2_bindings.cpp
+    csrc/kernels/inkling2/inkling2_gemv.cu
+    csrc/kernels/inkling2/inkling2_visit.cu
+    csrc/kernels/inkling2/inkling2_attention.cu
+    csrc/kernels/inkling2/inkling2_moe.cu
+    csrc/kernels/inkling2/inkling2_lmhead.cu)
+  set_target_properties(flash_rt_inkling2 PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_inkling2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_inkling2 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_inkling2 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_inkling2 LIBRARY DESTINATION flash_rt)
+  message(STATUS "Inkling-2-Mini kernels: ENABLED (separate module flash_rt_inkling2)")
+else()
+  message(STATUS "Inkling-2-Mini kernels: DISABLED (set FLASHRT_ENABLE_INKLING2=ON on sm_120)")
+endif()
+
 if(FLASHRT_BUILD_QWEN3_VL)
   # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official

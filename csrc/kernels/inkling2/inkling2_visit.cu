@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Per-visit vector kernels of the batch-one decode step (one 1024-thread block each: they reduce over the whole
+// 2304-wide residual): the visit boundary (expert combination, post-MLP short convolution and residual of the
+// previous visit, then the attention-input depth attention and the loop messages of the next one), the
+// post-attention step (short convolution, residual, block states, MLP-input depth attention) and the loop
+// controllers' gate mix. Semantics of mlx-lm's inkling2 layers: FP32 inside, BF16 where it stores BF16.
+
+#include "kernels/inkling2/inkling2_common.cuh"
+#include "kernels/inkling2/inkling2_kernels.cuh"
+
+namespace flash_rt {
+namespace inkling2 {
+
+namespace {
+
+// One block of 576 threads; thread t owns the 4 channels 4t .. 4t + 3 of the 2304-wide residual.
+constexpr int kThreads = kHidden / 4;
+constexpr int kWarps = kThreads / 32;
+
+struct V4 { float x[4]; };
+
+__device__ __forceinline__ V4 load_f4(const float* p, int t) {
+  const float4 v = reinterpret_cast<const float4*>(p)[t];
+  return {{v.x, v.y, v.z, v.w}};
+}
+__device__ __forceinline__ V4 load_b4(const uint16_t* p, int t) {
+  const uint2 v = reinterpret_cast<const uint2*>(p)[t];
+  return {{bf16lo(v.x), bf16hi(v.x), bf16lo(v.y), bf16hi(v.y)}};
+}
+__device__ __forceinline__ void store_f4(float* p, int t, const V4& v) {
+  reinterpret_cast<float4*>(p)[t] = make_float4(v.x[0], v.x[1], v.x[2], v.x[3]);
+}
+__device__ __forceinline__ void store_b4(uint16_t* p, int t, const V4& v) {
+  reinterpret_cast<uint2*>(p)[t] = make_uint2(uint32_t(f32_to_bf16_bits(v.x[0])) | (uint32_t(f32_to_bf16_bits(v.x[1])) << 16),
+                                              uint32_t(f32_to_bf16_bits(v.x[2])) | (uint32_t(f32_to_bf16_bits(v.x[3])) << 16));
+}
+__device__ __forceinline__ float sumsq(const V4& v) {
+  float s = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) s = fmaf(v.x[i], v.x[i], s);
+  return s;
+}
+
+// Block-wide sums of N per-thread values: warp sums, then warp 0 adds the per-warp partials; all threads get them.
+template <int N>
+__device__ __forceinline__ void block_sums(float (&v)[N], float (*red)[33]) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    const float s = warp_sum(v[i]);
+    if (lane == 0) red[i][warp] = s;
+  }
+  __syncthreads();
+  if (warp == 0) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      float s = lane < kWarps ? red[i][lane] : 0.0f;
+      s = warp_sum(s);
+      if (lane == 0) red[i][32] = s;
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] = red[i][32];
+  __syncthreads();
+}
+
+__device__ __forceinline__ float inv_rms(float sumsq_total, int d) { return 1.0f / sqrtf(sumsq_total / float(d) + 1e-6f); }
+
+// Depth attention for this thread's 4 channels: sources src[0..n) (registers), queries q[0..nq) (global FP32
+// [nq][kHidden]); out[q] = sum_s softmax_s(src_s . query_q / sqrt(d)) src_s.
+template <int MaxN, int MaxQ>
+__device__ __forceinline__ void depth_attention(const V4 (&src)[MaxN], int n, const float* query, int nq, V4 (&out)[MaxQ],
+                                                float (*red)[33]) {
+  const int t = threadIdx.x;
+  V4 qv[MaxQ];
+#pragma unroll
+  for (int q = 0; q < MaxQ; ++q) qv[q] = q < nq ? load_f4(query + q * kHidden, t) : V4{};
+  float part[MaxN * MaxQ];
+#pragma unroll
+  for (int s = 0; s < MaxN; ++s)
+#pragma unroll
+    for (int q = 0; q < MaxQ; ++q) {
+      float a = 0.0f;
+      if (s < n && q < nq) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) a = fmaf(src[s].x[i], qv[q].x[i], a);
+      }
+      part[s * MaxQ + q] = a;
+    }
+  block_sums<MaxN * MaxQ>(part, red);
+  const float scale = 1.0f / sqrtf(float(kHidden));
+#pragma unroll
+  for (int q = 0; q < MaxQ; ++q) {
+    if (q >= nq) break;
+    float m = -INFINITY;
+#pragma unroll
+    for (int s = 0; s < MaxN; ++s)
+      if (s < n) m = fmaxf(m, part[s * MaxQ + q] * scale);
+    float w[MaxN], z = 0.0f;
+#pragma unroll
+    for (int s = 0; s < MaxN; ++s) {
+      w[s] = s < n ? expf(part[s * MaxQ + q] * scale - m) : 0.0f;
+      z += w[s];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int s = 0; s < MaxN; ++s)
+        if (s < n) acc = fmaf(w[s] / z, src[s].x[i], acc);
+      out[q].x[i] = acc;
+    }
+  }
+}
+
+// Short convolution of the new row for 4 channels (mlx ShortConvolution, decode): window and conv in BF16 (FP32
+// sum, one rounding), (conv + x) / sqrt(K + 1) in BF16; state = the last K - 1 inputs, oldest first, shifted by one.
+__device__ __forceinline__ V4 short_conv4(uint16_t* __restrict__ state, const uint16_t* __restrict__ w, int t, const V4& x) {
+  const V4 s0 = load_b4(state, t), s1 = load_b4(state + kHidden, t), s2 = load_b4(state + 2 * kHidden, t);
+  const uint4 w01 = reinterpret_cast<const uint4*>(w)[2 * t], w23 = reinterpret_cast<const uint4*>(w)[2 * t + 1];
+  const uint32_t ww[8] = {w01.x, w01.y, w01.z, w01.w, w23.x, w23.y, w23.z, w23.w};   // channel c: 4 taps = 2 words
+  V4 out;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float conv = bf16lo(ww[2 * i]) * s0.x[i];
+    conv = fmaf(bf16hi(ww[2 * i]), s1.x[i], conv);
+    conv = fmaf(bf16lo(ww[2 * i + 1]), s2.x[i], conv);
+    conv = fmaf(bf16hi(ww[2 * i + 1]), x.x[i], conv);
+    out.x[i] = round_bf16((round_bf16(conv) + x.x[i]) / sqrtf(5.0f));
+  }
+  store_b4(state, t, s1);
+  store_b4(state + kHidden, t, s2);
+  store_b4(state + 2 * kHidden, t, x);
+  return out;
+}
+
+__global__ void __launch_bounds__(kThreads) visit_boundary_kernel(const __grid_constant__ BoundaryParams p) {
+  __shared__ float red[24][33];
+  if (prefetch_block(p.prefetch, 1)) return;
+  pdl_wait();
+  pdl_launch();
+  const int t = threadIdx.x;
+  auto mark = [&](int i) {
+    if (p.timing && t == 0) {
+      unsigned long long g;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(g));
+      p.timing[i] = g;
+    }
+  };
+  mark(0);
+  V4 h;                                   // the visit output (finish / embed), BF16 values
+  bool have_h = false;
+  if (p.finish) {
+    const uint16_t* __restrict__ y = after_wait(p.expert_out);
+    const float* __restrict__ rw = after_wait(p.route_w);
+    V4 ys[kTopK];
+#pragma unroll
+    for (int s = 0; s < kTopK; ++s) ys[s] = load_b4(y + s * kHidden, t);
+    const V4 res = load_f4(after_wait(p.residual), t);
+    float w[kTopK];
+#pragma unroll
+    for (int s = 0; s < kTopK; ++s) w[s] = rw[s];
+    V4 moe;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int s = 0; s < kTopK; ++s) acc = __fadd_rn(acc, __fmul_rn(ys[s].x[i], w[s]));
+      moe.x[i] = round_bf16(acc);
+    }
+    const V4 c = short_conv4(after_wait(p.mlp_conv_state), p.mlp_conv_w, t, moe);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h.x[i] = round_bf16(res.x[i] + c.x[i]);
+    store_b4(after_wait(p.hidden_out), t, h);
+    have_h = true;
+  } else if (p.embed) {
+    const int tok = *after_wait(p.token);
+    const V4 e = load_b4(p.embed_table + size_t(tok) * kHidden, t);
+    float v[1] = {sumsq(e)};
+    block_sums<1>(v, red);
+    const float inv = inv_rms(v[0], kHidden);
+    const V4 nw = load_b4(p.embed_norm, t);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h.x[i] = round_bf16(e.x[i] * inv * nw.x[i]);
+    store_b4(after_wait(p.hidden_out), t, h);
+    have_h = true;
+  }
+  mark(1);
+  if (p.bank_partial) {                   // end of a loop pass: the message bank's partial state rms(h)
+    float v[1] = {sumsq(h)};
+    block_sums<1>(v, red);
+    const float inv = inv_rms(v[0], kHidden);
+    V4 b;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) b.x[i] = h.x[i] * inv;
+    store_f4(after_wait(p.bank_partial), t, b);
+  }
+  if (!p.next_hidden) return;
+  // the next visit: block residual (the output just computed, or the prelude output at a pass start)
+  const V4 x = (have_h && p.next_hidden == p.hidden_out) ? h : load_b4(after_wait(p.next_hidden), t);
+  V4 nr;
+  {
+    float v[1] = {sumsq(x)};
+    block_sums<1>(v, red);
+    const float inv = inv_rms(v[0], kHidden);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) nr.x[i] = x.x[i] * inv;
+    store_f4(after_wait(p.normed_res), t, nr);
+  }
+  mark(2);
+  float* att = after_wait(p.att_in);
+  V4 att_v[3];
+  if (p.nq) {
+    V4 src[kMaxBlocks + 1];
+#pragma unroll
+    for (int s = 0; s < kMaxBlocks; ++s) src[s] = s < p.n_blocks ? load_f4(after_wait(p.blocks[s]), t) : V4{};
+    // the partial (normed residual) is source n_blocks
+#pragma unroll
+    for (int s = 0; s <= kMaxBlocks; ++s)
+      if (s == p.n_blocks) src[s] = nr;
+    depth_attention<kMaxBlocks + 1, 3>(src, p.n_blocks + 1, p.att_query, p.nq, att_v, red);
+    for (int q = 0; q < p.nq; ++q) store_f4(att + q * kHidden, t, att_v[q]);
+  } else {
+    att_v[0] = x;
+    store_f4(att, t, x);
+  }
+  mark(3);
+  if (!p.messages) return;
+  // loop passes 2 and 3: messages over the bank, and the gate inputs concat(rms(h_g), rms(m_g)) in BF16
+  V4 msg[4];
+  {
+    V4 src[2] = {load_f4(after_wait(p.bank_block), t), load_f4(after_wait(p.bank_state), t)};
+    depth_attention<2, 4>(src, 2, p.message_query, 4, msg, red);
+    float* mo = after_wait(p.messages_out);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) store_f4(mo + q * kHidden, t, msg[q]);
+  }
+  float v[6];
+#pragma unroll
+  for (int g = 0; g < 3; ++g) {
+    v[2 * g] = sumsq(p.nq == 3 ? att_v[g] : att_v[0]);
+    v[2 * g + 1] = sumsq(msg[g]);
+  }
+  block_sums<6>(v, red);
+  uint16_t* gin = after_wait(p.gate_in);
+#pragma unroll
+  for (int g = 0; g < 3; ++g) {
+    const V4& hg = p.nq == 3 ? att_v[g] : att_v[0];
+    const float ih = inv_rms(v[2 * g], kHidden), im = inv_rms(v[2 * g + 1], kHidden);
+    V4 a, b;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      a.x[i] = hg.x[i] * ih;
+      b.x[i] = msg[g].x[i] * im;
+    }
+    store_b4(gin + g * 2 * kHidden, t, a);
+    store_b4(gin + g * 2 * kHidden + kHidden, t, b);
+  }
+  mark(4);
+}
+
+__global__ void __launch_bounds__(kThreads) post_attention_kernel(const __grid_constant__ PostAttentionParams p) {
+  __shared__ float red[8][33];
+  if (prefetch_block(p.prefetch, 1)) return;
+  pdl_wait();
+  pdl_launch();
+  const int t = threadIdx.x;
+  const V4 o = load_b4(after_wait(p.attn_out), t);
+  const V4 br = load_b4(after_wait(p.block_residual), t);
+  V4 src[kMaxBlocks + 1];
+#pragma unroll
+  for (int s = 0; s < kMaxBlocks; ++s) src[s] = s < p.n_blocks ? load_f4(after_wait(p.blocks[s]), t) : V4{};
+  const V4 c = short_conv4(after_wait(p.attn_conv_state), p.attn_conv_w, t, o);
+  V4 r;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) r.x[i] = p.boundary ? c.x[i] : br.x[i] + c.x[i];
+  store_f4(after_wait(p.residual), t, r);
+  float v[1] = {sumsq(r)};
+  block_sums<1>(v, red);
+  const float inv = inv_rms(v[0], kHidden);
+  V4 nr;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) nr.x[i] = r.x[i] * inv;
+#pragma unroll
+  for (int s = 0; s <= kMaxBlocks; ++s)
+    if (s == p.n_blocks) src[s] = nr;
+  V4 mi[1];
+  depth_attention<kMaxBlocks + 1, 1>(src, p.n_blocks + 1, p.mlp_query, 1, mi, red);
+  store_f4(after_wait(p.mlp_in), t, mi[0]);
+  if (!p.message) return;
+  const V4 m = load_f4(after_wait(p.message), t);
+  float u[2] = {sumsq(mi[0]), sumsq(m)};
+  block_sums<2>(u, red);
+  const float ih = inv_rms(u[0], kHidden), im = inv_rms(u[1], kHidden);
+  V4 a, b;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    a.x[i] = mi[0].x[i] * ih;
+    b.x[i] = m.x[i] * im;
+  }
+  uint16_t* gin = after_wait(p.gate_in);
+  store_b4(gin, t, a);
+  store_b4(gin + kHidden, t, b);
+}
+
+// mixed_g = (1 - tanh(F_g s_g)) h_g + tanh(G_g s_g) m_g for each gate g: F_g, G_g [D][64] BF16 weights (FP32 in the
+// reference, BF16 values), s_g the 64 down-projected states (BF16), h_g / m_g FP32. Eight lanes per output.
+__global__ void __launch_bounds__(256) gate_mix_kernel(const __grid_constant__ GateMixParams p) {
+  const int D = kHidden;
+  const int lane8 = threadIdx.x & 7;
+  const int j = (blockIdx.x * 256 + threadIdx.x) >> 3;          // output over all gates
+  const int g = j / D, c = j - g * D;
+  const bool live = g < p.count;
+  const uint4 fw = live ? ldg_stream(static_cast<const uint16_t*>(p.forget[g]) + size_t(c) * 64 + lane8 * 8) : uint4{};
+  const uint4 gw = live ? ldg_stream(static_cast<const uint16_t*>(p.gain[g]) + size_t(c) * 64 + lane8 * 8) : uint4{};
+  pdl_wait();
+  pdl_launch();
+  float f = 0.0f, gn = 0.0f;
+  if (live) {
+    const uint16_t* s = after_wait(p.states[g]) + lane8 * 8;
+    const uint32_t fv[4] = {fw.x, fw.y, fw.z, fw.w}, gv[4] = {gw.x, gw.y, gw.z, gw.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float s0 = bf16_to_f32(s[2 * i]), s1 = bf16_to_f32(s[2 * i + 1]);
+      f = fmaf(bf16lo(fv[i]), s0, f);
+      f = fmaf(bf16hi(fv[i]), s1, f);
+      gn = fmaf(bf16lo(gv[i]), s0, gn);
+      gn = fmaf(bf16hi(gv[i]), s1, gn);
+    }
+  }
+  f = warp_sum<8>(f);
+  gn = warp_sum<8>(gn);
+  if (live && lane8 == 0) {
+    const float h = after_wait(p.h[g])[c], m = after_wait(p.m[g])[c];
+    after_wait(p.out[g])[c] = (1.0f - tanhf(f)) * h + tanhf(gn) * m;
+  }
+}
+
+}  // namespace
+
+void visit_boundary(const BoundaryParams& p, cudaStream_t stream) {
+  if (p.n_blocks < 0 || p.n_blocks > kMaxBlocks || p.nq < 0 || p.nq > 3)
+    throw std::invalid_argument("visit_boundary: bad block or query count");
+  launch_pdl(visit_boundary_kernel, dim3(p.prefetch.count ? 1 + kPrefetchBlocks : 1), dim3(kThreads), 0, stream, p);
+}
+
+void post_attention(const PostAttentionParams& p, cudaStream_t stream) {
+  if (p.n_blocks < 1 || p.n_blocks > kMaxBlocks) throw std::invalid_argument("post_attention: bad block count");
+  launch_pdl(post_attention_kernel, dim3(p.prefetch.count ? 1 + kPrefetchBlocks : 1), dim3(kThreads), 0, stream, p);
+}
+
+void gate_mix(const GateMixParams& p, cudaStream_t stream) {
+  if (p.count < 1 || p.count > 3) throw std::invalid_argument("gate_mix: 1 to 3 gates");
+  const int outputs = p.count * kHidden;
+  launch_pdl(gate_mix_kernel, dim3((outputs * 8 + 255) / 256), dim3(256), 0, stream, p);
+}
+
+}  // namespace inkling2
+}  // namespace flash_rt
