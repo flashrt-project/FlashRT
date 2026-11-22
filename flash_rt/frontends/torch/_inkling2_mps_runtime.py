@@ -348,10 +348,13 @@ class Inkling2Runtime(_MTPMixin):
     hybrid_limit = 1 << 30
     # NVFP4 experts (layers 0-19) of programs with more than gemv_rows and at most mma_limit rows: SIMD-group MMAs
     # over a load-time re-arranged copy of the expert weights (+11.5 GB; ink_nv_arrange / ink_experts_mma_*)
-    # instead of TensorOps tiles, experts with at most mma_rows rows on qmv. expert_mma = 0: no copy, TensorOps.
+    # instead of TensorOps tiles, experts with at most mma_rows rows on qmv. Up to mma_tile_rows rows a
+    # threadgroup runs all passes of one expert; above, one 32-row pass (scan tiles: large experts spread over
+    # many threadgroups). expert_mma = 0: no copy, TensorOps.
     expert_mma = 1
     mma_rows = 2
-    mma_limit = 512
+    mma_limit = 1 << 30
+    mma_tile_rows = 64
     expert_k32 = 64             # up to this many rows the gate/up tiles dequantize 32-input slices (64 otherwise)
     # expert tiles by row count (8 assignments per row over 128 experts: R / 16 rows per expert on average)
     expert_tiles = {64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
@@ -432,6 +435,7 @@ class Inkling2Runtime(_MTPMixin):
         mode0 = self._param(np.array([0], np.uint32).tobytes())
         mode1 = self._param(np.array([1], np.uint32).tobytes())
         tmp = self._param(np.array([tm, self.hybrid_rows if hybrid else 0], np.uint32).tobytes())
+        tmp_mma = self._param(np.array([32, self.mma_rows if hybrid else 0], np.uint32).tobytes())
         for v, (layer, pss) in enumerate(cfg.visits()):
             d = self.table[layer]
             full, msgs = cfg.is_global(layer), cfg.is_looped(layer) and pss > 0
@@ -521,15 +525,16 @@ class Inkling2Runtime(_MTPMixin):
                 self._gemm("ink_gemm_f32_rows", b["r_y"], 0, H, int(d[D_ROUTER]), E, H, b["r_rlog"], 0, E, 0, R, small)
             plan.dispatch("ink_route_rows", [W, T, (b["r_rlog"], 0, READ), (b["r_ids"], 0, WRITE), (b["r_rw"], 0, WRITE),
                           (b["r_counts"], 0, READ_WRITE), vis], ((R + 7) // 8, 1, 1), 256, label="route")
-            plan.dispatch("ink_expert_scan", [(b["r_counts"], 0, READ_WRITE), (b["r_starts"], 0, WRITE),
-                          (b["r_cursors"], 0, WRITE), (b["r_tiles"], 0, WRITE), (A, tmp, READ)], (1, 1, 1), 32,
-                          label="scan")
-            plan.dispatch("ink_expert_place_rows", [(b["r_ids"], 0, READ), (b["r_starts"], 0, READ),
-                          (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
-                          (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
             mx = 1 if int(d[D_FLAGS]) & 4 else 0
             mma = bool(self.expert_mma) and not gemv and not mx and R <= self.mma_limit
             few = (self.mma_rows if mma else self.hybrid_rows) if hybrid else 0
+            mtiles = mma and R > self.mma_tile_rows
+            plan.dispatch("ink_expert_scan", [(b["r_counts"], 0, READ_WRITE), (b["r_starts"], 0, WRITE),
+                          (b["r_cursors"], 0, WRITE), (b["r_tiles"], 0, WRITE), (A, tmp_mma if mtiles else tmp, READ)],
+                          (1, 1, 1), 32, label="scan")
+            plan.dispatch("ink_expert_place_rows", [(b["r_ids"], 0, READ), (b["r_starts"], 0, READ),
+                          (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
+                          (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
             if gemv or few:
                 # per-expert qmv: every expert (gemv) or the experts with at most `few` rows (hybrid)
                 limit = few
@@ -549,9 +554,15 @@ class Inkling2Runtime(_MTPMixin):
                         ("ink_experts_mma_down", ad, ads, D_GS2, I, H, H, "r_act", "r_ep")):
                     prm = self._param(np.array([codes, scales, d[gs]], np.uint64).tobytes() +
                                       np.array([k, wrows, few, nout], np.uint32).tobytes())
-                    plan.dispatch(name, [W, (b["arranged"], 0, READ), (b[src], 0, READ), (b[dst], 0, WRITE),
-                                         (A, prm, READ), (b["r_starts"], 0, READ)], (wrows // 64, E, 1), 256,
-                                  label=name)
+                    if mtiles:
+                        plan.dispatch(name + "_tiles", [W, (b["arranged"], 0, READ), (b[src], 0, READ),
+                                      (b[dst], 0, WRITE), (A, prm, READ), (b["r_starts"], 0, READ),
+                                      (b["r_tiles"], 0, READ)], (wrows // 64, (R * 8 + 31) // 32 + E, 1), 256,
+                                      label=name)
+                    else:
+                        plan.dispatch(name, [W, (b["arranged"], 0, READ), (b[src], 0, READ), (b[dst], 0, WRITE),
+                                             (A, prm, READ), (b["r_starts"], 0, READ)], (wrows // 64, E, 1), 256,
+                                      label=name)
             tiles_y = (R * 8 + tm - 1) // tm + E
             for name, w, s_, gs, k, n_out, src, dst in (() if (gemv or mma) else (
                     ("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I, "r_xp", "r_act"),

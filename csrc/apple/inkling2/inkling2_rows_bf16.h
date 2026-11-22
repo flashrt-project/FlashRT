@@ -879,6 +879,42 @@ kernel void NAME(const device uchar* weights [[buffer(0)]],const device uchar* a
 }
 INK_EXPERTS_MMA(ink_experts_mma_gateup,true)
 INK_EXPERTS_MMA(ink_experts_mma_down,false)
+// One 32-row pass per threadgroup row: g.y indexes the row tiles of ink_expert_scan (tile_starts, 32 rows per tile,
+// experts with at most the qmv threshold have none), so large experts spread over many threadgroups.
+template<bool GATEUP>
+inline void experts_mma_tiles(const device uchar* weights,const device uchar* arranged,const device ushort* xin,
+                              device ushort* out,constant ExpertsMma& p,const device uint* starts,
+                              const device uint* tile_starts,uint2 g,uint lane,uint simd,const threadgroup float* lut) {
+    if(g.y>=tile_starts[128])return;
+    uint lo=0u,hi=128u;
+    while(hi-lo>1u){const uint mid=(lo+hi)/2u;if(tile_starts[mid]<=g.y)lo=mid;else hi=mid;}
+    const uint e=lo,a1=starts[e+1],b0=starts[e]+(g.y-tile_starts[e])*32u;
+    const uint blk=g.x*8u+simd,nrb=p.wrows/8u;
+    if(blk>=nrb||b0>=a1)return;
+    const uint K=p.k,nkb=K/128u;
+    const ushort fm=((lane/4u)&4u)+(lane/2u)%4u,fn=((lane/4u)&2u)*2u+(lane%2u)*2u;
+    const device uint4* cb=(const device uint4*)(arranged+p.codes)+(size_t(e)*nrb+blk)*nkb*32u+lane;
+    const device uchar* sb=arranged+p.scales+(size_t(e)*nrb+blk)*nkb*64u;
+    const float inv=fdiv(((const device float*)(weights+p.gs))[e],2688.0f);
+    const uint n=a1-b0;
+    if(n>24u)experts_mma_pass<GATEUP,4>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+    else if(n>16u)experts_mma_pass<GATEUP,3>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+    else if(n>8u)experts_mma_pass<GATEUP,2>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+    else experts_mma_pass<GATEUP,1>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+}
+#define INK_EXPERTS_MMA_TILES(NAME,GATEUP) \
+kernel void NAME(const device uchar* weights [[buffer(0)]],const device uchar* arranged [[buffer(1)]], \
+    const device ushort* xin [[buffer(2)]],device ushort* out [[buffer(3)]],constant ExpertsMma& p [[buffer(4)]], \
+    const device uint* starts [[buffer(5)]],const device uint* tile_starts [[buffer(6)]], \
+    uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]], \
+    uint simd [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float lut[16]; \
+    if(simd==0u&&lane<16u)lut[lane]=e2m1(lane); \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    experts_mma_tiles<GATEUP>(weights,arranged,xin,out,p,starts,tile_starts,g,lane,simd,lut); \
+}
+INK_EXPERTS_MMA_TILES(ink_experts_mma_gateup_tiles,true)
+INK_EXPERTS_MMA_TILES(ink_experts_mma_down_tiles,false)
 // ---- debug: copy the hidden rows after a visit into trace[visit]
 kernel void ink_trace_rows(const device ushort* h [[buffer(0)]],device ushort* trace [[buffer(1)]],
     constant uint& n [[buffer(2)]],uint i [[thread_position_in_grid]]) {if(i<n)trace[i]=h[i];}
