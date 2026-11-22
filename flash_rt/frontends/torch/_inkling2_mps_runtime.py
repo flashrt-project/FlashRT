@@ -18,6 +18,7 @@ import numpy as np
 
 from flash_rt.hardware.apple_native.native import READ, READ_WRITE, WRITE, NativePlan
 from flash_rt.models.inkling2.checkpoint import Inkling2Checkpoint, Inkling2ConfigError, check_geometry
+from flash_rt.frontends.torch._inkling2_mtp import MTP_BLOCK, _MTPMixin
 
 WORKERS = 36
 THREADS = 256
@@ -65,15 +66,23 @@ def global_scale(amax: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     return (amax.astype(np.float32) * scale).astype(np.float32)
 
 
-class Inkling2Runtime:
+class Inkling2Runtime(_MTPMixin):
     """Owns the Metal plan, the buffers and the decode programs (batch 1)."""
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, library: Optional[str] = None,
-                 sequences: int = 1, row_capacity: int = 1024, row_shapes=None, trace_rows: bool = False):
+                 sequences: int = 1, row_capacity: int = 1024, row_shapes=None, trace_rows: bool = False,
+                 mtp_batches: Sequence[int] = (), mtp_prefill: Sequence[int] = ()):
         """``sequences``: KV / conv-state slots (batched decode); ``row_capacity``: rows of a prefill chunk or a
-        batched decode step."""
+        batched decode step. ``mtp_batches`` / ``mtp_prefill``: batch sizes and prompt lengths of DSpark
+        speculative decoding programs (mtp.safetensors; see _inkling2_mtp)."""
         if max_seq < 1 or sequences < 1 or row_capacity < 1:
             raise ValueError("max_seq, sequences and row_capacity must be positive")
+        self.mtp_batches, self.mtp_prefill = [int(c) for c in mtp_batches], [int(p) for p in mtp_prefill]
+        self.mtp = bool(self.mtp_batches)
+        if self.mtp:
+            row_capacity = max(int(row_capacity), MTP_BLOCK * max(self.mtp_batches), *self.mtp_prefill)
+            if max(self.mtp_batches) > sequences:
+                raise ValueError("MTP batch sizes must not exceed sequences")
         self.sequences, self.row_capacity = int(sequences), int(row_capacity)
         self.trace_rows = bool(trace_rows)
         self.row_shapes = None if row_shapes is None else [tuple(x) for x in row_shapes]
@@ -90,12 +99,18 @@ class Inkling2Runtime:
         started = time.perf_counter()
         self._upload_weights()
         self.ckpt.close()
+        if self.mtp:
+            self._mtp_file.close()
         self._allocate_state()
         self._allocate_rows()
+        if self.mtp:
+            self._mtp_allocate()
         self.programs = {name: self._record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
         self.row_programs: Dict[tuple, int] = {}
         for rows, logit_rows in self._row_shapes():
             self.row_programs[(rows, logit_rows)] = self._record_rows(rows, logit_rows)
+        if self.mtp:
+            self._mtp_record()
         self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
         self.plan.finish(resident=True)
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
@@ -200,6 +215,8 @@ class Inkling2Runtime:
             row[V_LAYER], row[V_PASS], row[V_KV], row[V_CAP], row[V_RING] = layer, p, kv_offset, cap, ring_offset
             kv_offset += 2 * dkv * cap
             ring_offset += 4 * RING_FRAME
+        if self.mtp:
+            self._mtp_upload(layout)
         self.weight_bytes = layout.size
         self.buf["weights"] = self.plan.buffer(layout.size)
         dst = self.plan.view(self.buf["weights"], np.uint8, layout.size)
@@ -244,7 +261,8 @@ class Inkling2Runtime:
             "r_resid": C * H * f32, "r_y": C * H * bf, "r_rlog": C * 128 * f32, "r_ids": C * 8 * 4, "r_rw": C * 8 * f32,
             "r_slot": C * 8 * 4, "r_counts": 128 * 4, "r_starts": 129 * 4, "r_cursors": 128 * 4, "r_tiles": 129 * 4,
             "r_xp": C * 8 * H * bf, "r_act": C * 8 * 1152 * bf, "r_ep": C * 8 * H * bf, "r_moe": C * H * bf,
-            "r_xf": C * H * bf, "r_logits": max(lr for _, lr in self._row_shapes()) * self.cfg.vocab_size * f32,
+            "r_xf": C * H * bf, "r_logits": max([lr for _, lr in self._row_shapes()] +
+                                                [MTP_BLOCK * c for c in self.mtp_batches]) * self.cfg.vocab_size * f32,
             "r_out": C * 4,
             "args": 4 << 20, "r_trace": (48 * C * H * bf if self.trace_rows else 4),
         }
@@ -279,8 +297,9 @@ class Inkling2Runtime:
     # rows take the qmv kernel, the others TensorOps tiles (a tile pays its weights for up to tile_m rows).
     gemv_rows = 4
     hybrid_rows = 3
-    hybrid_limit = 64
-    expert_tiles = {4: (8, 64, 4), 16: (8, 32, 2), 64: (8, 32, 2)}
+    hybrid_limit = 1 << 30
+    # expert tiles by row count (8 assignments per row over 128 experts: R / 16 rows per expert on average)
+    expert_tiles = {4: (8, 64, 4), 64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
 
     @staticmethod
     def _pick(table, rows):
@@ -336,9 +355,11 @@ class Inkling2Runtime:
                            (yf[0], yf[1], READ_WRITE), (self.buf["args"], prm, READ)],
                            ((units + 7) // 8, 1, 1), 256, label=label)
 
-    def _record_rows(self, R: int, logit_rows: int) -> int:
+    def _record_rows(self, R: int, logit_rows: int, stage: bool = False, features: bool = False) -> int:
         """Program for R rows (rows_info and tokens written per run): all 48 visits, then the logits of the last
-        ``logit_rows`` rows (softcapped FP32) and their greedy tokens."""
+        ``logit_rows`` rows (softcapped FP32) and their greedy tokens. ``stage``: conv frames and sliding K / V
+        staged for ink_commit_rows (speculative verification); ``features``: the drafter features of every row
+        (m_feat: the hidden state after visits 4, 22, 40 and the final normalized state)."""
         cfg, b, plan = self.cfg, self.buf, self.plan
         H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
         small = R <= 64
@@ -478,9 +499,20 @@ class Inkling2Runtime:
                               (b["r_rw"], 0, READ), (b["r_resid"], 0, READ), (b["r_moe"], 0, READ_WRITE),
                               (b["r_h"], 0, WRITE), (b["r_bank"], 0, WRITE), (b["rings"], 0, READ), (A, prm, READ),
                               (b["r_info"], 0, READ)], (R, 1, 1), 256, label=lbl)
-            plan.dispatch("ink_ring_rows", [(P, 0, READ), (b["r_o"], 0, READ), (b["r_moe"], 0, READ),
-                          (b["r_chunk"], 0, READ), (b["rings"], 0, WRITE), (b["kv"], 0, READ_WRITE), vis,
-                          (b["r_info"], 0, READ)], (R, 1, 1), 256, label="ring")
+            if stage:
+                vix = self._param(np.array([v], np.uint32).tobytes())
+                plan.dispatch("ink_ring_stage_rows", [(P, 0, READ), (b["r_o"], 0, READ), (b["r_moe"], 0, READ),
+                              (b["r_chunk"], 0, READ), (b["m_stage"], 0, WRITE), vis, (A, vix, READ)], (R, 1, 1), 256,
+                              label="ring_stage")
+            else:
+                plan.dispatch("ink_ring_rows", [(P, 0, READ), (b["r_o"], 0, READ), (b["r_moe"], 0, READ),
+                              (b["r_chunk"], 0, READ), (b["rings"], 0, WRITE), (b["kv"], 0, READ_WRITE), vis,
+                              (b["r_info"], 0, READ)], (R, 1, 1), 256, label="ring")
+            if features and v in (4, 22, 40):     # the hidden state entering visits 5, 23, 41
+                n = R * H
+                cnt = self._param(np.array([n], np.uint32).tobytes())
+                plan.dispatch("ink_trace_rows", [(b["r_h"], 0, READ), (b["m_feat"], (4, 22, 40).index(v) * n * 2, WRITE),
+                                                 (A, cnt, READ)], ((n + 255) // 256, 1, 1), 256, label="feature")
             if boundary:
                 slots = slots + [bslot]
                 nblocks += 1
@@ -489,13 +521,20 @@ class Inkling2Runtime:
                 cnt = self._param(np.array([n], np.uint32).tobytes())
                 plan.dispatch("ink_trace_rows", [(b["r_h"], 0, READ), (b["r_trace"], v * n * 2, WRITE), (A, cnt, READ)],
                               ((n + 255) // 256, 1, 1), 256, label="trace")
-        first = self._param(np.array([R - logit_rows], np.uint32).tobytes())
         rvf = self._visit_param(len(cfg.visits()) - 1, R, 4, [0, 1, 4, 5], 0)
+        if features:
+            # every row's final state into m_feat[3]; the logit rows read it there
+            first = self._param(np.array([0], np.uint32).tobytes())
+            xf, xf_off, final_rows = b["m_feat"], 3 * R * H * 2, R
+            lx_off = xf_off + (R - logit_rows) * H * 2
+        else:
+            first = self._param(np.array([R - logit_rows], np.uint32).tobytes())
+            xf, xf_off, final_rows, lx_off = b["r_xf"], 0, logit_rows, 0
         plan.dispatch("ink_final_rows", [(b["weights"], 0, READ), (b["table"], 0, READ), (b["r_h"], 0, READ),
-                      (b["r_bs"], 0, READ), (b["r_xf"], 0, WRITE), (A, rvf, READ), (A, first, READ)],
-                      (logit_rows, 1, 1), 256, label="final")
+                      (b["r_bs"], 0, READ), (xf, xf_off, WRITE), (A, rvf, READ), (A, first, READ)],
+                      (final_rows, 1, 1), 256, label="final")
         f = self.table[cfg.num_layers]
-        self._gemm("ink_gemm_logits_rows", b["r_xf"], 0, H, int(f[D_HEAD]), cfg.vocab_size, H, b["r_logits"], 0,
+        self._gemm("ink_gemm_logits_rows", xf, lx_off, H, int(f[D_HEAD]), cfg.vocab_size, H, b["r_logits"], 0,
                    cfg.vocab_size, 0, logit_rows, logit_rows <= 64)
         nrows = self._param(np.array([logit_rows], np.uint32).tobytes())
         plan.dispatch("ink_argmax_rows", [(b["r_logits"], 0, READ), (b["r_out"], 0, WRITE), (A, nrows, READ)],

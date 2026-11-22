@@ -18,6 +18,7 @@
 #include "inkling2/inkling2_decode_resident_bf16.h"
 #include "inkling2/inkling2_rows_bf16.h"
 #include "inkling2/inkling2_rows_gemm.h"
+#include "inkling2/inkling2_mtp_bf16.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
 #include "kernels/gelu_bf16.h"
@@ -207,6 +208,19 @@ inline constexpr KernelSource kernel_registry[] = {
     {"inkling2_decode_resident_reference_bf16", "inkling2_decode_resident_bf16",
      [] { Inkling2DecodeOptions o; o.trace = true; return inkling2_decode_resident_bf16_source(o); }},
     // inkling2_loop row programs (prefill chunks and batched decode): per-row kernels and TensorOps products.
+    // Inkling 2 Mini DSpark speculative decoding (verify staging / commit, drafter)
+    {"ink_ring_stage_rows", "ink_ring_stage_rows", inkling2_mtp_bf16_source},
+    {"ink_commit_rows", "ink_commit_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_mix_rows", "ink_mtp_mix_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_ctx_write_rows", "ink_mtp_ctx_write_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_embed_rows", "ink_mtp_embed_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_norm_rows", "ink_mtp_norm_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_qk_rows", "ink_mtp_qk_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_attn_rows", "ink_mtp_attn_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_silu_rows", "ink_mtp_silu_rows", inkling2_mtp_bf16_source},
+    {"ink_mtp_rnn_in", "ink_mtp_rnn_in", inkling2_mtp_bf16_source},
+    {"ink_mtp_gates", "ink_mtp_gates", inkling2_mtp_bf16_source},
+    {"ink_mtp_pick", "ink_mtp_pick", inkling2_mtp_bf16_source},
     {"ink_embed_rows", "ink_embed_rows", inkling2_rows_bf16_source},
     {"ink_attn_inputs_rows", "ink_attn_inputs_rows", inkling2_rows_bf16_source},
     {"ink_gate_rows", "ink_gate_rows", inkling2_rows_bf16_source},
@@ -278,6 +292,14 @@ inline constexpr KernelSource kernel_registry[] = {
     {"ink_experts_down_t8x32s2", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 8; o.tile_n = 32; o.simdgroups = 2; return inkling2_rows_gemm_source(o); }},
     {"ink_experts_down_t16x64s4", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 64; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
     {"ink_experts_down_t8x64s8", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 8; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t32x64s4", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_down_t32x64s4", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t32x32s4", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 32; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_down_t32x32s4", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 32; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t32x64s8", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_down_t32x64s8", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t16x64s8", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_down_t16x64s8", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
     {"ink_experts_down_t16x32s4", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 32; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
 };
 
