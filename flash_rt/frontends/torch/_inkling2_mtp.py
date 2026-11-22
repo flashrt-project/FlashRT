@@ -15,14 +15,15 @@ Mixed into ``Inkling2Runtime`` (programs must be recorded before the plan is sea
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, Iterator, List, Sequence
 
 import numpy as np
 
 from flash_rt.hardware.apple_native.native import READ, READ_WRITE, WRITE
-from flash_rt.models.inkling2.checkpoint import SafetensorsFile
+from flash_rt.models.inkling2.checkpoint import SafetensorsFile, check_mtp_config
 
 D_HEAD = 5                        # LM head descriptor of the final table row
 MTP_LAYERS = 3
@@ -39,6 +40,7 @@ class _MTPMixin:
     def _mtp_upload(self, layout) -> None:
         cfg = self.cfg
         H, V = cfg.hidden_size, cfg.vocab_size
+        check_mtp_config(json.loads((Path(self.ckpt.directory) / "config.json").read_text()))
         st = SafetensorsFile(Path(self.ckpt.directory) / "mtp.safetensors")
         w: Dict[str, int] = {}
 
@@ -128,8 +130,9 @@ class _MTPMixin:
 
     # ------------------------------------------------------------------ programs
     def _mtp_record(self) -> None:
-        """Programs per batch size C in self.mtp_batches: verify (8C rows, staged), commit, draft (context of the
-        last verify's accepted rows, the block, the Markov walk); per prefill length: features + context."""
+        """Programs per batch size C in self.mtp_batches: verify (W x C rows, staged), commit, draft (context of
+        the last verify's accepted rows, the block, the Markov walk); per prefill chunk: rows with features and the
+        drafter context of those rows."""
         self.mtp_programs: Dict[tuple, int] = {}
         for C in self.mtp_batches:
             W = self.mtp_width(C)
@@ -137,9 +140,9 @@ class _MTPMixin:
             self.mtp_programs[("verify", C)] = self._record_rows(R, R, stage=True, features=True)
             self.mtp_programs[("commit", C)] = self._mtp_record_commit(R)
             self.mtp_programs[("draft", C)] = self._mtp_record_draft(C, W)
-        for P in self.mtp_prefill:
-            self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True)
-            self.mtp_programs[("context", P)] = self._mtp_record_context_only(P)
+        for P in self.mtp_prefill:     # target rows with features, then the drafter context of the same rows
+            self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True,
+                                                                  then=lambda P=P: self._mtp_context(P))
 
     def _mtp_record_commit(self, R: int) -> int:
         b, plan = self.buf, self.plan
@@ -183,11 +186,6 @@ class _MTPMixin:
         plan.dispatch("ink_mtp_ctx_write_rows", [(b["weights"], 0, READ), (b["m_kvc"], 0, READ), (b["m_kv"], 0, READ_WRITE),
                                                  (b["m_cinfo"], 0, READ), (A, ctx, READ)], (R, 1, 1), 256,
                       label="mtp_ctx_write")
-
-    def _mtp_record_context_only(self, R: int) -> int:
-        program = self.plan.program()
-        self._mtp_context(R)
-        return program
 
     def _mtp_record_draft(self, C: int, W: int) -> int:
         b, plan, w, cfg = self.buf, self.plan, self.mtp_w, self.cfg
@@ -266,43 +264,34 @@ class _MTPMixin:
         return program
 
     # ------------------------------------------------------------------ generation
-    def mtp_generate(self, prompts: Sequence[Sequence[int]], new_tokens: int, stats: dict | None = None
-                     ) -> List[List[int]]:
-        """Greedy generation of exactly ``new_tokens`` tokens per prompt (C = len(prompts) sequences, all prompts
-        of one length with a recorded prefill program) with DSpark drafting. Returns the generated tokens."""
+    def mtp_steps(self, prompts: Sequence[Sequence[int]], limit: int, stats: dict | None = None
+                  ) -> Iterator[List[List[int]]]:
+        """Greedy DSpark generation for C = len(prompts) sequences (sequence slots 0..C-1): yields per step the new
+        tokens of every sequence (the first yield: each prompt's first token). A sequence with ``limit`` tokens
+        is frozen (its rows still run, nothing is committed); the caller stops iterating when it is done."""
         C = len(prompts)
-        P = len(prompts[0])
-        if ("draft", C) not in self.mtp_programs or ("prefill", P) not in self.mtp_programs:
-            raise ValueError(f"no MTP programs for {C} sequences / prompt length {P}")
-        if any(len(p) != P for p in prompts):
-            raise ValueError("prompts must have one length")
-        if P + new_tokens + MTP_BLOCK > self.max_seq:
+        if ("draft", C) not in self.mtp_programs:
+            raise ValueError(f"no MTP programs for {C} sequences (mtp_batches)")
+        if any(not p for p in prompts):
+            raise ValueError("prompts must be non-empty")
+        if any(len(p) + limit + MTP_BLOCK > self.max_seq for p in prompts):
             raise ValueError("prompt + new tokens exceed max_seq")
         plan, b = self.plan, self.buf
         W = self.mtp_width(C)
         R = W * C
         RB = MTP_BLOCK * C
-        out: List[List[int]] = [[] for _ in range(C)]
         anchor = np.zeros(C, np.uint32)
-        pos = np.full(C, P, np.int64)
+        pos = np.array([len(p) for p in prompts], np.int64)
         # prefill: target rows with features, then the drafter context of every prompt position
         for s, prompt in enumerate(prompts):
-            info = np.array([[s, i, 0, P - 1] for i in range(P)], np.uint32)
-            plan.write(b["r_tokens"], 0, np.asarray(prompt, np.uint32))
-            plan.write(b["r_info"], 0, info)
-            plan.run(self.mtp_programs[("prefill", P)])
-            anchor[s] = plan.read(b["r_out"], 0, np.uint32, 1)[0]
-            ci = np.zeros((P, 4), np.uint32)
-            ci[:, 0], ci[:, 1], ci[:, 2] = s, np.arange(P), 1
-            ci[-1, 3] = 1
-            plan.write(b["m_cinfo"], 0, ci)
-            plan.run(self.mtp_programs[("context", P)])
-            out[s].append(int(anchor[s]))
+            anchor[s] = self.prefill(prompt, seq=s, features=True)
+        count = [1] * C
+        yield [[int(t)] for t in anchor]
         cinfo = np.zeros((R, 4), np.uint32)            # first draft step: no new context rows
         steps = accepted = active = 0
         gpu = {"draft": 0.0, "verify": 0.0, "commit": 0.0}
         t_start = time.perf_counter()
-        while min(len(o) for o in out) < new_tokens:
+        while min(count) < limit:
             # draft
             dinfo = np.zeros((RB, 4), np.uint32)
             for s in range(C):
@@ -325,14 +314,15 @@ class _MTPMixin:
             target = plan.read(b["r_out"], 0, np.uint32, R).reshape(C, W)
             commit = np.zeros((R, 2), np.uint32)
             cinfo = np.zeros((R, 4), np.uint32)
+            new_tokens: List[List[int]] = [[] for _ in range(C)]
             for s in range(C):
-                if len(out[s]) >= new_tokens:
+                if count[s] >= limit:
                     continue                    # finished: frozen (rows recomputed, nothing committed)
                 n = 0
                 while n < W - 1 and drafts[s, n] == target[s, n]:
                     n += 1
-                new = list(drafts[s, :n]) + [target[s, n]]
-                out[s].extend(int(t) for t in new)
+                new_tokens[s] = [int(t) for t in drafts[s, :n]] + [int(target[s, n])]
+                count[s] += n + 1
                 commit[s * W:s * W + n + 1, 0] = 1
                 commit[s * W:(s + 1) * W, 1] = pos[s] + n
                 cinfo[s * W:s * W + n + 1] = [[s, pos[s] + j, 1, 1 if j == n else 0] for j in range(n + 1)]
@@ -343,9 +333,19 @@ class _MTPMixin:
             plan.write(b["m_commit"], 0, commit)
             gpu["commit"] += plan.run(self.mtp_programs[("commit", C)])["gpu_us"]
             steps += 1
-        if stats is not None:
-            stats.update(steps=steps, tokens_per_step=accepted / max(1, active), decode_s=time.perf_counter() - t_start,
-                         **{k + "_ms_per_step": v / 1000 / max(1, steps) for k, v in gpu.items()})
+            if stats is not None:
+                stats.update(steps=steps, tokens_per_step=accepted / max(1, active),
+                             decode_s=time.perf_counter() - t_start,
+                             **{k + "_ms_per_step": v / 1000 / steps for k, v in gpu.items()})
+            yield new_tokens
+
+    def mtp_generate(self, prompts: Sequence[Sequence[int]], new_tokens: int, stats: dict | None = None
+                     ) -> List[List[int]]:
+        """Greedy generation of exactly ``new_tokens`` tokens per prompt with DSpark drafting (see mtp_steps)."""
+        out: List[List[int]] = [[] for _ in prompts]
+        for step in self.mtp_steps(prompts, new_tokens, stats):
+            for o, new in zip(out, step):
+                o.extend(new)
         return [o[:new_tokens] for o in out]
 
 

@@ -122,6 +122,25 @@ def check_constants(raw: dict) -> None:
             raise Inkling2ConfigError(f"{key}={t.get(key)}; the Apple Inkling 2 kernels are built for {value}")
 
 
+# The DSpark drafter (mtp.safetensors) the Apple speculative-decoding kernels are written for.
+MTP_GEOMETRY = {
+    "hidden_size": 2304, "num_hidden_layers": 3, "num_attention_heads": 24, "num_key_value_heads": 8, "head_dim": 128,
+    "intermediate_size": 9216, "q_bias": False, "o_bias": False, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+    "local_layer_ids": [0, 2], "sliding_window_size": 1024, "block_size": 8, "markov_rank": 256,
+    "markov_head_type": "rnn_hidden", "target_layer_ids": [5, 23, 41, 48],
+}
+
+
+def check_mtp_config(raw: dict) -> None:
+    """config.json ``mtp_config``: the drafter geometry the speculative-decoding kernels hard-code."""
+    m = raw.get("mtp_config")
+    if not m:
+        raise Inkling2ConfigError("config.json has no mtp_config (no DSpark drafter)")
+    for key, value in MTP_GEOMETRY.items():
+        if m.get(key) != value:
+            raise Inkling2ConfigError(f"mtp_config {key}={m.get(key)}; the Apple drafter kernels are built for {value}")
+
+
 def check_geometry(cfg: Inkling2Config) -> None:
     for key, value in GEOMETRY.items():
         if getattr(cfg, key) != value:
