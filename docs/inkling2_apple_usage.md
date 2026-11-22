@@ -126,7 +126,10 @@ and the expert combination (the decode step's device functions), and products:
   that received at most 2 rows take the per-expert quantized product. The
   MXFP8 experts run TensorOps tiles grouped by expert (experts with at most 3
   rows on the quantized product). `Inkling2Runtime.expert_mma = 0` keeps every
-  expert on TensorOps tiles and skips the copy.
+  expert on TensorOps tiles and skips the copy. Up to 32 rows
+  (`expert_overlap_rows`) the quantized-product experts and the others of a
+  stage write disjoint rows and run as concurrent dispatches (no barrier
+  between them).
 
 **Speculative decoding.** The drafter follows SGLang's
 `Inkling2ForConditionalGenerationMTP` (a DFlash block drafter with DSpark's RNN
