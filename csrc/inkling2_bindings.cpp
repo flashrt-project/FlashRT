@@ -297,6 +297,99 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   m.def("expert_w13_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13_flat(expert(d), to_stream(stream)); });
   m.def("expert_act_quant", [expert](const py::dict& d, uintptr_t stream) { ik::expert_act_quant(expert(d), to_stream(stream)); });
   m.def("expert_w2_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w2_flat(expert(d), to_stream(stream)); });
+  auto mtp = [](const py::dict& d) {
+    ik::MtpParams p = {};
+    for (int i = 0; i < 4; ++i) {
+      p.feat[i] = nullptr;
+      p.norm[i] = nullptr;
+    }
+    if (d.contains("feat")) {
+      const auto v = d["feat"].cast<std::vector<uintptr_t>>();
+      if (v.size() != 4) throw std::invalid_argument("mtp: feat needs 4 pointers");
+      for (int i = 0; i < 4; ++i) p.feat[i] = ptr<const uint16_t>(v[i]);
+    }
+    if (d.contains("norm")) {
+      const auto v = d["norm"].cast<std::vector<uintptr_t>>();
+      if (v.size() != 4) throw std::invalid_argument("mtp: norm needs 4 pointers");
+      for (int i = 0; i < 4; ++i) p.norm[i] = ptr<const uint16_t>(v[i]);
+    }
+    if (d.contains("k_norm")) {
+      const auto v = d["k_norm"].cast<std::vector<uintptr_t>>();
+      if (v.size() != 3) throw std::invalid_argument("mtp: k_norm needs 3 pointers");
+      for (int i = 0; i < 3; ++i) p.k_norm[i] = ptr<const uint16_t>(v[i]);
+    }
+    if (d.contains("alpha")) {
+      const auto v = d["alpha"].cast<std::vector<float>>();
+      if (v.size() != 16) throw std::invalid_argument("mtp: alpha needs 16 values");
+      for (int i = 0; i < 16; ++i) p.alpha[i] = v[i];
+    }
+    p.count = dptr<const int>(d, "count");
+    p.count_add = dint(d, "count_add");
+    p.kvc = dptr<const uint16_t>(d, "kvc");
+    p.pos = dptr<const int>(d, "pos");
+    p.kv = dptr<uint16_t>(d, "kv");
+    p.cap = dint(d, "cap");
+    p.theta = dflt(d, "theta", 1.0e6f);
+    p.layer = dint(d, "layer");
+    p.window = dint(d, "window");
+    p.x = dptr<uint16_t>(d, "x");
+    p.frnn = dptr<uint16_t>(d, "frnn");
+    p.anchor = dptr<const int>(d, "anchor");
+    p.embed = dptr<const uint16_t>(d, "embed");
+    p.embed_norm = dptr<const uint16_t>(d, "embed_norm");
+    p.mask_embed = dptr<const uint16_t>(d, "mask_embed");
+    p.dh = dptr<float>(d, "dh");
+    p.add = dptr<const uint16_t>(d, "add");
+    if (d.contains("add_part")) {
+      const auto v = d["add_part"].cast<std::vector<uintptr_t>>();
+      if (v.size() != 2) throw std::invalid_argument("mtp: add_part needs 2 pointers");
+      for (int i = 0; i < 2; ++i) p.add_part[i] = ptr<const float>(v[i]);
+    }
+    p.norm_w = dptr<const uint16_t>(d, "norm_w");
+    p.q_in = dptr<const uint16_t>(d, "q_in");
+    p.k_in = dptr<const uint16_t>(d, "k_in");
+    p.v_in = dptr<const uint16_t>(d, "v_in");
+    p.q_norm = dptr<const uint16_t>(d, "q_norm");
+    p.kb_norm = dptr<const uint16_t>(d, "kb_norm");
+    p.q_out = dptr<uint16_t>(d, "q_out");
+    p.attn_out = dptr<uint16_t>(d, "attn_out");
+    p.gate = dptr<const uint16_t>(d, "gate");
+    p.up = dptr<const uint16_t>(d, "up");
+    p.act = dptr<uint16_t>(d, "act");
+    p.step = dint(d, "step");
+    p.drafts = dptr<int>(d, "drafts");
+    p.markov_w1 = dptr<const uint16_t>(d, "markov_w1");
+    p.hn = dptr<const uint16_t>(d, "hn");
+    p.rnn_in = dptr<uint16_t>(d, "rnn_in");
+    p.proj = dptr<const float>(d, "proj");
+    p.rnn_bias = dptr<const uint16_t>(d, "rnn_bias");
+    p.state = dptr<uint16_t>(d, "state");
+    p.latent = dptr<uint16_t>(d, "latent");
+    p.logits = dptr<const float>(d, "logits");
+    p.vocab_stride = dint(d, "vocab_stride");
+    p.vocab = dint(d, "vocab");
+    p.fold_w = dptr<const uint16_t>(d, "fold_w");
+    p.fold_b = dptr<const uint16_t>(d, "fold_b");
+    p.pick_best = dptr<float>(d, "pick_best");
+    p.pick_index = dptr<int>(d, "pick_index");
+    p.pick_counter = dptr<int>(d, "pick_counter");
+    return p;
+  };
+#define MTP_DEF(name) \
+  m.def(#name, [mtp](const py::dict& d, uintptr_t stream) { ik::name(mtp(d), to_stream(stream)); });
+  MTP_DEF(mtp_context_mix)
+  MTP_DEF(mtp_context_write)
+  MTP_DEF(mtp_block_embed)
+  MTP_DEF(mtp_norm)
+  MTP_DEF(mtp_qk)
+  MTP_DEF(mtp_attention)
+  MTP_DEF(mtp_silu)
+  MTP_DEF(mtp_rnn_in)
+  MTP_DEF(mtp_gates)
+  MTP_DEF(mtp_pick)
+#undef MTP_DEF
+  m.attr("MTP_PICK_BLOCKS") = ik::mtp_pick_blocks();
+
   m.def("lm_head", [](const py::dict& d, uintptr_t stream) {
     ik::LmHeadParams p = {};
     p.rows = dint(d, "rows", 1);
@@ -312,6 +405,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.block_index = dptr<int>(d, "block_index");
     p.counter = dptr<int>(d, "counter");
     p.token = dptr<int>(d, "token");
+    p.normed_out = dptr<uint16_t>(d, "normed_out");
     p.prefetch = dprefetch(d);
     ik::lm_head(p, to_stream(stream));
   });
@@ -326,6 +420,8 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.tokens = dptr<int>(d, "tokens");
     p.next_token = dptr<int>(d, "next_token");
     p.next_pos = dptr<int>(d, "next_pos");
+    p.log = dptr<int>(d, "log");
+    p.log_count = dptr<int>(d, "log_count");
     ik::accept(p, to_stream(stream));
   });
   m.def("commit", [](const py::dict& d, uintptr_t stream) {

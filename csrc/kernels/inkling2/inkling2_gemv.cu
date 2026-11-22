@@ -127,13 +127,17 @@ __global__ void __launch_bounds__(kThreads) gemv_multi_kernel(const __grid_const
 }
 
 // Several rows: the inputs staged as BF16 [rows][k] (the values the one-row kernel computes in FP32 are BF16
-// values), the same prologue arithmetic per row, R accumulators per lane in the one-row order.
-__global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_constant__ GemvParams p) {
+// values), the same prologue arithmetic per row, R accumulators per lane in the one-row order. kRowsWarps output
+// rows per block (fewer blocks staging the inputs); the norm sums over the first kThreads threads as in the one-row
+// kernel.
+constexpr int kRowsWarps = 8;               // 16 measured slower (one block per SM either way)
+constexpr int kRowsThreads = kRowsWarps * 32;
+__global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_constant__ GemvParams p) {
   extern __shared__ __align__(16) uint16_t xb[];
   int t = 0;
   while (t + 1 < p.count && int(blockIdx.x) >= p.block_start[t + 1]) ++t;
   const GemvTask& task = p.task[t];
-  const int row = (int(blockIdx.x) - p.block_start[t]) * kRows + (threadIdx.x >> 5);
+  const int row = (int(blockIdx.x) - p.block_start[t]) * kRowsWarps + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
   const int k = task.k, R = task.rows < 1 ? 1 : task.rows;
   const size_t xs = task.x_stride ? task.x_stride : k;
@@ -149,7 +153,7 @@ __global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_consta
     float ss[kMaxRows];
 #pragma unroll
     for (int r = 0; r < kMaxRows; ++r) ss[r] = 0.0f;
-    for (int i = threadIdx.x; i < k; i += kThreads) {
+    for (int i = threadIdx.x; threadIdx.x < kThreads && i < k; i += kThreads) {
 #pragma unroll
       for (int r = 0; r < kMaxRows; ++r) {
         if (r >= R) break;
@@ -162,7 +166,7 @@ __global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_consta
     for (int r = 0; r < kMaxRows; ++r) {
       if (r >= R) break;
       const float s = warp_sum(ss[r]);
-      if ((threadIdx.x & 31) == 0) rp[threadIdx.x >> 5][r] = s;
+      if ((threadIdx.x & 31) == 0 && threadIdx.x < kThreads) rp[threadIdx.x >> 5][r] = s;
     }
     __syncthreads();
     float inv[kMaxRows];
@@ -174,7 +178,7 @@ __global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_consta
       inv[r] = 1.0f / sqrtf(tot / float(k) + 1e-6f);
     }
     const uint16_t* nw = static_cast<const uint16_t*>(task.aux);
-    for (int i = threadIdx.x; i < k; i += kThreads) {
+    for (int i = threadIdx.x; i < k; i += kRowsThreads) {
       const float wv = bf16_to_f32(nw[i]);
 #pragma unroll
       for (int r = 0; r < kMaxRows; ++r) {
@@ -186,7 +190,7 @@ __global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_consta
     }
   } else if (task.prologue == kGemvGate) {
     const uint16_t* gate = static_cast<const uint16_t*>(after_wait(task.aux));
-    for (int i = threadIdx.x; i < k; i += kThreads)
+    for (int i = threadIdx.x; i < k; i += kRowsThreads)
 #pragma unroll
       for (int r = 0; r < kMaxRows; ++r) {
         if (r >= R) break;
@@ -194,12 +198,21 @@ __global__ void __launch_bounds__(kThreads) gemv_rows_kernel(const __grid_consta
         xb[r * k + i] = f32_to_bf16_bits(x * (1.0f / (1.0f + expf(-bf16_to_f32(gate[size_t(r) * k + i])))));
       }
   } else {
-    for (int i = threadIdx.x; i < k / 8; i += kThreads)
+    // 8 loads of a thread in flight per round
+    const int k8 = k / 8, total = R * k8;
+    for (int base = threadIdx.x; base < total; base += 8 * kRowsThreads) {
+      uint4 v[8];
 #pragma unroll
-      for (int r = 0; r < kMaxRows; ++r) {
-        if (r >= R) break;
-        reinterpret_cast<uint4*>(xb + r * k)[i] = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(xin) + r * xs)[i];
+      for (int u = 0; u < 8; ++u) {
+        const int i = base + u * kRowsThreads;
+        if (i < total) v[u] = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(xin) + (i / k8) * xs)[i % k8];
       }
+#pragma unroll
+      for (int u = 0; u < 8; ++u) {
+        const int i = base + u * kRowsThreads;
+        if (i < total) reinterpret_cast<uint4*>(xb)[i] = v[u];
+      }
+    }
   }
   __syncthreads();
   if (!live) return;
@@ -318,6 +331,12 @@ void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cuda
   int max_rows = 1;
   for (int t = 0; t < count; ++t) max_rows = tasks[t].rows > max_rows ? tasks[t].rows : max_rows;
   if (max_rows > 1) {
+    blocks = 0;
+    for (int t = 0; t < count; ++t) {
+      p.block_start[t] = blocks;
+      blocks += (tasks[t].n + kRowsWarps - 1) / kRowsWarps;
+    }
+    p.block_start[count] = blocks;
     size_t smem = 0;
     for (int t = 0; t < count; ++t) {
       const GemvTask& task = tasks[t];
@@ -328,7 +347,7 @@ void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cuda
     }
     check_cuda(cudaFuncSetAttribute(gemv_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
                "gemv_rows smem");
-    launch_pdl(gemv_rows_kernel, dim3(blocks), dim3(kThreads), smem, stream, p);
+    launch_pdl(gemv_rows_kernel, dim3(blocks), dim3(kRowsThreads), smem, stream, p);
     return;
   }
   const size_t smem = size_t(p.max_k) * sizeof(float);
