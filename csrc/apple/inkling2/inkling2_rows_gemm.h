@@ -69,6 +69,52 @@ kernel void ink_gemm_logits_rows(const device bfloat* x [[buffer(0)]],const devi
     device void* y [[buffer(2)]],constant RowsGemm& p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]])
     {gemm_rows<2>(x,weights,y,p,g);}
 
+// Several independent products in one dispatch: column tiles of matrix i are g.x in [tile0_i, tile0_{i+1}); inputs
+// x0..x2 and outputs y0 / y1 chosen per matrix.
+struct MultiMat { ulong w; uint n, k, x_sel, x_stride, y_sel, y_col, y_stride, tile0, pad; };
+struct MultiGemm { uint count, rows, pad0, pad1; MultiMat m[8]; };
+template<int MODE>
+inline void gemm_multi(const device bfloat* x0,const device bfloat* x1,const device bfloat* x2,
+                       const device uchar* weights,device void* y0,device void* y1,constant MultiGemm& p,uint2 g) {
+    uint mi=0;
+    while(mi+1u<p.count && g.x>=p.m[mi+1u].tile0)++mi;
+    const uint n=p.m[mi].n,K=p.m[mi].k,xs=p.m[mi].x_stride,ys=p.m[mi].y_stride,yc=p.m[mi].y_col;
+    const uint n0=(g.x-p.m[mi].tile0)*uint(TN),row0=g.y*uint(TM);
+    if(n0>=n || row0>=p.rows)return;
+    const device bfloat* x=p.m[mi].x_sel==0u?x0:(p.m[mi].x_sel==1u?x1:x2);
+    device void* y=p.m[mi].y_sel==0u?y0:y1;
+    const uint rows=min(uint(TM),p.rows-row0),cols=min(uint(TN),n-n0);
+    using E=dextents<int,2>;
+    tensor<device bfloat,E,tensor_inline> left((device bfloat*)x+size_t(row0)*xs,E(int(K),int(rows)),array<int,2>{1,int(xs)});
+    tensor<device bfloat,E,tensor_inline> right((device bfloat*)(weights+p.m[mi].w)+size_t(n0)*K,E(int(K),int(cols)),
+                                              array<int,2>{1,int(K)});
+    constexpr auto desc=matmul2d_descriptor(TM,TN,64,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<SG>> op;
+    auto acc=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();
+    for(uint i=0;i<acc.get_capacity();++i)if(acc.is_valid_element(i))acc[i]=0.0f;
+    for(uint k0=0;k0<K;k0+=64) {
+        auto l=left.slice(int(k0),0);
+        auto r=right.slice(int(k0),0);
+        op.run(l,r,acc);
+    }
+    for(uint i=0;i<acc.get_capacity();++i) {
+        if(!acc.is_valid_element(i))continue;
+        auto c=acc.get_multidimensional_index(i);
+        if(c[1]>=int(rows) || c[0]>=int(cols))continue;
+        const size_t at=size_t(row0+c[1])*ys+yc+n0+c[0];
+        if(MODE==0)((device bfloat*)y)[at]=bfloat(rbf(acc[i]));
+        else ((device float*)y)[at]=acc[i];
+    }
+}
+kernel void ink_gemm_bf16_multi(const device bfloat* x0 [[buffer(0)]],const device bfloat* x1 [[buffer(1)]],
+    const device bfloat* x2 [[buffer(2)]],const device uchar* weights [[buffer(3)]],device void* y0 [[buffer(4)]],
+    device void* y1 [[buffer(5)]],constant MultiGemm& p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]])
+    {gemm_multi<0>(x0,x1,x2,weights,y0,y1,p,g);}
+kernel void ink_gemm_f32_multi(const device bfloat* x0 [[buffer(0)]],const device bfloat* x1 [[buffer(1)]],
+    const device bfloat* x2 [[buffer(2)]],const device uchar* weights [[buffer(3)]],device void* y0 [[buffer(4)]],
+    device void* y1 [[buffer(5)]],constant MultiGemm& p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]])
+    {gemm_multi<1>(x0,x1,x2,weights,y0,y1,p,g);}
+
 // ------------------------------------------------------------------------------------------ experts
 struct ExpertGemm {
     uint assignments, k, n_out, mx;  // assignment rows, inputs, output columns, 1 = MXFP8

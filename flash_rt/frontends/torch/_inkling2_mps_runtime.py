@@ -274,7 +274,12 @@ class Inkling2Runtime:
     # TensorOps tile (rows, columns, SIMD groups) by row count: few rows want narrow column tiles (more
     # threadgroups to stream the weights), many rows one row tile (weights read once).
     gemm_tiles = {4: (8, 32, 1), 16: (16, 32, 2), 64: (16, 32, 2)}
-    mma_expert_rows = 0         # register-dequant MMA experts (experimental; slower than the TensorOps tiles so far)
+    # Row-count paths. Up to `gemv_rows` rows: multi-row gemv / per-expert qmv, each row's arithmetic the decode
+    # step's (results independent of the batch). Up to `hybrid_limit` rows: experts with at most `hybrid_rows`
+    # rows take the qmv kernel, the others TensorOps tiles (a tile pays its weights for up to tile_m rows).
+    gemv_rows = 4
+    hybrid_rows = 3
+    hybrid_limit = 64
     expert_tiles = {4: (8, 64, 4), 16: (8, 32, 2), 64: (8, 32, 2)}
 
     @staticmethod
@@ -294,6 +299,26 @@ class Inkling2Runtime:
                                   (self.buf["args"], prm, READ)],
                            ((n + tn - 1) // tn, (rows + tm - 1) // tm, 1), sg * 32, label=name)
 
+    def _gemm_multi(self, kernel, rows, mats, xs, ys, label):
+        """Independent TensorOps products in one dispatch (ink_gemm_*_multi): mats = [(weight offset, n, k, x index,
+        x stride, y index, y column, y stride)]; xs = up to three (buffer, offset) inputs, ys = up to two outputs."""
+        tm, tn, sg = self._pick(self.gemm_tiles, rows)
+        blob = np.array([len(mats), rows, 0, 0], np.uint32).tobytes()
+        tiles = 0
+        for w, n, k, xsel, xstride, ysel, ycol, ystride in mats:
+            blob += np.array([w], np.uint64).tobytes() + \
+                np.array([n, k, xsel, xstride, ysel, ycol, ystride, tiles, 0, 0], np.uint32).tobytes()
+            tiles += (n + tn - 1) // tn
+        blob += b"\0" * (48 * (8 - len(mats)))
+        prm = self._param(blob)
+        xs = list(xs) + [xs[0]] * (3 - len(xs))
+        ys = list(ys) + [ys[0]] * (2 - len(ys))
+        name = f"{kernel}_t{tm}x{tn}s{sg}"
+        self.plan.dispatch(name, [(xs[0][0], xs[0][1], READ), (xs[1][0], xs[1][1], READ), (xs[2][0], xs[2][1], READ),
+                                  (self.buf["weights"], 0, READ), (ys[0][0], ys[0][1], READ_WRITE),
+                                  (ys[1][0], ys[1][1], READ_WRITE), (self.buf["args"], prm, READ)],
+                           (tiles, (rows + tm - 1) // tm, 1), sg * 32, label=label)
+
     def _gemv_rows(self, R, mats, xs, y, yf=None, label="gemv_rows"):
         """Multi-row BF16 products (ink_gemv_rows): mats = [(weight offset, rows, k, x index, y column, y stride,
         mode)]; xs = up to three (buffer, offset) inputs."""
@@ -301,7 +326,7 @@ class Inkling2Runtime:
         units = 0
         for w, rows, k, xsel, ycol, ystride, mode in mats:
             blob += np.array([w], np.uint64).tobytes() + np.array([rows, k, xsel, ycol, ystride, mode], np.uint32).tobytes()
-            units += rows // 4 if mode == 0 else rows
+            units += rows // 4 if mode == 0 else (rows // 32 if mode == 4 else rows)
         blob += b"\0" * (32 * (10 - len(mats)))
         prm = self._param(blob)
         xs = list(xs) + [xs[0]] * (3 - len(xs))
@@ -318,9 +343,8 @@ class Inkling2Runtime:
         H, I, E = cfg.hidden_size, cfg.expert_intermediate_size, cfg.num_experts
         small = R <= 64
         tm, etn, esg = self._pick(self.expert_tiles, R * 8 // 8)
-        gemv = R <= 4               # multi-row gemv products (each row's arithmetic = the decode step's)
-        qmv_experts = R <= 4        # per-expert multi-row qmv (scalar: ALU-bound beyond a few rows)
-        mma_experts = not qmv_experts and R <= self.mma_expert_rows
+        gemv = R <= self.gemv_rows           # multi-row gemv products and per-expert qmv
+        hybrid = not gemv and R <= self.hybrid_limit and self.hybrid_rows > 0
         program = plan.program()
         A = self.buf["args"]
         rv0 = self._visit_param(0, R, 0, [], 0)
@@ -329,7 +353,7 @@ class Inkling2Runtime:
         nblocks, slots = 0, []
         mode0 = self._param(np.array([0], np.uint32).tobytes())
         mode1 = self._param(np.array([1], np.uint32).tobytes())
-        tmp = self._param(np.array([tm], np.uint32).tobytes())
+        tmp = self._param(np.array([tm, self.hybrid_rows if hybrid else 0], np.uint32).tobytes())
         for v, (layer, pss) in enumerate(cfg.visits()):
             if v >= getattr(self, "max_visits", 48):
                 break
@@ -351,13 +375,20 @@ class Inkling2Runtime:
                     self._gemv_rows(R, [(int(d[D_MG + 3 * g]), 64, 2 * H, g, g * R * 64, 64, 1) for g in range(3)],
                                     [(b["r_s"], g * R * 2 * H * 2) for g in range(3)], (b["r_mdown"], 0), label="msg_down")
                 else:
-                    for g in range(3):
-                        self._gemm("ink_gemm_bf16_rows", b["r_s"], g * R * 2 * H * 2, 2 * H, int(d[D_MG + 3 * g]), 64,
-                                   2 * H, b["r_mdown"], g * R * 64 * 2, 64, 0, R, small)
-                for g in range(3):
+                    self._gemm_multi("ink_gemm_bf16_multi", R,
+                                     [(int(d[D_MG + 3 * g]), 64, 2 * H, g, 2 * H, 0, g * R * 64, 64) for g in range(3)],
+                                     [(b["r_s"], g * R * 2 * H * 2) for g in range(3)], [(b["r_mdown"], 0)], "msg_down")
+                if not gemv:
+                    self._gemm_multi("ink_gemm_f32_multi", R,
+                                     [(int(d[D_MG + 3 * g + which]), H, 64, g, 64, which - 1, g * R * H, H)
+                                      for which in (1, 2) for g in range(3)],
+                                     [(b["r_mdown"], g * R * 64 * 2) for g in range(3)],
+                                     [(b["r_forget"], 0), (b["r_gain"], 0)], "msg_forget_gain")
+                else:
                     for which, buf in ((1, "r_forget"), (2, "r_gain")):
-                        self._gemm("ink_gemm_f32_rows", b["r_mdown"], g * R * 64 * 2, 64, int(d[D_MG + 3 * g + which]),
-                                   H, 64, b[buf], g * R * H * 4, H, 0, R, small)
+                        self._gemv_rows(R, [(int(d[D_MG + 3 * g + which]), H, 64, g, g * R * H, H, 4) for g in range(3)],
+                                        [(b["r_mdown"], g * R * 64 * 2) for g in range(3)], (b[buf], 0), (b[buf], 0),
+                                        label="msg_" + buf[2:])
                 plan.dispatch("ink_gate_rows", [W, T, (b["r_ain"], 0, READ), (b["r_msg"], 0, READ),
                               (b["r_forget"], 0, READ), (b["r_gain"], 0, READ), (b["r_gated"], 0, WRITE),
                               (b["r_x"], 0, WRITE), vis, (A, mode0, READ)], (R, 1, 1), 256, label="gate_attn")
@@ -369,9 +400,9 @@ class Inkling2Runtime:
                 self._gemv_rows(R, [(int(d[idx]), n, H, xj, col, 8672, mode) for col, idx, n, xj, mode in projs],
                                 [(b["r_x"], j * R * H * 2) for j in range(3)], (P, 0), label="proj")
             else:
-                for col, idx, n, xj, _ in projs:
-                    self._gemm("ink_gemm_bf16_rows", b["r_x"], xj * R * H * 2, H, int(d[idx]), n, H, P, 0, 8672, col, R,
-                               small)
+                self._gemm_multi("ink_gemm_bf16_multi", R, [(int(d[idx]), n, H, xj, H, 0, col, 8672)
+                                                            for col, idx, n, xj, _ in projs],
+                                 [(b["r_x"], j * R * H * 2) for j in range(3)], [(P, 0)], "proj")
             plan.dispatch("ink_heads_rows", [W, T, (P, 0, READ), (b["r_qc"], 0, WRITE), (b["r_rclip"], 0, WRITE),
                           (b["kv"], 0, READ_WRITE), (b["r_chunk"], 0, WRITE), (b["rings"], 0, READ), vis,
                           (b["r_info"], 0, READ)], (R, 1, 1), 256, label="heads")
@@ -395,9 +426,15 @@ class Inkling2Runtime:
                 else:
                     self._gemm("ink_gemm_bf16_rows", b["r_s"], 3 * R * 2 * H * 2, 2 * H, int(d[D_MG + 9]), 64, 2 * H,
                                b["r_mdown"], 3 * R * 64 * 2, 64, 0, R, small)
-                for which, buf in ((1, "r_forget"), (2, "r_gain")):
-                    self._gemm("ink_gemm_f32_rows", b["r_mdown"], 3 * R * 64 * 2, 64, int(d[D_MG + 9 + which]), H, 64,
-                               b[buf], 3 * R * H * 4, H, 0, R, small)
+                if not gemv:
+                    self._gemm_multi("ink_gemm_f32_multi", R,
+                                     [(int(d[D_MG + 9 + which]), H, 64, 0, 64, which - 1, 3 * R * H, H) for which in (1, 2)],
+                                     [(b["r_mdown"], 3 * R * 64 * 2)], [(b["r_forget"], 0), (b["r_gain"], 0)],
+                                     "msg_forget_gain")
+                else:
+                    for which, buf in ((1, "r_forget"), (2, "r_gain")):
+                        self._gemv_rows(R, [(int(d[D_MG + 9 + which]), H, 64, 0, 3 * R * H, H, 4)],
+                                        [(b["r_mdown"], 3 * R * 64 * 2)], (b[buf], 0), (b[buf], 0), label="msg_" + buf[2:])
                 plan.dispatch("ink_gate_rows", [W, T, (b["r_ain"], 0, READ), (b["r_msg"], 0, READ),
                               (b["r_forget"], 0, READ), (b["r_gain"], 0, READ), (b["r_gated"], 0, WRITE),
                               (b["r_y"], 0, WRITE), vis, (A, mode1, READ)], (R, 1, 1), 256, label="gate_mlp")
@@ -415,24 +452,18 @@ class Inkling2Runtime:
                           (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
                           (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
             mx = 1 if int(d[D_FLAGS]) & 4 else 0
-            if mma_experts:
+            if gemv or hybrid:
+                # per-expert qmv: every expert (gemv) or the experts with at most hybrid_rows rows (hybrid)
+                limit = self.hybrid_rows if hybrid else 0
                 for gu, w, s_, gs, k, src, dst in ((1, D_W13, D_S13, D_GS13, H, "r_xp", "r_act"),
                                                    (0, D_W2, D_S2, D_GS2, I, "r_act", "r_ep")):
-                    wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, 0], np.uint64).tobytes())
-                    sh = self._param(np.array([gu, mx, 2 * I if gu else H, k], np.uint32).tobytes())
-                    plan.dispatch("ink_experts_mma", [W, (b[src], 0, READ), (b[dst], 0, WRITE), (A, wq, READ),
-                                  (b["r_starts"], 0, READ), (A, sh, READ)], (((2 * I if gu else H) + 127) // 128, E, 1),
-                                  128, label="mma_gateup" if gu else "mma_down")
-            elif qmv_experts:
-                for gu, w, s_, gs, k, src, dst in ((1, D_W13, D_S13, D_GS13, H, "r_xp", "r_act"),
-                                                   (0, D_W2, D_S2, D_GS2, I, "r_act", "r_ep")):
-                    wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, 0], np.uint64).tobytes())
+                    wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, limit], np.uint64).tobytes())
                     sh = self._param(np.array([gu, mx, 2 * I if gu else H, k], np.uint32).tobytes())
                     plan.dispatch("ink_experts_qmv_rows", [W, (b[src], 0, READ), (b[dst], 0, WRITE), (A, wq, READ),
                                   (b["r_starts"], 0, READ), (A, sh, READ)], ((2 * I if gu else H) // 32, E, 1), 256,
                                   label="experts_gateup" if gu else "experts_down")
             tiles_y = (R * 8 + tm - 1) // tm + E
-            for name, w, s_, gs, k, n_out, src, dst in (() if (qmv_experts or mma_experts) else (
+            for name, w, s_, gs, k, n_out, src, dst in (() if gemv else (
                     ("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I, "r_xp", "r_act"),
                     ("ink_experts_down", D_W2, D_S2, D_GS2, I, H, "r_act", "r_ep"))):
                 blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
