@@ -435,7 +435,8 @@ class Inkling2Runtime(_MTPMixin):
         mode0 = self._param(np.array([0], np.uint32).tobytes())
         mode1 = self._param(np.array([1], np.uint32).tobytes())
         tmp = self._param(np.array([tm, self.hybrid_rows if hybrid else 0], np.uint32).tobytes())
-        tmp_mma = self._param(np.array([32, self.mma_rows if hybrid else 0], np.uint32).tobytes())
+        few_mma = self.mma_rows if hybrid else 0     # MMA layers: experts with at most few_mma rows on qmv, no tiles
+        tmp_mma = self._param(np.array([32, few_mma], np.uint32).tobytes())
         for v, (layer, pss) in enumerate(cfg.visits()):
             d = self.table[layer]
             full, msgs = cfg.is_global(layer), cfg.is_looped(layer) and pss > 0
@@ -527,7 +528,7 @@ class Inkling2Runtime(_MTPMixin):
                           (b["r_counts"], 0, READ_WRITE), vis], ((R + 7) // 8, 1, 1), 256, label="route")
             mx = 1 if int(d[D_FLAGS]) & 4 else 0
             mma = bool(self.expert_mma) and not gemv and not mx and R <= self.mma_limit
-            few = (self.mma_rows if mma else self.hybrid_rows) if hybrid else 0
+            few = few_mma if mma else (self.hybrid_rows if hybrid else 0)
             mtiles = mma and R > self.mma_tile_rows
             plan.dispatch("ink_expert_scan", [(b["r_counts"], 0, READ_WRITE), (b["r_starts"], 0, WRITE),
                           (b["r_cursors"], 0, WRITE), (b["r_tiles"], 0, WRITE), (A, tmp_mma if mtiles else tmp, READ)],

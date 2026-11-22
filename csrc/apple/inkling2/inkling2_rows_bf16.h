@@ -761,7 +761,7 @@ kernel void ink_experts_qmv_rows(const device uchar* weights [[buffer(0)]],const
 }
 // ---- NVFP4 experts on SIMD-group MMAs: activations x weights^T per 8x8 fragment (A = 8 activation rows x 8
 // inputs, B = the same 8 inputs x 8 weight rows). Per 128-input block, fragment f = 4q + j (q, j < 4) takes the
-// inputs 32q + 4c' + 2j + {0, 1} for A columns c = 2c' + {0, 1}: a lane's A elements of the 4 fragments of one q are
+// inputs 32q + 8c' + 2j + {0, 1} for A columns c = 2c' + {0, 1}: a lane's A elements of the 4 fragments of one q are
 // 8 adjacent BF16 inputs (one 16-byte load per activation row), and its B row (input) fm lies in 16-input scale
 // group 2q + fm / 4. ink_nv_arrange (once, at load) re-arranges an expert matrix [rows][K] to match: for an 8-row
 // block and 128 inputs, lane l's 16 bytes hold, per fragment, the codes of weight rows fn and fn + 1 at the lane's

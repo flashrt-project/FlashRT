@@ -9,7 +9,8 @@ decoding. The checkpoint is used in its released precisions: BF16 attention,
 gates, embedding and LM head; NVFP4 experts (E2M1 codes, E4M3 scales per 16
 inputs, a per-expert FP32 global scale) in layers 0-19 and MXFP8 experts (E4M3
 codes, E8M0 scales per 32 inputs) in layers 20-23. Weights are copied verbatim
-into one Metal buffer; nothing is re-quantized. The runtime needs numpy and the
+into one Metal buffer; nothing is re-quantized (the row programs add a copy of
+the NVFP4 experts with the same codes and scales in another order). The runtime needs numpy and the
 plan library only (no PyTorch, no MLX).
 
 The arithmetic contract for a one-token step is `mlx-lm`'s (the reference
@@ -21,7 +22,7 @@ engine below, with Inkling 2 support): a step reproduces its logits bit for bit
 | | |
 |---|---|
 | Checkpoint | `thinkingmachines/Inkling-2-Mini` directory (`config.json`, `generation_config.json`, `model-*.safetensors`, `mtp.safetensors` for speculative decoding, `tokenizer.json`, `chat_template.jinja`); validated revision `ed40e7da625f594fc9c4990f5f66be24873c22d7` |
-| Hardware | Apple M4 Pro / M4 Max (Metal GPU family Apple9), 20+ GPU cores (the decode step keeps 36 threadgroups co-resident), 48 GB unified memory or more (19.5 GB weights; KV and conv state per sequence) |
+| Hardware | Apple M4 Pro / M4 Max (Metal GPU family Apple9), 20+ GPU cores (the decode step keeps 36 threadgroups co-resident), 48 GB unified memory or more (19.5 GB weights, 11.5 GB re-ordered NVFP4 experts for the row programs; KV and conv state per sequence) |
 | Software | macOS 26.2 or newer (validated on 26.7.3), Xcode command line tools to build the plan library |
 | Python | 3.10+, numpy; `tokenizers` + `jinja2` for the tokenizer and chat template |
 
@@ -115,8 +116,17 @@ and the expert combination (the decode step's device functions), and products:
   rows; each row's arithmetic is the decode step's, so a row's result does not
   depend on the batch;
 - more rows, TensorOps products (the independent products of a visit in one
-  dispatch) and expert tiles grouped by expert, with the experts that received
-  at most 3 rows on the per-expert quantized product.
+  dispatch); the NVFP4 experts on SIMD-group matrix multiplies over a copy of
+  their weights re-ordered on the GPU at load (11.5 GB): 8 x 8 fragments of
+  activations times weights in FP32, the weight fragment decoded in registers,
+  the inputs of each 128-input block permuted so that a lane loads 8 adjacent
+  activations at once. Up to 64 rows one threadgroup runs all 32-row passes of
+  an expert; above, every pass has its threadgroup (the expert scan's row
+  tiles), so the large experts of a prefill chunk spread over the GPU. Experts
+  that received at most 2 rows take the per-expert quantized product. The
+  MXFP8 experts run TensorOps tiles grouped by expert (experts with at most 3
+  rows on the quantized product). `Inkling2Runtime.expert_mma = 0` keeps every
+  expert on TensorOps tiles and skips the copy.
 
 **Speculative decoding.** The drafter follows SGLang's
 `Inkling2ForConditionalGenerationMTP` (a DFlash block drafter with DSpark's RNN
@@ -145,11 +155,14 @@ sliding-window K / V of its rows; only the accepted rows are committed.
   states at position 0 and are batch-invariant; across positions their
   attention partitions differ from the step's.
 - **Prefill and larger batches are equivalent, not bit-identical**: products
-  as TensorOps tiles (FP32 accumulation), FlashRT's attention partitions. For a
-  1024-token prompt the last position's logits differ from `mlx-lm`'s
-  one-token evaluation by KL 9.0e-6, below the reference engine's own
-  difference between its batched and stepwise evaluation (KL 4.7e-5); the
-  first token agrees.
+  as TensorOps tiles or SIMD-group matrix multiplies (FP32 accumulation in a
+  different order), FlashRT's attention partitions. For a 1024-token prompt the
+  last position's logits differ from `mlx-lm`'s one-token evaluation by KL
+  1.5e-5 (9.0e-6 with every expert on TensorOps tiles), below the reference
+  engine's own difference between its batched and stepwise evaluation (KL
+  4.7e-5); the first token agrees. A batched decode step's logits differ
+  between the two expert paths by a mean KL of 0.5-1.2e-4, the spread of
+  moving the few-row experts between the quantized product and the tiles.
 - **Sampling** keeps the tokens `mlx-lm`'s sampler keeps for the same top-k and
   top-p (the nucleus over the full distribution intersected with the top-k) and
   draws by Gumbel-max at the temperature with FlashRT's counter-based noise:
@@ -175,8 +188,9 @@ FLASHRT_INKLING2_DIR=/path/to/Inkling-2-Mini python -m pytest tests/test_inkling
 The Mac file checks the one-row program against the decode step (every
 visit's hidden state, bit for bit), batch invariance of a four-row decode step,
 chunked against one-chunk prefill, speculative against plain greedy decoding,
-sampling (top-k 1 equals greedy, seeds reproduce), the input checks and the
-chat path.
+sampling (top-k 1 equals greedy, seeds reproduce), the input checks, the chat
+path, the re-ordered expert copy against its numpy reference and the tiled
+expert passes against the per-expert ones (bit for bit).
 
 ### Equivalence with the reference engine (M4 Pro, macOS 26)
 
@@ -187,9 +201,10 @@ chat path.
   after every one of the 48 layer visits at the 12 steps where they were
   recorded.
 - **Prefill.** Last-position logits after the same text's first 1024 tokens as
-  one chunk: KL(reference || FlashRT) = 9.0e-6, largest logit difference 0.68;
-  the reference engine's batched and one-token evaluations of the same prompt
-  differ by KL 4.7e-5. The first token is the same.
+  one chunk: KL(reference || FlashRT) = 1.5e-5, largest logit difference 0.67
+  (every expert on TensorOps tiles: 9.0e-6, 0.68); the reference engine's
+  batched and one-token evaluations of the same prompt differ by KL 4.7e-5.
+  The first token is the same.
 
 ## M4 Pro numbers
 
@@ -208,10 +223,10 @@ different prompt slices and reports the median of the last two.
 
 | C | mlx-lm, two runs | FlashRT | vs mlx-lm | FlashRT + DSpark | vs mlx-lm | accepted tokens per step |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 26.0 / 26.0 (`stream_generate` 28.4 / 28.5) | **35.2** | 1.24x | **54.2** (45.9-62.5) | 1.91x | 4.8-6.6 of 8 |
-| 4 | 52.2 / 52.2 | **64.0** | 1.23x | **81.3** (75.7-86.9) | 1.56x | 5.3-5.4 of 8 |
-| 16 | 71.2 / 69.9 | **101.9** | 1.44x | **131.3** (126.4-136.2) | 1.86x | 3.5-3.6 of 4 |
-| 64 | 113.1 / 116.7 | **169.1** | 1.47x | **185.6** (180.3-190.9) | 1.62x | 2.8 of 3 |
+| 1 | 26.0 / 26.1 (`stream_generate` 28.4 / 28.5) | **35.3** | 1.24x | **58.9** (49.1-68.7) | 2.07x | 4.8-6.8 of 8 |
+| 4 | 53.0 / 52.2 | **64.3** | 1.22x | **89.0** (85.9-92.1) | 1.69x | 5.1-5.2 of 8 |
+| 16 | 72.5 / 72.6 | **116.3** | 1.60x | **155.8** (151.8-159.7) | 2.15x | 3.5-3.6 of 4 |
+| 64 | 120.0 / 120.3 | **210.7** | 1.75x | **218.9** (214.3-223.5) | 1.82x | 2.8 of 3 |
 
 mlx-lm runs these concurrency levels on its BatchGenerator (the engine of
 `mlx_lm.server`); at C = 1 its single-sequence `stream_generate` is faster and
@@ -223,12 +238,12 @@ rows buys less.
 
 ### Prefill (seconds until every sequence has its first token)
 
-| C | mlx-lm | FlashRT |
+| C | mlx-lm, two runs | FlashRT |
 |---:|---:|---:|
-| 1 | 2.17-2.25 | 2.16 |
-| 4 | 9.26-9.33 | 9.45 |
-| 16 | 36.4-36.7 | 39.4 |
-| 64 | 151.5-153.1 | 155.2 |
+| 1 | 2.17 / 2.17 | 2.08 |
+| 4 | 8.85 / 8.91 | 9.12 |
+| 16 | 35.7 / 35.7 | 37.2 |
+| 64 | 149.9 / 148.5 | 147.8 |
 
 FlashRT prefills the prompts one after another (chunks of up to 1024 rows);
 mlx-lm prefills up to eight prompts together.
@@ -238,7 +253,7 @@ mlx-lm prefills up to eight prompts together.
 At 1-2K context a token reads about 5.8 GB: the attention, output-projection and
 LM-head weights (3.7 GB), the eight experts of each of the 48 visits (1.8 GB)
 and the KV it attends to. At the M4 Pro's measured 254 GB/s streaming rate that
-is 22.8 ms; the step takes 28.4 ms (35.2 tokens/s). The projections, output
+is 22.8 ms; the step takes 28.3 ms (35.3 tokens/s). The projections, output
 projection and LM head stream at that rate, the expert products at 85-94 % of
 it; the remaining time is attention (about 1.5 ms) and the device-scope
 barriers between the step's phases (about 2 ms).
@@ -251,7 +266,7 @@ the drafter and 147.8 / 534.6 / 1620.5 / 4058.8 with it (29.7 / 31.4 / 36.1 /
 47.5 ms and 5.2 / 6.1 / 7.3 / 10.9 ms per token). Those runs measure SGLang's
 output throughput over the whole benchmark, prefill included, on a GPU with
 about 30 times the M4 Pro's memory bandwidth. At C = 1 without the drafter, a
-FlashRT token on the M4 Pro takes 28.4 ms.
+FlashRT token on the M4 Pro takes 28.3 ms.
 
 ### Reproduce
 

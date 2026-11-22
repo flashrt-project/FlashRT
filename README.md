@@ -347,16 +347,17 @@ mlx-lm with Inkling 2 support (BatchGenerator; `stream_generate` at C = 1).
 
 | Concurrency | mlx-lm tok/s | FlashRT tok/s | FlashRT + DSpark tok/s |
 |---:|---:|---:|---:|
-| 1 | 28.4 (`stream_generate`) | **35.2** | **54.2** |
-| 4 | 52.2 | **64.0** | **81.3** |
-| 16 | 70.6 | **101.9** | **131.3** |
-| 64 | 114.9 | **169.1** | **185.6** |
+| 1 | 28.4 (`stream_generate`) | **35.3** | **58.9** |
+| 4 | 52.6 | **64.3** | **89.0** |
+| 16 | 72.6 | **116.3** | **155.8** |
+| 64 | 120.1 | **210.7** | **218.9** |
 
-Prefill of the 1024-token prompts matches mlx-lm (2.16 s against 2.17-2.25 s
-at C = 1). DSpark's gain depends on the text (source code here) and shrinks as
-the batch grows, since the M4 Pro is compute-bound from C = 16. A FlashRT token
-at C = 1 takes 28.4 ms; the model card's SGLang run on one B300 reports 29.7 ms
-without the drafter (whole-benchmark throughput, prefill included).
+Prefill of the 1024-token prompts matches mlx-lm (2.08 s against 2.17 s at
+C = 1, 147.8 s against 148.5-149.9 s at C = 64). DSpark's gain depends on the
+text (source code here) and shrinks as the batch grows, since the M4 Pro is
+compute-bound from C = 16. A FlashRT token at C = 1 takes 28.3 ms; the model
+card's SGLang run on one B300 reports 29.7 ms without the drafter
+(whole-benchmark throughput, prefill included).
 
 ### Qwen3-8B
 
