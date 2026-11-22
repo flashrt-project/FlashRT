@@ -355,6 +355,10 @@ class Inkling2Runtime(_MTPMixin):
     mma_rows = 2
     mma_limit = 1 << 30
     mma_tile_rows = 64
+    # Programs of at most expert_overlap_rows rows run the qmv experts and the MMA / TensorOps experts of a stage
+    # concurrently (no barrier between their dispatches; NativePlan.dispatch(barrier=False)): 1% faster up to 32
+    # rows, not above. 0 disables.
+    expert_overlap_rows = 32
     expert_k32 = 64             # up to this many rows the gate/up tiles dequantize 32-input slices (64 otherwise)
     # expert tiles by row count (8 assignments per row over 128 experts: R / 16 rows per expert on average)
     expert_tiles = {64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
@@ -536,45 +540,51 @@ class Inkling2Runtime(_MTPMixin):
             plan.dispatch("ink_expert_place_rows", [(b["r_ids"], 0, READ), (b["r_starts"], 0, READ),
                           (b["r_cursors"], 0, READ_WRITE), (b["r_slot"], 0, WRITE), (b["r_y"], 0, READ),
                           (b["r_xp"], 0, WRITE), vis], (R * 8, 1, 1), 256, label="place")
-            if gemv or few:
-                # per-expert qmv: every expert (gemv) or the experts with at most `few` rows (hybrid)
-                limit = few
-                for gu, w, s_, gs, k, src, dst in ((1, D_W13, D_S13, D_GS13, H, "r_xp", "r_act"),
-                                                   (0, D_W2, D_S2, D_GS2, I, "r_act", "r_ep")):
-                    wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, limit], np.uint64).tobytes())
+            qmv = gemv or few > 0      # per-expert qmv: every expert (gemv) or those with at most `few` rows
+            tiles = not (gemv or mma)  # TensorOps tiles for the experts qmv leaves
+            if mma and self._arranged is None:
+                self._allocate_arranged()
+            # gate/up, then down. Within a stage the qmv experts and the others write disjoint rows of the
+            # same output, and each down product reads only its own gate/up rows: up to expert_overlap_rows
+            # rows the larger experts' dispatch has no barrier, so the two run concurrently.
+            concurrent = R <= self.expert_overlap_rows and qmv and (mma or tiles)
+            for gu in (1, 0):
+                src, dst = ("r_xp", "r_act") if gu else ("r_act", "r_ep")
+                if qmv:
+                    w, s_, gs, k = (D_W13, D_S13, D_GS13, H) if gu else (D_W2, D_S2, D_GS2, I)
+                    wq = self._param(np.array([d[w], d[s_], d[gs] if not mx else 0, few], np.uint64).tobytes())
                     sh = self._param(np.array([gu, mx, 2 * I if gu else H, k], np.uint32).tobytes())
                     plan.dispatch("ink_experts_qmv_rows", [W, (b[src], 0, READ), (b[dst], 0, WRITE), (A, wq, READ),
                                   (b["r_starts"], 0, READ), (A, sh, READ)], ((2 * I if gu else H) // 32, E, 1), 256,
                                   label="experts_gateup" if gu else "experts_down")
-            if mma:
-                if self._arranged is None:
-                    self._allocate_arranged()
-                ag, ags, ad, ads = self._arranged[layer]
-                for name, codes, scales, gs, k, wrows, nout, src, dst in (
-                        ("ink_experts_mma_gateup", ag, ags, D_GS13, H, 2 * I, I, "r_xp", "r_act"),
-                        ("ink_experts_mma_down", ad, ads, D_GS2, I, H, H, "r_act", "r_ep")):
+                if mma:
+                    ag, ags, ad, ads = self._arranged[layer]
+                    name, codes, scales, gs, k, wrows, nout = (
+                        ("ink_experts_mma_gateup", ag, ags, D_GS13, H, 2 * I, I) if gu else
+                        ("ink_experts_mma_down", ad, ads, D_GS2, I, H, H))
                     prm = self._param(np.array([codes, scales, d[gs]], np.uint64).tobytes() +
                                       np.array([k, wrows, few, nout], np.uint32).tobytes())
                     if mtiles:
                         plan.dispatch(name + "_tiles", [W, (b["arranged"], 0, READ), (b[src], 0, READ),
                                       (b[dst], 0, WRITE), (A, prm, READ), (b["r_starts"], 0, READ),
                                       (b["r_tiles"], 0, READ)], (wrows // 64, (R * 8 + 31) // 32 + E, 1), 256,
-                                      label=name)
+                                      label=name, barrier=not concurrent)
                     else:
                         plan.dispatch(name, [W, (b["arranged"], 0, READ), (b[src], 0, READ), (b[dst], 0, WRITE),
                                              (A, prm, READ), (b["r_starts"], 0, READ)], (wrows // 64, E, 1), 256,
-                                      label=name)
-            tiles_y = (R * 8 + tm - 1) // tm + E
-            for name, w, s_, gs, k, n_out, src, dst in (() if (gemv or mma) else (
-                    ("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I, "r_xp", "r_act"),
-                    ("ink_experts_down", D_W2, D_S2, D_GS2, I, H, "r_act", "r_ep"))):
-                blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
-                    np.array([d[w], d[s_], d[gs] if not mx else 0], np.uint64).tobytes()
-                prm = self._param(blob)
-                k32 = name == "ink_experts_gateup" and R <= self.expert_k32
-                kn = f"{name}_t{tm}x{etn}s{esg}{'k32' if k32 else ''}"
-                plan.dispatch(kn, [(b[src], 0, READ), W, (b[dst], 0, WRITE), (A, prm, READ), (b["r_starts"], 0, READ),
-                              (b["r_tiles"], 0, READ)], ((n_out + etn - 1) // etn, tiles_y, 1), esg * 32, label=kn)
+                                      label=name, barrier=not concurrent)
+                if tiles:
+                    name, w, s_, gs, k, n_out = (("ink_experts_gateup", D_W13, D_S13, D_GS13, H, I) if gu else
+                                                 ("ink_experts_down", D_W2, D_S2, D_GS2, I, H))
+                    blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
+                        np.array([d[w], d[s_], d[gs] if not mx else 0], np.uint64).tobytes()
+                    prm = self._param(blob)
+                    k32 = gu and R <= self.expert_k32
+                    kn = f"{name}_t{tm}x{etn}s{esg}{'k32' if k32 else ''}"
+                    tiles_y = (R * 8 + tm - 1) // tm + E
+                    plan.dispatch(kn, [(b[src], 0, READ), W, (b[dst], 0, WRITE), (A, prm, READ),
+                                  (b["r_starts"], 0, READ), (b["r_tiles"], 0, READ)],
+                                  ((n_out + etn - 1) // etn, tiles_y, 1), esg * 32, label=kn, barrier=not concurrent)
             rv2 = self._visit_param(v, R, nblocks, slots, bslot, pad=1)
             for prm, lbl in ((rv, "combine"), (rv2, "mlp_conv")):
                 plan.dispatch("ink_combine_rows", [W, T, (b["r_ep"], 0, READ), (b["r_slot"], 0, READ),

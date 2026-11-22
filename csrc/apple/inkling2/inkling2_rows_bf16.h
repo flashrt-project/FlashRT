@@ -850,8 +850,7 @@ template<bool GATEUP>
 inline void experts_mma_nv(const device uchar* weights,const device uchar* arranged,const device ushort* xin,
                            device ushort* out,constant ExpertsMma& p,const device uint* starts,uint2 g,uint lane,
                            uint simd,const threadgroup float* lut) {
-    const uint e=g.y,a0=starts[e],a1=starts[e+1];
-    if(a1<=a0 || a1-a0<=p.limit)return;
+    const uint e=g.y,a0=starts[e],a1=starts[e+1];      // the entry checked mma_expert_live
     const uint blk=g.x*8u+simd,nrb=p.wrows/8u;
     if(blk>=nrb)return;
     const uint K=p.k,nkb=K/128u;
@@ -867,11 +866,17 @@ inline void experts_mma_nv(const device uchar* weights,const device uchar* arran
         else experts_mma_pass<GATEUP,1>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
     }
 }
+// Threadgroups without work leave before the table and its barrier (most experts of a batched step have no MMA rows).
+inline bool mma_expert_live(constant ExpertsMma& p,const device uint* starts,uint e) {
+    const uint a0=starts[e],a1=starts[e+1];
+    return a1>a0 && a1-a0>p.limit;
+}
 #define INK_EXPERTS_MMA(NAME,GATEUP) \
 kernel void NAME(const device uchar* weights [[buffer(0)]],const device uchar* arranged [[buffer(1)]], \
     const device ushort* xin [[buffer(2)]],device ushort* out [[buffer(3)]],constant ExpertsMma& p [[buffer(4)]], \
     const device uint* starts [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) { \
+    if(!mma_expert_live(p,starts,g.y))return; \
     threadgroup float lut[16]; \
     if(simd==0u&&lane<16u)lut[lane]=e2m1(lane); \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
@@ -885,8 +890,7 @@ template<bool GATEUP>
 inline void experts_mma_tiles(const device uchar* weights,const device uchar* arranged,const device ushort* xin,
                               device ushort* out,constant ExpertsMma& p,const device uint* starts,
                               const device uint* tile_starts,uint2 g,uint lane,uint simd,const threadgroup float* lut) {
-    if(g.y>=tile_starts[128])return;
-    uint lo=0u,hi=128u;
+    uint lo=0u,hi=128u;                                 // the entry checked g.y < tile_starts[128]
     while(hi-lo>1u){const uint mid=(lo+hi)/2u;if(tile_starts[mid]<=g.y)lo=mid;else hi=mid;}
     const uint e=lo,a1=starts[e+1],b0=starts[e]+(g.y-tile_starts[e])*32u;
     const uint blk=g.x*8u+simd,nrb=p.wrows/8u;
@@ -908,6 +912,7 @@ kernel void NAME(const device uchar* weights [[buffer(0)]],const device uchar* a
     const device uint* starts [[buffer(5)]],const device uint* tile_starts [[buffer(6)]], \
     uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]], \
     uint simd [[simdgroup_index_in_threadgroup]]) { \
+    if(g.y>=tile_starts[128])return; \
     threadgroup float lut[16]; \
     if(simd==0u&&lane<16u)lut[lane]=e2m1(lane); \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
