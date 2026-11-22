@@ -54,8 +54,13 @@ void* frt_apple_plan_data(void* p,uint32_t id,size_t off,size_t n) {
 }
 int frt_apple_plan_dispatch(void* p,const char* name,const uint32_t* ids,const size_t* offsets,
     const uint32_t* access,size_t n,const size_t* groups,size_t threads,const char* label) {
+    return frt_apple_plan_dispatch_flags(p,name,ids,offsets,access,n,groups,threads,label,0u);
+}
+int frt_apple_plan_dispatch_flags(void* p,const char* name,const uint32_t* ids,const size_t* offsets,
+    const uint32_t* access,size_t n,const size_t* groups,size_t threads,const char* label,uint32_t flags) {
     return guard([&]{auto& x=checked(p);std::lock_guard<std::mutex> lock(x.mutex);
         require(!x.sealed && name && ids && offsets && access && groups && label,"invalid plan dispatch");
+        require((flags & ~FRT_APPLE_PLAN_DISPATCH_CONCURRENT)==0u,"unknown plan dispatch flags");
         require(n>0 && n<=31,"invalid binding count");
         std::string key(name);
         if(!x.kernels.count(key)) {
@@ -68,7 +73,7 @@ int frt_apple_plan_dispatch(void* p,const char* name,const uint32_t* ids,const s
             bindings.push_back({x.buffers.at(ids[i]),offsets[i],static_cast<Access>(access[i])});
         }
         x.current().push_back(Dispatch{x.kernels.at(key),bindings,{groups[0],groups[1],groups[2]},
-            {threads},label});
+            {threads},label,(flags & FRT_APPLE_PLAN_DISPATCH_CONCURRENT)==0u});
     });
 }
 int frt_apple_plan_copy(void* p,uint32_t source,size_t source_offset,

@@ -25,3 +25,44 @@ def test_native_plan_fails_clearly(monkeypatch, tmp_path):
     assert native.default_library() == tmp_path / 'other.dylib'
     with pytest.raises(RuntimeError, match='other.dylib'):
         native.NativePlan()
+
+
+class _Lib:
+    """Records plan dispatch calls; ``flags=False`` models a library built before concurrent dispatches."""
+
+    def __init__(self, flags=True):
+        self.calls = []
+        self.frt_apple_plan_dispatch = lambda *args: self.calls.append(('dispatch', args[-1])) or 0
+        if flags:
+            self.frt_apple_plan_dispatch_flags = _Fn(lambda *args: self.calls.append(('flags', args[-1])) or 0)
+
+
+class _Fn:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *args):
+        return self.fn(*args)
+
+
+def _plan(lib):
+    from flash_rt.hardware.apple_native import native
+    plan = native.NativePlan.__new__(native.NativePlan)
+    plan.lib, plan.handle, plan.labels, plan._recording = lib, None, {0: []}, 0
+    return plan
+
+
+def test_dispatch_barrier_default_keeps_the_original_call():
+    lib = _Lib()
+    plan = _plan(lib)
+    plan.dispatch('k', [(0, 0, 0)], (1,), 32, label='a')
+    plan.dispatch('k', [(0, 0, 0)], (1,), 32, label='b', barrier=False)
+    assert lib.calls == [('dispatch', b'a'), ('flags', 1)]
+    assert plan.labels[0] == ['a', 'b']
+
+
+def test_concurrent_dispatch_needs_a_rebuilt_library():
+    plan = _plan(_Lib(flags=False))
+    plan.dispatch('k', [(0, 0, 0)], (1,), 32)
+    with pytest.raises(RuntimeError, match='frt_apple_plan_dispatch_flags'):
+        plan.dispatch('k', [(0, 0, 0)], (1,), 32, barrier=False)

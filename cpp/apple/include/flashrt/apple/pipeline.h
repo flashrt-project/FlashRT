@@ -47,6 +47,12 @@ struct Dispatch {
     Size threadgroups;
     Size threads_per_threadgroup;
     std::string label;
+    // true (default): the dispatch starts after every earlier operation of the program has finished.
+    // false: no barrier before it, so it may run concurrently with the dispatches issued since the last barrier
+    // (the next dispatch with a barrier waits for all of them). The caller guarantees that none of them writes
+    // memory another one reads or writes. No effect on the first dispatch after a buffer copy, which always
+    // waits for the copy.
+    bool barrier = true;
 };
 struct BufferCopy {
     Binding source;

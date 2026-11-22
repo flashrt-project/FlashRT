@@ -174,6 +174,55 @@ int main() { try {
     }();
     retained.run(Execution::direct);
     retained.run(Execution::icb);
+    // Dispatches without a barrier run concurrently with the ones since the last barrier; the next barrier
+    // waits for all of them, and a copy still orders the dispatch after it.
+    {
+        constexpr unsigned n = 1u << 20;
+        std::vector<Buffer> x, y, z;
+        for (unsigned i = 0; i < 2; ++i) {
+            x.push_back(context.buffer(n * sizeof(float)));
+            y.push_back(context.buffer(n * sizeof(float)));
+            z.push_back(context.buffer(n * sizeof(float)));
+        }
+        auto staged = context.buffer(n * sizeof(float));
+        Params p{2, 1, n};
+        parameters.write(&p, sizeof(p));
+        auto step = [&](Buffer in, Buffer out, bool barrier) {
+            Dispatch d{kernel, {{in}, {out, 0, Access::write}, {parameters}}, {n / 64, 1, 1}, {64, 1, 1}};
+            d.barrier = barrier;
+            return d;
+        };
+        auto concurrent = context.program({
+            step(x[0], y[0], true), step(x[1], y[1], false),     // independent pair
+            step(y[0], z[0], true), step(y[1], z[1], false),     // after the barrier: both see their input
+            BufferCopy{{z[1]}, {staged, 0, Access::write}, n * sizeof(float), "stage"},
+            step(staged, y[1], false),                           // first after a copy: waits for it
+        });
+        check(concurrent.dispatch_count() == 5, "wrong concurrent dispatch count");
+        std::vector<float> in0(n), in1(n), out(n);
+        for (unsigned i = 0; i < n; ++i) { in0[i] = (i % 97) * 0.25f; in1[i] = (i % 89) * -0.5f; }
+        for (auto mode : {Execution::direct, Execution::icb}) {
+            for (unsigned i = 0; i < 2; ++i) {
+                std::vector<float> zero(n, -1.0f);
+                y[i].write(zero.data(), y[i].size());
+                z[i].write(zero.data(), z[i].size());
+            }
+            x[0].write(in0.data(), x[0].size());
+            x[1].write(in1.data(), x[1].size());
+            concurrent.run(mode);
+            z[0].read(out.data(), z[0].size());
+            for (unsigned i = 0; i < n; ++i)
+                check(out[i] == std::fma(std::fma(in0[i], 2.0f, 1.0f), 2.0f, 1.0f), "barrier missed the first pair");
+            z[1].read(out.data(), z[1].size());
+            for (unsigned i = 0; i < n; ++i)
+                check(out[i] == std::fma(std::fma(in1[i], 2.0f, 1.0f), 2.0f, 1.0f), "barrier missed a concurrent dispatch");
+            y[1].read(out.data(), y[1].size());
+            for (unsigned i = 0; i < n; ++i)
+                check(out[i] == std::fma(std::fma(std::fma(in1[i], 2.0f, 1.0f), 2.0f, 1.0f), 2.0f, 1.0f),
+                      "dispatch after a copy did not wait for it");
+        }
+        std::cout << "concurrent dispatches: PASS\n";
+    }
     std::cout << "compute/blit ordering, bounds, ownership, context isolation: PASS\n";
     return 0;
 } catch (const std::exception& error) {

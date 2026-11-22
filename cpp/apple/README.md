@@ -66,7 +66,7 @@ Run timing without Metal validation or Instruments; use a separate process
 for tracing. No CMake or offline shader compiler is required by the build script.
 
 Both build paths hide C++ implementation symbols and use the same Mach-O
-allowlists: [`plan.exports`](plan.exports) (16 private plan C entry points)
+allowlists: [`plan.exports`](plan.exports) (17 private plan C entry points)
 and [`signpost.exports`](signpost.exports) (2 tracing entry points). Every link
 runs [`check_exports.sh`](../../scripts/apple/check_exports.sh), which fails
 on missing or extra exports. These are Apple adapter interfaces, separate
@@ -85,6 +85,17 @@ program. `frt_apple_plan_profile_program` is the per-operation diagnostic of an
 additional program. The torch-free `flash_rt.hardware.apple_native.native.NativePlan`
 binding records only additional programs; `tests/test_apple_w4a16_affine.py`
 covers the API and its error paths.
+
+Every dispatch of a program waits for every earlier operation (a barrier before
+each ICB command, a buffer-scope memory barrier between direct dispatches).
+`frt_apple_plan_dispatch_flags` with `FRT_APPLE_PLAN_DISPATCH_CONCURRENT`
+(`Dispatch::barrier = false`, `NativePlan.dispatch(..., barrier=False)`) records
+a dispatch without that barrier: it may run concurrently with the dispatches
+since the last barrier, and the next dispatch with a barrier waits for all of
+them. The caller guarantees that none of them writes memory another one reads
+or writes. A dispatch after a buffer copy still waits for the copy. Callers that
+never pass the flag record exactly the programs they recorded before it;
+`flashrt_apple_smoke` and `tests/test_apple_native_concurrent.py` cover both.
 
 ### Fixed vision + prefix + decoder replay
 

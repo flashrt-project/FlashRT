@@ -26,6 +26,7 @@ struct Node {
     std::vector<std::size_t> offsets;
     MTLSize groups{}, threads{};
     std::size_t copy_bytes = 0;
+    bool barrier = true;
 };
 struct Batch { std::size_t begin, count, icb_begin; bool copy; };
 struct Pipeline {
@@ -221,6 +222,7 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
                 node.kernel = d.kernel.impl_;
                 node.groups = dimensions(d.threadgroups);
                 node.threads = dimensions(d.threads_per_threadgroup);
+                node.barrier = d.barrier;
                 auto limit = node.kernel->value.maxTotalThreadsPerThreadgroup;
                 auto axis = impl_->device.maxThreadsPerThreadgroup;
                 require(node.threads.width <= axis.width && node.threads.height <= axis.height &&
@@ -267,7 +269,7 @@ Pipeline Context::program(const std::vector<Operation>& operations, const std::s
                 const auto& n = p->nodes[i];
                 if (n.copy_bytes) continue;
                 id<MTLIndirectComputeCommand> command = [p->icb indirectComputeCommandAtIndex:command_index++];
-                if (i && !p->nodes[i - 1].copy_bytes) [command setBarrier];
+                if (i && !p->nodes[i - 1].copy_bytes && n.barrier) [command setBarrier];
                 [command setComputePipelineState:n.kernel->value];
                 for (std::size_t j = 0; j < n.buffers.size(); ++j)
                     [command setKernelBuffer:n.buffers[j]->value offset:n.offsets[j] atIndex:j];
@@ -314,7 +316,7 @@ Timing Pipeline::run(Execution mode) const {
             } else {
                 for (std::size_t i = batch.begin; i < batch.begin + batch.count; ++i) {
                     const auto& n = impl_->nodes[i];
-                    if (i != batch.begin) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    if (i != batch.begin && n.barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                     if (n.label.length) [encoder pushDebugGroup:n.label];
                     [encoder setComputePipelineState:n.kernel->value];
                     for (std::size_t j = 0; j < n.buffers.size(); ++j)
