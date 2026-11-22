@@ -179,3 +179,28 @@ def test_sampling_parameters_are_checked(top_k, top_p, temperature):
     from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
     with pytest.raises(ValueError):
         Inkling2Runtime._check_sampling(top_k, top_p, temperature)
+
+
+def test_nvfp4_mma_arrangement_holds_every_weight_once():
+    from flash_rt.frontends.torch._inkling2_mps_runtime import nvfp4_mma_arrangement
+    rng = np.random.default_rng(0)
+    rows, K = 16, 256
+    codes = rng.integers(0, 256, (rows, K // 2), dtype=np.uint8)
+    scales = rng.integers(0, 256, (rows, K // 16), dtype=np.uint8)
+    arranged, ascales = nvfp4_mma_arrangement(codes, scales)
+    nibbles = np.stack([codes & 15, codes >> 4], axis=-1).reshape(rows, K)
+    rebuilt = np.zeros((rows, K), np.int64)
+    seen = np.zeros((rows, K), np.int64)
+    for lane in range(32):
+        fm = ((lane // 4) & 4) + (lane // 2) % 4
+        fn = ((lane // 4) & 2) * 2 + (lane % 2) * 2
+        for f in range(16):
+            k = (f // 4) * 32 + 8 * (fm // 2) + 2 * (f % 4) + fm % 2
+            for rb in range(rows // 8):
+                for kb in range(K // 128):
+                    byte = int(arranged[rb, kb, lane, f])
+                    for r, v in ((rb * 8 + fn, byte & 15), (rb * 8 + fn + 1, byte >> 4)):
+                        rebuilt[r, kb * 128 + k] = v
+                        seen[r, kb * 128 + k] += 1
+    assert (seen == 1).all() and np.array_equal(rebuilt, nibbles)
+    assert np.array_equal(ascales[1, 0, 3], scales[11, :8]) and np.array_equal(ascales[0, 1, 7], scales[7, 8:])

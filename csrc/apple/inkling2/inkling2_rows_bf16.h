@@ -759,6 +759,126 @@ kernel void ink_experts_qmv_rows(const device uchar* weights [[buffer(0)]],const
     const uint nout=gateup?wrows/2u:wrows;
     if(row0<wrows)experts_qmv_body<2u>(codes,scales,xin,out,e,row0,a0,a1,gateup,mx,wrows,K,inv,nout,lane,lut);
 }
+// ---- NVFP4 experts on SIMD-group MMAs: activations x weights^T per 8x8 fragment (A = 8 activation rows x 8
+// inputs, B = the same 8 inputs x 8 weight rows). Per 128-input block, fragment f = 4q + j (q, j < 4) takes the
+// inputs 32q + 4c' + 2j + {0, 1} for A columns c = 2c' + {0, 1}: a lane's A elements of the 4 fragments of one q are
+// 8 adjacent BF16 inputs (one 16-byte load per activation row), and its B row (input) fm lies in 16-input scale
+// group 2q + fm / 4. ink_nv_arrange (once, at load) re-arranges an expert matrix [rows][K] to match: for an 8-row
+// block and 128 inputs, lane l's 16 bytes hold, per fragment, the codes of weight rows fn and fn + 1 at the lane's
+// input (low / high nibble), one coalesced 16-byte load per lane; the block's 8 rows x 8 E4M3 scales follow in a
+// second array ([block][input block][row][group]). Buffers bind at offset 0 and the matrices are addressed by byte
+// offsets in the parameters (ICB binding offsets beyond 4 GiB are not honoured).
+struct NvArrange { ulong codes, scales, acodes, ascales; uint e, rows, k, pad; };
+inline uint mma_input(uint f,uint r){return (f/4u)*32u+(r&6u)*4u+(f%4u)*2u+(r&1u);}
+kernel void ink_nv_arrange(const device uchar* weights [[buffer(0)]],device uchar* arranged [[buffer(1)]],
+    constant NvArrange& p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
+    const uint E=p.e,rows=p.rows,K=p.k,nrb=rows/8u,nkb=K/128u;
+    const uint lane=i%32u,t=i/32u,kb=t%nkb,rb=(t/nkb)%nrb,e=t/(nkb*nrb);
+    if(e>=E)return;
+    const device uchar* codes=weights+p.codes;
+    const device uchar* scales=weights+p.scales;
+    device uint4* acodes=(device uint4*)(arranged+p.acodes);
+    device uint2* ascales=(device uint2*)(arranged+p.ascales);
+    const uint fm=((lane/4u)&4u)+(lane/2u)%4u,fn=((lane/4u)&2u)*2u+(lane%2u)*2u;
+    const device uchar* r0=codes+(size_t(e)*rows+rb*8u+fn)*(K/2u)+kb*64u;
+    const device uchar* r1=r0+K/2u;
+    uint4 o;
+    for(uint q=0;q<4u;++q) {
+        uint w=0u;
+        for(uint j=0;j<4u;++j) {
+            const uint k=mma_input(q*4u+j,fm),sh=4u*(k&1u);
+            w|=(((uint(r0[k/2u])>>sh)&15u)|(((uint(r1[k/2u])>>sh)&15u)<<4))<<(8u*j);
+        }
+        o[q]=w;
+    }
+    acodes[i]=o;
+    if(lane<8u) {
+        const device uchar* sr=scales+(size_t(e)*rows+rb*8u+lane)*(K/16u)+kb*8u;
+        ascales[size_t(t)*8u+lane]=uint2(uint(sr[0])|(uint(sr[1])<<8)|(uint(sr[2])<<16)|(uint(sr[3])<<24),
+                                       uint(sr[4])|(uint(sr[5])<<8)|(uint(sr[6])<<16)|(uint(sr[7])<<24));
+    }
+}
+// A SIMD group owns one 8-row weight block of one expert and runs the expert's assignments in passes of up to NG
+// groups of 8 rows: per fragment one B fragment dequantized in registers (E2M1 through the 16-entry threadgroup
+// table, times the row's E4M3 scale) and one MMA per activation group. Accumulation FP32; the NVFP4 global scale /
+// (448 * 6) on the sum, rounded to BF16; gate/up rows 2c / 2c + 1 are a lane's two C elements (softcapped SwiGLU in
+// place). Experts with at most `limit` rows are left to qmv.
+struct ExpertsMma { ulong codes, scales, gs; uint k, wrows, limit, nout; };
+template<bool GATEUP,uint NG>
+inline void experts_mma_pass(const device uint4* cb,const device uchar* sb,const device ushort* xin,device ushort* out,
+                             uint K,uint nkb,uint b0,uint a1,uint blk,ushort fm,ushort fn,float inv,uint nout,
+                             const threadgroup float* lut) {
+    simdgroup_float8x8 c[NG];
+    const device ushort* xr[NG];
+    for(uint gi=0;gi<NG;++gi) {
+        c[gi]=simdgroup_float8x8(0.0f);
+        xr[gi]=xin+size_t(min(b0+gi*8u+fm,a1-1u))*K+fn*4u;
+    }
+    const uint hi=fm/4u;
+    for(uint kb=0;kb<nkb;++kb) {
+        const uint4 w=cb[kb*32u];
+        const uint4 sc=*((const device uint4*)(sb+kb*64u+fn*8u));    // rows fn (x, y) and fn + 1 (z, w), 8 groups each
+        const uint s0w[2]={sc.x,sc.y},s1w[2]={sc.z,sc.w};
+        for(uint q=0;q<4u;++q) {
+            const uint g=2u*q+hi;
+            const float s0=e4m3((s0w[g/4u]>>(8u*(g%4u)))&255u),s1=e4m3((s1w[g/4u]>>(8u*(g%4u)))&255u);
+            uint4 xa[NG];
+            for(uint gi=0;gi<NG;++gi)xa[gi]=*((const device uint4*)(xr[gi]+kb*128u+q*32u));
+            for(uint j=0;j<4u;++j) {
+                const uint byte=(w[q]>>(8u*j))&255u;
+                simdgroup_float8x8 bm;
+                bm.thread_elements()[0]=lut[byte&15u]*s0;
+                bm.thread_elements()[1]=lut[byte>>4]*s1;
+                for(uint gi=0;gi<NG;++gi) {
+                    simdgroup_float8x8 am;
+                    am.thread_elements()[0]=lo_f(xa[gi][j]);
+                    am.thread_elements()[1]=hi_f(xa[gi][j]);
+                    simdgroup_multiply_accumulate(c[gi],am,bm,c[gi]);
+                }
+            }
+        }
+    }
+    for(uint gi=0;gi<NG;++gi) {
+        const uint row=b0+gi*8u+fm;
+        if(row>=a1)continue;
+        const float v0=rb(c[gi].thread_elements()[0]*inv),v1=rb(c[gi].thread_elements()[1]*inv);
+        if(GATEUP)out[size_t(row)*nout+blk*4u+fn/2u]=ubf(softcapped_swiglu(v0,v1));
+        else *((device uint*)(out+size_t(row)*nout+blk*8u+fn))=uint(ubf(v0))|(uint(ubf(v1))<<16);
+    }
+}
+template<bool GATEUP>
+inline void experts_mma_nv(const device uchar* weights,const device uchar* arranged,const device ushort* xin,
+                           device ushort* out,constant ExpertsMma& p,const device uint* starts,uint2 g,uint lane,
+                           uint simd,const threadgroup float* lut) {
+    const uint e=g.y,a0=starts[e],a1=starts[e+1];
+    if(a1<=a0 || a1-a0<=p.limit)return;
+    const uint blk=g.x*8u+simd,nrb=p.wrows/8u;
+    if(blk>=nrb)return;
+    const uint K=p.k,nkb=K/128u;
+    const ushort fm=((lane/4u)&4u)+(lane/2u)%4u,fn=((lane/4u)&2u)*2u+(lane%2u)*2u;
+    const device uint4* cb=(const device uint4*)(arranged+p.codes)+(size_t(e)*nrb+blk)*nkb*32u+lane;
+    const device uchar* sb=arranged+p.scales+(size_t(e)*nrb+blk)*nkb*64u;
+    const float inv=fdiv(((const device float*)(weights+p.gs))[e],2688.0f);
+    for(uint b0=a0;b0<a1;b0+=32u) {
+        const uint n=a1-b0;
+        if(n>24u)experts_mma_pass<GATEUP,4>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+        else if(n>16u)experts_mma_pass<GATEUP,3>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+        else if(n>8u)experts_mma_pass<GATEUP,2>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+        else experts_mma_pass<GATEUP,1>(cb,sb,xin,out,K,nkb,b0,a1,blk,fm,fn,inv,p.nout,lut);
+    }
+}
+#define INK_EXPERTS_MMA(NAME,GATEUP) \
+kernel void NAME(const device uchar* weights [[buffer(0)]],const device uchar* arranged [[buffer(1)]], \
+    const device ushort* xin [[buffer(2)]],device ushort* out [[buffer(3)]],constant ExpertsMma& p [[buffer(4)]], \
+    const device uint* starts [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float lut[16]; \
+    if(simd==0u&&lane<16u)lut[lane]=e2m1(lane); \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    experts_mma_nv<GATEUP>(weights,arranged,xin,out,p,starts,g,lane,simd,lut); \
+}
+INK_EXPERTS_MMA(ink_experts_mma_gateup,true)
+INK_EXPERTS_MMA(ink_experts_mma_down,false)
 // ---- debug: copy the hidden rows after a visit into trace[visit]
 kernel void ink_trace_rows(const device ushort* h [[buffer(0)]],device ushort* trace [[buffer(1)]],
     constant uint& n [[buffer(2)]],uint i [[thread_position_in_grid]]) {if(i<n)trace[i]=h[i];}
