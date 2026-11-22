@@ -370,6 +370,8 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.vocab = dint(d, "vocab");
     p.fold_w = dptr<const uint16_t>(d, "fold_w");
     p.fold_b = dptr<const uint16_t>(d, "fold_b");
+    p.fold_w8 = dptr<const uint8_t>(d, "fold_w8");
+    p.fold_scale = dptr<const float>(d, "fold_scale");
     p.pick_best = dptr<float>(d, "pick_best");
     p.pick_index = dptr<int>(d, "pick_index");
     p.pick_counter = dptr<int>(d, "pick_counter");
@@ -406,6 +408,8 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.counter = dptr<int>(d, "counter");
     p.token = dptr<int>(d, "token");
     p.normed_out = dptr<uint16_t>(d, "normed_out");
+    p.weight_fp8 = dptr<const uint8_t>(d, "weight_fp8");
+    p.weight_scale = dptr<const float>(d, "weight_scale");
     p.prefetch = dprefetch(d);
     ik::lm_head(p, to_stream(stream));
   });

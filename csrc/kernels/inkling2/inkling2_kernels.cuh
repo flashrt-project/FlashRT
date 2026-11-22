@@ -274,6 +274,8 @@ struct LmHeadParams {
   const float* in;                  // final depth-attention output (FP32)
   const uint16_t* norm_w;           // final norm
   const uint16_t* weight;           // [vocab rows][kHidden]
+  const uint8_t* weight_fp8;        // or E4M3 codes [vocab rows][kHidden] with weight_scale [vocab rows] (drafter)
+  const float* weight_scale;
   int vocab;                        // unpadded vocabulary
   float softcap;                    // 0: none
   int blocks;
@@ -343,6 +345,8 @@ struct MtpParams {
   int vocab_stride;
   int vocab;                        // unpadded
   const uint16_t* fold_w;           // [vocab][256]
+  const uint8_t* fold_w8;           // or E4M3 codes [vocab][256] with fold_scale [vocab]
+  const float* fold_scale;
   const uint16_t* fold_b;           // [vocab]
   float* pick_best;                 // [mtp_pick_blocks()]
   int* pick_index;

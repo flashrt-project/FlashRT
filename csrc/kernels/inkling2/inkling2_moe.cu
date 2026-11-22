@@ -785,6 +785,8 @@ __global__ void __launch_bounds__(kExpertThreads) expert_route_kernel(const __gr
 }
 
 constexpr int kFlatThreads = 256;       // one block per SM; the decoded share needs the registers of 256 threads
+// (measured slower: 2-4 raw shares in flight with per-row decoding, 2 blocks per SM, L2 prefetch of the warp range,
+// of sliding windows or of single lines ahead)
 constexpr int kFlatWarps = kFlatThreads / 32;
 
 // A warp's items q0 .. q1 - 1 with one weight share in flight: use(share, q, refill) decodes item q's share and
