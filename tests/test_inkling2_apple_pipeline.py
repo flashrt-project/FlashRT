@@ -169,3 +169,25 @@ def test_mma_expert_copy_matches_the_reference_arrangement():
                     assert np.array_equal(got_c, want_c) and np.array_equal(got_s, want_s), (layer, rows, k, e)
     finally:
         rt.close()
+
+
+def test_mma_tiles_match_per_expert_passes(tokens):
+    """Above mma_tile_rows the expert MMAs run one 32-row pass per threadgroup (scan tiles) instead of all of an
+    expert's passes in one threadgroup: the same passes, so the same logits bit for bit."""
+    from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
+    n = 96
+    ids = (tokens * 8)[:n]
+    info = np.array([[0, i, 0, n - 1] for i in range(n)], np.uint32)
+    saved, out = Inkling2Runtime.mma_tile_rows, []
+    try:
+        for tile_rows in (saved, 1 << 30):
+            Inkling2Runtime.mma_tile_rows = tile_rows
+            rt = _runtime(max_seq=128, row_capacity=n, row_shapes=[(n, 1)])
+            try:
+                rt.run_rows(ids, info, 1)
+                out.append(rt.rows_logits(0).copy())
+            finally:
+                rt.close()
+    finally:
+        Inkling2Runtime.mma_tile_rows = saved
+    assert np.array_equal(out[0].view(np.uint32), out[1].view(np.uint32))
