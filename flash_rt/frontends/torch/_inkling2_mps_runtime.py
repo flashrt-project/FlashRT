@@ -298,6 +298,7 @@ class Inkling2Runtime(_MTPMixin):
     gemv_rows = 4
     hybrid_rows = 3
     hybrid_limit = 1 << 30
+    expert_k32 = 64             # up to this many rows the gate/up tiles dequantize 32-input slices (64 otherwise)
     # expert tiles by row count (8 assignments per row over 128 experts: R / 16 rows per expert on average)
     expert_tiles = {4: (8, 64, 4), 64: (8, 32, 2), 256: (16, 64, 4), 1 << 30: (32, 64, 4)}
 
@@ -490,7 +491,8 @@ class Inkling2Runtime(_MTPMixin):
                 blob = np.array([R * 8, k, n_out, mx], np.uint32).tobytes() + \
                     np.array([d[w], d[s_], d[gs] if not mx else 0], np.uint64).tobytes()
                 prm = self._param(blob)
-                kn = f"{name}_t{tm}x{etn}s{esg}"
+                k32 = name == "ink_experts_gateup" and R <= self.expert_k32
+                kn = f"{name}_t{tm}x{etn}s{esg}{'k32' if k32 else ''}"
                 plan.dispatch(kn, [(b[src], 0, READ), W, (b[dst], 0, WRITE), (A, prm, READ), (b["r_starts"], 0, READ),
                               (b["r_tiles"], 0, READ)], ((n_out + etn - 1) // etn, tiles_y, 1), esg * 32, label=kn)
             rv2 = self._visit_param(v, R, nblocks, slots, bslot, pad=1)

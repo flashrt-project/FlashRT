@@ -300,6 +300,10 @@ inline constexpr KernelSource kernel_registry[] = {
     {"ink_experts_down_t32x64s8", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
     {"ink_experts_gateup_t16x64s8", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
     {"ink_experts_down_t16x64s8", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 64; o.simdgroups = 8; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t8x32s2k32", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 8; o.tile_n = 32; o.simdgroups = 2; o.kslice = 32; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t16x64s4k32", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 64; o.simdgroups = 4; o.kslice = 32; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t32x64s4k32", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 4; o.kslice = 32; return inkling2_rows_gemm_source(o); }},
+    {"ink_experts_gateup_t32x64s8k32", "ink_experts_gateup", [] { Inkling2GemmOptions o; o.tile_m = 32; o.tile_n = 64; o.simdgroups = 8; o.kslice = 32; return inkling2_rows_gemm_source(o); }},
     {"ink_experts_down_t16x32s4", "ink_experts_down", [] { Inkling2GemmOptions o; o.tile_m = 16; o.tile_n = 32; o.simdgroups = 4; return inkling2_rows_gemm_source(o); }},
 };
 
