@@ -27,14 +27,18 @@ namespace flashrt::apple::shaders {
 struct Inkling2DecodeOptions {
     bool sampled = false;   // gumbel top-k / top-p selection instead of greedy argmax
     bool trace = false;     // write the hidden state after every visit and a visit's intermediates
+    int workers = 36;       // resident threadgroups (>= 36: 12 per message gate). All must be co-resident for the
+                            // grid barriers: 40 (2 per core of the 20-core GPU) is 2% faster but leaves no slack,
+                            // and a soak test hit a barrier timeout; 36 keeps 4 threadgroup slots free.
 };
 
 inline std::string inkling2_decode_resident_bf16_source(const Inkling2DecodeOptions& o = {}) {
-    std::string defines = std::string("\n#define FRT_WORKERS 36u") +
+    std::string defines = std::string("\n#define FRT_WORKERS ") + std::to_string(o.workers) + "u" +
         "\n#define FRT_SAMPLED " + std::to_string(o.sampled ? 1 : 0) +
         "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) + "\n";
     return std::string(metal_preamble) + defines + inkling2_common_msl() + R"MSL(
-constant constexpr uint FRT_GROUPS=FRT_WORKERS*8u;        // SIMD groups in the grid (288)
+static_assert(FRT_WORKERS>=36u,"message gates use threadgroups 0..35 (12 per gate)");
+constant constexpr uint FRT_GROUPS=FRT_WORKERS*8u;        // SIMD groups in the grid
 constant constexpr uint FRT_THREADS=FRT_WORKERS*256u;
 struct DecodeParams {
     uint token, position, steps, eos_count;
@@ -212,23 +216,25 @@ kernel void inkling2_decode_resident_bf16(
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
             } else {
-                // message gates q, k, v (threadgroups 12j .. 12j + 11 hold gate j):
+                // message gates q, k, v (threadgroups 12j .. 12j + 11 hold gate j; groups from 36 on idle here):
                 //   s = [rms(input) | rms(message)] -> down (64 rows, BF16) -> forget, gain -> combination
                 const uint j=group/12u;
-                if(full)depth_output_k<3>(bs,slots,nblocks,(const threadgroup ushort*)vh,rinv,dw,j,vr,tid,zero);
-                else depth_output_k<1>(bs,slots,nblocks,(const threadgroup ushort*)vh,rinv,dw,0u,vr,tid,zero);
-                if(group%12u==0u)for(uint i=tid;i<FH;i+=256u)ain[j*FH+i]=vr[i];
-                if(dbg)for(uint i=tid;i<FH;i+=256u)dbgp[j*FDBG+i]=vr[i];
-                const device float* m=msg+(li*4u+j)*FH;
-                const float ia=rms_inv((const threadgroup float*)vr,red,lane,simd);
-                const float im=rms_inv(m,red,lane,simd);
-                for(uint i=tid;i<FH;i+=256u){vx[i]=ubf(vr[i]*ia);vx[FH+i]=ubf(m[i]*im);}
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                const uint r=(group%12u)*8u+simd;
-                if(r<64u) {
-                    const device ushort* wd=(const device ushort*)(weights+d[D_MG+j*3u])+r*4608u;
-                    const float v=gemv_bn8_row(wd,4608u,(const threadgroup ushort*)vx,lane);
-                    if(lane==0)mdown[j*64u+r]=rb(v);
+                if(j<3u) {
+                    if(full)depth_output_k<3>(bs,slots,nblocks,(const threadgroup ushort*)vh,rinv,dw,j,vr,tid,zero);
+                    else depth_output_k<1>(bs,slots,nblocks,(const threadgroup ushort*)vh,rinv,dw,0u,vr,tid,zero);
+                    if(group%12u==0u)for(uint i=tid;i<FH;i+=256u)ain[j*FH+i]=vr[i];
+                    if(dbg)for(uint i=tid;i<FH;i+=256u)dbgp[j*FDBG+i]=vr[i];
+                    const device float* m=msg+(li*4u+j)*FH;
+                    const float ia=rms_inv((const threadgroup float*)vr,red,lane,simd);
+                    const float im=rms_inv(m,red,lane,simd);
+                    for(uint i=tid;i<FH;i+=256u){vx[i]=ubf(vr[i]*ia);vx[FH+i]=ubf(m[i]*im);}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    const uint r=(group%12u)*8u+simd;
+                    if(r<64u) {
+                        const device ushort* wd=(const device ushort*)(weights+d[D_MG+j*3u])+r*4608u;
+                        const float v=gemv_bn8_row(wd,4608u,(const threadgroup ushort*)vx,lane);
+                        if(lane==0)mdown[j*64u+r]=rb(v);
+                    }
                 }
                 SYNC();
                 // forget and gain rows: 3 gates x 2 matrices x 72 tasks of 32 rows
@@ -512,8 +518,9 @@ kernel void inkling2_decode_resident_bf16(
                         }
                     }
                     SYNC();
-                    // merge (sdpa_vector_2pass_2): lane l holds partitions l and l + 32
-                    for(uint h=sg;h<24u;h+=FRT_GROUPS) {
+                    // merge (sdpa_vector_2pass_2): lane l holds partitions l and l + 32; a task = (head, 4 outputs)
+                    for(uint mt=sg;mt<24u*32u;mt+=FRT_GROUPS) {
+                        const uint h=mt/32u;
                         const float m0=stats[(h*64u+lane)*2u],m1=stats[(h*64u+lane+32u)*2u];
                         float top=FRT_MIN;top=max(top,m0);top=max(top,m1);
                         top=simd_max(top);
@@ -524,7 +531,8 @@ kernel void inkling2_decode_resident_bf16(
                         }
                         zs=simd_sum(zs);
                         const float f0=metal::fast::exp(m0-top),f1=metal::fast::exp(m1-top);
-                        for(uint dd=0;dd<128u;dd+=4u) {
+                        {
+                            const uint dd=(mt%32u)*4u;
                             float ov[4];
                             for(uint t=0;t<4;++t) {
                                 float a=0.0f;
