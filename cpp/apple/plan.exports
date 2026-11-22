@@ -4,6 +4,7 @@ _frt_apple_plan_create
 _frt_apple_plan_data
 _frt_apple_plan_destroy
 _frt_apple_plan_dispatch
+_frt_apple_plan_dispatch_flags
 _frt_apple_plan_error
 _frt_apple_plan_finish
 _frt_apple_plan_profile

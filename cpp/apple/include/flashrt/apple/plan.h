@@ -19,6 +19,13 @@ FRT_APPLE_PLAN_API int frt_apple_plan_copy(void*, uint32_t source, size_t source
 FRT_APPLE_PLAN_API int frt_apple_plan_dispatch(void*, const char* kernel, const uint32_t* buffers,
     const size_t* offsets, const uint32_t* access, size_t count,
     const size_t* groups, size_t threads, const char* label);
+// frt_apple_plan_dispatch with flags (0 is frt_apple_plan_dispatch). FRT_APPLE_PLAN_DISPATCH_CONCURRENT: no
+// barrier before this dispatch; it may run concurrently with the dispatches since the last barrier, which the
+// caller guarantees write no memory another of them reads or writes (Dispatch::barrier = false).
+#define FRT_APPLE_PLAN_DISPATCH_CONCURRENT 1u
+FRT_APPLE_PLAN_API int frt_apple_plan_dispatch_flags(void*, const char* kernel, const uint32_t* buffers,
+    const size_t* offsets, const uint32_t* access, size_t count,
+    const size_t* groups, size_t threads, const char* label, uint32_t flags);
 // Start recording an additional program (ids 1, 2, ...); later dispatch/copy calls append to it.
 // Programs share the plan's buffers. Operations recorded before the first call form program 0.
 FRT_APPLE_PLAN_API int64_t frt_apple_plan_program(void*);

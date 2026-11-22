@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 
 READ, WRITE, READ_WRITE = 0, 1, 2
+_DISPATCH_CONCURRENT = 1     # FRT_APPLE_PLAN_DISPATCH_CONCURRENT
 
 
 class _Timing(C.Structure):
@@ -127,18 +128,39 @@ class NativePlan:
         return int(pid)
 
     def dispatch(self, kernel: str, bindings: Sequence[Tuple[int, int, int]], groups: Iterable[int],
-                 threads: int, label: str = "") -> None:
-        """bindings: (buffer, byte offset, access) in Metal argument order."""
+                 threads: int, label: str = "", barrier: bool = True) -> None:
+        """bindings: (buffer, byte offset, access) in Metal argument order.
+
+        ``barrier=False`` drops the barrier before this dispatch: it may run concurrently with the dispatches
+        recorded since the last barrier (the next dispatch with a barrier waits for all of them). The caller
+        guarantees that none of them writes memory another one reads or writes."""
         n = len(bindings)
         ids = (C.c_uint32 * n)(*[b[0] for b in bindings])
         offsets = (C.c_size_t * n)(*[b[1] for b in bindings])
         access = (C.c_uint32 * n)(*[b[2] for b in bindings])
         g = tuple(int(x) for x in groups)
         g = g + (1,) * (3 - len(g))
-        self._check(self.lib.frt_apple_plan_dispatch(self.handle, kernel.encode(), ids, offsets, access, n,
-                                                     (C.c_size_t * 3)(*g), int(threads),
-                                                     (label or kernel).encode()))
+        args = (self.handle, kernel.encode(), ids, offsets, access, n, (C.c_size_t * 3)(*g), int(threads),
+                (label or kernel).encode())
+        if barrier:
+            self._check(self.lib.frt_apple_plan_dispatch(*args))
+        else:
+            self._check(self._dispatch_flags()(*args, _DISPATCH_CONCURRENT))
         self.labels[self._recording].append(label or kernel)
+
+    def _dispatch_flags(self):
+        # Resolved on first use, so libraries built before the flag still serve every other call.
+        fn = getattr(self, "_dispatch_flags_fn", None)
+        if fn is None:
+            try:
+                fn = self.lib.frt_apple_plan_dispatch_flags
+            except AttributeError as exc:
+                raise RuntimeError("the Apple plan library lacks frt_apple_plan_dispatch_flags (concurrent "
+                                   "dispatches); rebuild it with scripts/apple/build_native.sh") from exc
+            fn.argtypes = self._SIGNATURES["dispatch"][0] + [C.c_uint32]
+            fn.restype = C.c_int
+            self._dispatch_flags_fn = fn
+        return fn
 
     def finish(self, resident: bool = True) -> None:
         self._check(self.lib.frt_apple_plan_finish(self.handle))
