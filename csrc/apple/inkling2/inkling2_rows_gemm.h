@@ -16,13 +16,15 @@ struct Inkling2GemmOptions {
     int tile_m = 64;
     int tile_n = 64;
     int simdgroups = 4;
+    int kslice = 64;          // expert tiles: inputs per dequantized slice
 };
 
 inline std::string inkling2_rows_gemm_source(const Inkling2GemmOptions& o = {}) {
     return std::string(tensor_ops_preamble) +
         "constant constexpr int TM=" + std::to_string(o.tile_m) + ";\n" +
         "constant constexpr int TN=" + std::to_string(o.tile_n) + ";\n" +
-        "constant constexpr int SG=" + std::to_string(o.simdgroups) + ";\n" + R"MSL(
+        "constant constexpr int SG=" + std::to_string(o.simdgroups) + ";\n" +
+        "constant constexpr int KS=" + std::to_string(o.kslice) + ";\n" + R"MSL(
 #pragma METAL fp math_mode(safe)
 inline float rbf(float v){uint u=as_type<uint>(v);return as_type<float>((u+0x7fffu+((u>>16)&1u))&0xffff0000u);}
 struct RowsGemm {
@@ -132,10 +134,10 @@ inline float e8m0(uint b){return as_type<float>(b==0u?0x400000u:(b<<23));}
 inline void expert_tile(const device uchar* codes,const device uchar* scales,uint K,uint e,uint mx,uint rows_total,
                         uint r0,uint stride,uint k0,threadgroup bfloat* tile,uint t) {
     const uint threads=uint(SG)*32u;
-    for(uint i=t;i<uint(TN)*8u;i+=threads) {     // 8 elements per item
-        const uint j=i/8u,part=i%8u;
+    for(uint i=t;i<uint(TN)*uint(KS/8);i+=threads) {     // 8 elements per item
+        const uint j=i/uint(KS/8),part=i%uint(KS/8);
         const uint wr=r0+stride*j;
-        threadgroup bfloat* out=tile+j*64u+part*8u;
+        threadgroup bfloat* out=tile+j*uint(KS)+part*8u;
         if(wr>=rows_total){for(uint q=0;q<8u;++q)out[q]=bfloat(0.0f);continue;}
         const size_t row=size_t(e)*rows_total+wr;
         const uint c=k0+part*8u;
@@ -177,15 +179,15 @@ inline void experts(const device bfloat* x,const device uchar* weights,device bf
     const uint wrows=GATEUP?2u*p.n_out:p.n_out;
     using E=dextents<int,2>;
     tensor<device bfloat,E,tensor_inline> left((device bfloat*)x+size_t(row0)*p.k,E(int(p.k),int(rows)),array<int,2>{1,int(p.k)});
-    tensor<threadgroup bfloat,E,tensor_inline> right(tile,E(64,TN),array<int,2>{1,64});
-    constexpr auto desc=matmul2d_descriptor(TM,TN,64,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    tensor<threadgroup bfloat,E,tensor_inline> right(tile,E(KS,TN),array<int,2>{1,KS});
+    constexpr auto desc=matmul2d_descriptor(TM,TN,KS,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc,execution_simdgroups<SG>> op;
     auto acc=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();
     for(uint i=0;i<acc.get_capacity();++i)if(acc.is_valid_element(i))acc[i]=0.0f;
-    tensor<threadgroup bfloat,E,tensor_inline> right2(GATEUP?tile2:tile,E(64,TN),array<int,2>{1,64});
+    tensor<threadgroup bfloat,E,tensor_inline> right2(GATEUP?tile2:tile,E(KS,TN),array<int,2>{1,KS});
     auto acc2=op.get_destination_cooperative_tensor<decltype(left),decltype(right2),float>();
     if(GATEUP)for(uint i=0;i<acc2.get_capacity();++i)if(acc2.is_valid_element(i))acc2[i]=0.0f;
-    for(uint k0=0;k0<p.k;k0+=64) {
+    for(uint k0=0;k0<p.k;k0+=uint(KS)) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if(GATEUP) {
             expert_tile(codes,scales,p.k,e,p.mx,wrows,2u*n0,2u,k0,tile,t);
@@ -212,14 +214,14 @@ kernel void ink_experts_gateup(const device bfloat* x [[buffer(0)]],const device
     device bfloat* y [[buffer(2)]],constant ExpertGemm& p [[buffer(3)]],const device uint* starts [[buffer(4)]],
     const device uint* tile_starts [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]],
     uint t [[thread_index_in_threadgroup]]) {
-    threadgroup bfloat tile[TN*64],tile2[TN*64];
+    threadgroup bfloat tile[TN*KS],tile2[TN*KS];
     experts<true>(x,weights,y,p,starts,tile_starts,g,t,tile,tile2);
 }
 kernel void ink_experts_down(const device bfloat* x [[buffer(0)]],const device uchar* weights [[buffer(1)]],
     device bfloat* y [[buffer(2)]],constant ExpertGemm& p [[buffer(3)]],const device uint* starts [[buffer(4)]],
     const device uint* tile_starts [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]],
     uint t [[thread_index_in_threadgroup]]) {
-    threadgroup bfloat tile[TN*64];
+    threadgroup bfloat tile[TN*KS];
     experts<false>(x,weights,y,p,starts,tile_starts,g,t,tile,tile);
 }
 )MSL";
