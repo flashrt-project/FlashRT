@@ -305,40 +305,83 @@ __global__ void __launch_bounds__(kThreads) mtp_gates_kernel(const __grid_consta
   after_wait(p.latent)[c] = f32_to_bf16_bits(tanhf(o));
 }
 
-// The drafted token of step `step`: argmax over v < vocab of logits[step][v] + fold_w[v] . latent + fold_b[v]; a warp
-// per vocabulary row (one uint4 of fold_w per lane), the blocks' best merged by the last block.
+// The drafted token of step `step`: argmax over v < vocab of logits[step][v] + fold_w[v] . latent + fold_b[v]. Four
+// lanes per vocabulary row (64 latent values each, in registers), eight rows per warp and pass; the blocks' best
+// merged by the last block.
 constexpr int kPickBlocks = 340;
+__device__ __forceinline__ void best_of(float& best, int& idx, float ob, int oi) {
+  if (ob > best || (ob == best && oi < idx)) { best = ob; idx = oi; }
+}
 __global__ void __launch_bounds__(kThreads) mtp_pick_kernel(const __grid_constant__ MtpParams p) {
-  __shared__ float lat[kMtpRank];
   __shared__ float bv[kThreads / 32];
   __shared__ int bi[kThreads / 32];
   __shared__ int last;
   pdl_wait();
   pdl_launch();
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (threadIdx.x < kMtpRank) lat[threadIdx.x] = bf16_to_f32(after_wait(p.latent)[threadIdx.x]);
-  __syncthreads();
-  float lx[8];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, sub = lane & 3;
+  float lx[64];
+  {
+    const uint4* lat = reinterpret_cast<const uint4*>(after_wait(p.latent) + 64 * sub);
 #pragma unroll
-  for (int e = 0; e < 8; ++e) lx[e] = lat[8 * lane + e];
+    for (int i = 0; i < 8; ++i) {
+      const uint4 v = lat[i];
+      const uint32_t vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) { lx[8 * i + 2 * e] = bf16lo(vv[e]); lx[8 * i + 2 * e + 1] = bf16hi(vv[e]); }
+    }
+  }
   const float* lg = after_wait(p.logits) + size_t(p.step) * p.vocab_stride;
   float best = -INFINITY;
   int idx = 1 << 30;
-  for (int v = blockIdx.x * (kThreads / 32) + warp; v < p.vocab; v += gridDim.x * (kThreads / 32)) {
-    const uint4 w = ldg_stream(reinterpret_cast<const uint4*>(p.fold_w + size_t(v) * kMtpRank) + lane);
-    const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+  const int stride = gridDim.x * (kThreads / 32) * 8;
+  for (int base = (blockIdx.x * (kThreads / 32) + warp) * 8; base < p.vocab; base += stride) {
+    const int v = base + (lane >> 2);
     float d = 0.0f;
+    if (v < p.vocab) {
+      if (p.fold_w8) {           // E4M3 rows (L2 resident across the walk's steps)
+        const uint4* q = reinterpret_cast<const uint4*>(p.fold_w8 + size_t(v) * kMtpRank + 64 * sub);
+        uint4 c[4];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) d = fmaf(bf16lo(ww[e]), lx[2 * e], fmaf(bf16hi(ww[e]), lx[2 * e + 1], d));
-    d = warp_sum(d);
-    const float x = lg[v] + d + bf16_to_f32(p.fold_b[v]);
-    if (x > best) { best = x; idx = v; }
+        for (int i = 0; i < 4; ++i) c[i] = q[i];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const uint32_t cc[4] = {c[i].x, c[i].y, c[i].z, c[i].w};
+#pragma unroll
+          for (int e = 0; e < 4; ++e)
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+              uint32_t h2;
+              const uint16_t pair = static_cast<uint16_t>(cc[e] >> (16 * s));
+              asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(pair));
+              const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+              const int k = 16 * i + 4 * e + 2 * s;
+              d = fmaf(f.x, lx[k], fmaf(f.y, lx[k + 1], d));
+            }
+        }
+      } else {
+        const uint4* q = reinterpret_cast<const uint4*>(p.fold_w + size_t(v) * kMtpRank + 64 * sub);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const uint4 w = ldg_stream(q + i);
+          const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+          for (int e = 0; e < 4; ++e) d = fmaf(bf16lo(ww[e]), lx[8 * i + 2 * e], fmaf(bf16hi(ww[e]), lx[8 * i + 2 * e + 1], d));
+        }
+      }
+    }
+    d += __shfl_xor_sync(0xffffffffu, d, 1);
+    d += __shfl_xor_sync(0xffffffffu, d, 2);
+    if (sub == 0 && v < p.vocab) {
+      const float x = lg[v] + (p.fold_w8 ? d * p.fold_scale[v] : d) + bf16_to_f32(p.fold_b[v]);
+      best_of(best, idx, x, v);
+    }
   }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) best_of(best, idx, __shfl_xor_sync(0xffffffffu, best, o), __shfl_xor_sync(0xffffffffu, idx, o));
   if (lane == 0) { bv[warp] = best; bi[warp] = idx; }
   __syncthreads();
   if (threadIdx.x == 0) {
-    for (int w = 1; w < kThreads / 32; ++w)
-      if (bv[w] > best || (bv[w] == best && bi[w] < idx)) { best = bv[w]; idx = bi[w]; }
+    for (int w = 1; w < kThreads / 32; ++w) best_of(best, idx, bv[w], bi[w]);
     after_wait(p.pick_best)[blockIdx.x] = best;
     after_wait(p.pick_index)[blockIdx.x] = idx;
     __threadfence();
@@ -351,19 +394,13 @@ __global__ void __launch_bounds__(kThreads) mtp_pick_kernel(const __grid_constan
   const int* pi = after_wait(p.pick_index);
   best = -INFINITY;
   idx = 1 << 30;
-  for (int b = threadIdx.x; b < int(gridDim.x); b += kThreads)
-    if (pb[b] > best || (pb[b] == best && pi[b] < idx)) { best = pb[b]; idx = pi[b]; }
+  for (int b = threadIdx.x; b < int(gridDim.x); b += kThreads) best_of(best, idx, pb[b], pi[b]);
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) {
-    const float ob = __shfl_xor_sync(0xffffffffu, best, o);
-    const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
-    if (ob > best || (ob == best && oi < idx)) { best = ob; idx = oi; }
-  }
+  for (int o = 16; o > 0; o >>= 1) best_of(best, idx, __shfl_xor_sync(0xffffffffu, best, o), __shfl_xor_sync(0xffffffffu, idx, o));
   if (lane == 0) { bv[warp] = best; bi[warp] = idx; }
   __syncthreads();
   if (threadIdx.x == 0) {
-    for (int w = 1; w < kThreads / 32; ++w)
-      if (bv[w] > best || (bv[w] == best && bi[w] < idx)) { best = bv[w]; idx = bi[w]; }
+    for (int w = 1; w < kThreads / 32; ++w) best_of(best, idx, bv[w], bi[w]);
     after_wait(p.drafts)[p.step] = idx;
     *after_wait(p.pick_counter) = 0;
   }
