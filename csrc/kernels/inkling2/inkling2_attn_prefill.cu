@@ -107,7 +107,11 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
     __syncthreads();
     for (int i = t; i < kKeys * 16; i += kFlashThreads) {
       const int key = i >> 4, part = i & 15, kp = k0 + key;
-      if (kp >= kend) continue;
+      if (kp >= kend) {      // past the chunk: zeros (P is 0 there, and 0 x stale FP16 values could be NaN)
+        *reinterpret_cast<uint4*>(&ks[key][part * 8]) = make_uint4(0u, 0u, 0u, 0u);
+        *reinterpret_cast<uint4*>(&vs[key][part * 8]) = make_uint4(0u, 0u, 0u, 0u);
+        continue;
+      }
       if (p.sliding && kp >= pos) {
         const uint16_t* src = skv + ((size_t(kp - pos) * 2) * kKvHeads + h) * kHd + part * 8;
         cp_async16(&ks[key][part * 8], src);
