@@ -179,8 +179,11 @@ struct AttnDecodeParams {
   uint16_t* out;                    // [rows][24 * 128] BF16
   const uint16_t* gate;             // optional [rows][24 * 128]: out = bf16(bf16(attention) * sigmoid(gate)), the
                                     // kGemvGate prologue of the output projection applied once
+  const uint16_t* rel_t;            // attn_flash: rel_proj transposed [1024][16]
 };
 void attn_decode(const AttnDecodeParams& p, cudaStream_t stream);
+// Prefill chunks on tensor cores (inkling2_attn_prefill.cu): q_pre from kv_rows, the staged rows, rel_t.
+void attn_flash(const AttnDecodeParams& p, cudaStream_t stream);
 void kv_rows(const AttnDecodeParams& p, cudaStream_t stream);
 int attn_split_keys();
 

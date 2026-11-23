@@ -204,11 +204,13 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.out = dptr<uint16_t>(d, "out");
     p.gate = dptr<const uint16_t>(d, "gate");
     p.q_pre = dptr<float>(d, "q_pre");
+    p.rel_t = dptr<const uint16_t>(d, "rel_t");
     p.prefetch = dprefetch(d);
     return p;
   };
   m.def("attn_decode", [attn_params](const py::dict& d, uintptr_t stream) { ik::attn_decode(attn_params(d), to_stream(stream)); });
   m.def("kv_rows", [attn_params](const py::dict& d, uintptr_t stream) { ik::kv_rows(attn_params(d), to_stream(stream)); });
+  m.def("attn_flash", [attn_params](const py::dict& d, uintptr_t stream) { ik::attn_flash(attn_params(d), to_stream(stream)); });
   auto expert = [](const py::dict& d) {
     ik::ExpertParams p = {};
     p.mxfp8 = dint(d, "mxfp8");
