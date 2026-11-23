@@ -27,8 +27,9 @@ import torch
 
 try:  # the extension is optional at import time (see _require_module)
     from flash_rt import flash_rt_inkling2 as _ik
-except ImportError:  # pragma: no cover - exercised on machines without the build
-    _ik = None
+    _IMPORT_ERROR = None
+except ImportError as e:  # pragma: no cover - exercised on machines without the build
+    _ik, _IMPORT_ERROR = None, e
 
 BF16, F32, I32, U8 = torch.bfloat16, torch.float32, torch.int32, torch.uint8
 PREFIX = "model.llm."
@@ -54,8 +55,8 @@ class Inkling2ConfigError(ValueError):
 
 def _require_module():
     if _ik is None:
-        raise RuntimeError("flash_rt.flash_rt_inkling2 is not built: configure with -DGPU_ARCH=120 "
-                           "-DFLASHRT_ENABLE_INKLING2=ON (see docs/inkling2_rtx_usage.md)")
+        raise RuntimeError(f"flash_rt.flash_rt_inkling2 is not available ({_IMPORT_ERROR}): build it with "
+                           "-DGPU_ARCH=120 -DFLASHRT_ENABLE_INKLING2=ON (see docs/inkling2_rtx_usage.md)")
     return _ik
 
 
@@ -85,6 +86,12 @@ def check_config(raw: dict) -> None:
     # global layers are the last layer of each depth-attention block
     if glob != [b - 1 for b in range(BLOCK_LAYERS, c["num_hidden_layers"] + 1, BLOCK_LAYERS)]:
         raise Inkling2ConfigError(f"global layers {glob}: expected the last layer of each block of {BLOCK_LAYERS}")
+
+
+def visit_count(c: dict) -> int:
+    """Layer visits per token: the stored layers, the looped ones once more per extra pass."""
+    lc = c["loop_config"]
+    return c["num_hidden_layers"] + (lc["num_passes"] - 1) * (lc["core_end"] - lc["core_start"])
 
 
 def checkpoint_shards(checkpoint_dir) -> List[Path]:
@@ -155,6 +162,9 @@ class Inkling2RtxRuntime:
     ``max_seq``: KV capacity of the global-attention layers (sliding-window layers keep a ring of 1024 positions).
     ``prefill_rows``: rows of the largest tensor-core prefill chunk (``chunk_rows`` lists the chunk sizes).
     ``exact_rows``: rows of the bit-exact prefill chunks and of the largest verification.
+    ``mma_experts`` (grouped MMA experts in prompt chunks, else flat passes) applies to programs recorded after it is
+    set; ``flash_prefill`` (tensor-core attention in prompt chunks) also sizes buffers and is fixed at construction.
+    The runtime makes ``device`` the current CUDA device and launches on its current stream.
     """
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, device: int = 0, prefill_rows: int = 512,
@@ -181,7 +191,7 @@ class Inkling2RtxRuntime:
         self.dev = torch.device("cuda", device)
         self.max_seq = int(max_seq)
         self.prefill_rows, self.chunk_rows, self.exact_rows = int(prefill_rows), chunk_rows, int(exact_rows)
-        self.prefetch, self.mma_experts, self.flash_prefill = prefetch, mma_experts, flash_prefill
+        self.prefetch, self.mma_experts, self._flash_prefill = prefetch, mma_experts, bool(flash_prefill)
         c = self.c
         self.vocab = int(c["unpadded_vocab_size"])
         self.local = set(c["local_layer_ids"])
@@ -206,7 +216,12 @@ class Inkling2RtxRuntime:
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
         self.use_graphs = True
         self._cublas_ready = False
+        self.drafter = None                 # the DSpark drafter recorded into this runtime (at most one)
         self.programs["decode"] = self._record(1, verify=False)
+
+    @property
+    def flash_prefill(self) -> bool:
+        return self._flash_prefill
 
     # ------------------------------------------------------------------------------------------- weights
     def _load(self) -> Dict[str, torch.Tensor]:

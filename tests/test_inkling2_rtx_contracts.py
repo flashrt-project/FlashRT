@@ -105,6 +105,24 @@ def test_plan_chunks_rejects_an_empty_prompt():
         rtm.plan_chunks(0, (512,), 8, False)
 
 
+def test_visit_count():
+    assert rtm.visit_count(_config()["text_config"]) == 48
+
+
+def test_chat_template_tojson_matches_transformers():
+    """tojson takes transformers' arguments and defaults (ensure_ascii=False): tool declarations render with sorted
+    keys and compact separators as the checkpoint's template asks."""
+    pytest.importorskip("jinja2")
+    from flash_rt.frontends.torch.inkling2_rtx import compile_chat_template
+    t = compile_chat_template('{{ x | tojson }}|{{ x | tojson(sort_keys=true, separators=(",", ":")) }}|'
+                              '{{ x | tojson(indent=1) }}')
+    x = {"b": 1, "a": "é"}
+    assert t.render(x=x) == '{"b": 1, "a": "é"}|{"a":"é","b":1}|{\n "b": 1,\n "a": "é"\n}'
+    with pytest.raises(ValueError, match="stop"):
+        compile_chat_template("{{ raise_exception('stop') }}").render()
+    assert compile_chat_template("{% generation %}A{% endgeneration %}B").render() == "AB"
+
+
 def test_missing_extension_names_the_build_flag(monkeypatch):
     monkeypatch.setattr(rtm, "_ik", None)
     with pytest.raises(RuntimeError, match="FLASHRT_ENABLE_INKLING2"):

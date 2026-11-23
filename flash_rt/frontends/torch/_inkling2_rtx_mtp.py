@@ -57,6 +57,9 @@ class Inkling2RtxDrafter:
 
     def __init__(self, rt: Inkling2RtxRuntime, width: int = 4, fp8: bool = True):
         ik = _require_module()
+        if getattr(rt, "drafter", None) is not None:
+            # its programs and graphs point at the first drafter's buffers
+            raise RuntimeError("the runtime already has a drafter")
         if not 2 <= width <= min(BLOCK, rt.exact_rows):
             raise ValueError(f"width must be in 2..{min(BLOCK, rt.exact_rows)}")
         m = check_mtp_config(rt.raw, len(rt.visits))
@@ -121,6 +124,7 @@ class Inkling2RtxDrafter:
         rt.programs["ctx_chunk"] = self._context(rt.accepted, 1, rt.prefill_rows)
         rt.programs["ctx_exact"] = self._context(rt.accepted, 1)
         self.round = self.add_width(self.width)
+        rt.drafter = self
 
     @staticmethod
     def _e4m3_rows(w, chunk=16384):

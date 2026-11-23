@@ -173,6 +173,12 @@ def test_stop_tokens_and_lengths(fe, text_ids, speculative):
     assert fe.generate(ids, 40, stop_ids=(stop,), speculative=speculative) == ref[:cut]
 
 
+def test_one_drafter_per_runtime(fe):
+    from flash_rt.frontends.torch._inkling2_rtx_mtp import Inkling2RtxDrafter
+    with pytest.raises(RuntimeError, match="already has a drafter"):
+        Inkling2RtxDrafter(fe.rt)
+
+
 def test_request_validation(fe):
     with pytest.raises(ValueError):
         fe.generate([], 4)

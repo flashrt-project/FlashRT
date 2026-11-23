@@ -2,12 +2,18 @@
 FLASHRT_ENABLE_INKLING2; no checkpoint)."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
     pytest.skip("needs an SM120 GPU", allow_module_level=True)
-ik = pytest.importorskip("flash_rt.flash_rt_inkling2")
+_built = list((Path(__file__).resolve().parents[1] / "flash_rt").glob("flash_rt_inkling2*.so"))
+if _built:   # a built module that does not import is a failure, not a skip
+    from flash_rt import flash_rt_inkling2 as ik
+else:
+    ik = pytest.importorskip("flash_rt.flash_rt_inkling2")
 
 D = 2304
 
@@ -69,7 +75,8 @@ def test_gate_mix_tiles_track_the_row_kernel():
 
 def test_row_limits_are_enforced():
     s = torch.cuda.current_stream().cuda_stream
-    with pytest.raises(ValueError):
-        ik.attn_flash(dict(rows=ik.MAX_CHUNK + 1), s)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="kMaxChunk rows"):
+        # every other input present (non-null), so only the row count can be refused
+        ik.attn_flash(dict(rows=ik.MAX_CHUNK + 1, sliding=1, q_pre=16, rel_t=16, stage_kv=16), s)
+    with pytest.raises(ValueError, match="at most 8 rows"):
         ik.lm_head(dict(rows=ik.MAX_ROWS + 1, blocks=1), s)

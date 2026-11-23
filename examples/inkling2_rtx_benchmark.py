@@ -68,17 +68,24 @@ def main():
     fe = Inkling2TorchFrontendRtx(args.checkpoint, max_seq=args.max_seq, speculative=True, draft_width=args.width,
                                   prefill=args.prefill)
     ids = json.loads(Path(args.prompt_ids).read_text()) if args.prompt_ids else reference_prompt(fe)
+    warm_steps = int(args.warm * 1000) + 8          # far more than 0.2 s of steps take (5.6 ms each)
+    need = len(ids) + args.new + max(fe._margin(True), fe._margin(False))
+    if need > args.max_seq or warm_steps > args.max_seq:
+        raise SystemExit(f"--max-seq {args.max_seq} is too small (prompt + new tokens + margin = {need})")
     fe.warmup(len(ids))
     print(f"load + capture {time.perf_counter() - t0:.1f} s, prompt {len(ids)} tokens, "
           f"GPU {gpu_temperature()} C", flush=True)
 
     def warm():
         rt, sync = fe.rt, torch.cuda.synchronize
+        rt.reset()          # decode steps from position 0 (each request resets again)
         sync()
         t = time.perf_counter()
-        while time.perf_counter() - t < args.warm:
+        done = 0
+        while time.perf_counter() - t < args.warm and done + 8 <= warm_steps:
             for _ in range(8):
                 rt.run("decode")
+            done += 8
             sync()
 
     def plain():
