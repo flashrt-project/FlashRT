@@ -60,9 +60,14 @@ def _cuda_kernel():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from flash_rt import flash_rt_kernels as fvk
+    if torch.cuda.get_device_capability() != (8, 7):
+        pytest.skip("requires SM87 (Jetson Orin)")
+    try:
+        from flash_rt import flash_rt_kernels as fvk
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"optional CUDA extension is not available: {exc}")
     if not hasattr(fvk,"pi05_strict_visual_available"):
-        pytest.fail("Rebuild the extension to include the feature probe")
+        pytest.skip("Rebuild with FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=ON")
     if not fvk.pi05_strict_visual_available():
         pytest.skip("Build with FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=ON")
     return torch,fvk
@@ -132,3 +137,47 @@ def test_projector_rejects_invalid_shapes(rows,cols,image_rows):
     ptr = storage.data_ptr()
     with pytest.raises(ValueError,match="pi05_projector_bias_rms_norm_int8"):
         k.pi05_projector_bias_rms_norm_int8(ptr,ptr,ptr,ptr,ptr,rows,cols,image_rows,1e-6,0)
+
+
+@pytest.mark.parametrize("available,capability", [(False, None), (True, (12, 0))])
+def test_non_target_environment_skips_before_extension_import(monkeypatch, available, capability):
+    import builtins
+    torch = pytest.importorskip("torch")
+    original = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "flash_rt" and "flash_rt_kernels" in (fromlist or ()):
+            pytest.fail("non-target environment attempted to import the CUDA extension")
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(pytest.skip.Exception):
+        _cuda_kernel()
+
+
+@pytest.mark.parametrize("feature", ["missing_extension", "missing_probe", "disabled", "enabled"])
+def test_sm87_optional_feature_probe(monkeypatch, feature):
+    import builtins
+    torch = pytest.importorskip("torch")
+    original = builtins.__import__
+    kernels = SimpleNamespace()
+    if feature in ("disabled", "enabled"):
+        kernels.pi05_strict_visual_available = lambda: feature == "enabled"
+
+    def import_extension(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "flash_rt" and "flash_rt_kernels" in (fromlist or ()):
+            if feature == "missing_extension":
+                raise ImportError("optional extension not built")
+            return SimpleNamespace(flash_rt_kernels=kernels)
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 7))
+    monkeypatch.setattr(builtins, "__import__", import_extension)
+    if feature == "enabled":
+        assert _cuda_kernel() == (torch, kernels)
+    else:
+        with pytest.raises(pytest.skip.Exception):
+            _cuda_kernel()

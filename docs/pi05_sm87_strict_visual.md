@@ -16,8 +16,16 @@ python -c "from flash_rt import flash_rt_kernels as k; print(k.__file__); print(
 python -m pytest tests/test_pi05_strict_visual.py -q
 ```
 
-Set `FLASHRT_PI05_STRICT_VISUAL=1` before constructing the frontend to select
-the path. Both build and runtime options default OFF. This changes no public
+Set both runtime options before constructing the frontend:
+
+```bash
+export FVK_PI05_RTX_FORCE_INT8=1
+export FLASHRT_PI05_STRICT_VISUAL=1
+```
+
+`FVK_PI05_RTX_FORCE_INT8=1` selects the required dynamic INT8 encoder/decoder
+path; `FLASHRT_PI05_STRICT_VISUAL=1` enables the visual fusion. Both the fusion
+build option and its runtime option default OFF. This changes no public
 `load_model`/`predict` signature. The tested mode is BF16 vision, dynamic INT8
 encoder and decoder, exact prompt lengths, no visual pooling. Fixed-shape,
 FP8, visual INT8 and static encoder modes fail explicitly when selected with
