@@ -389,6 +389,59 @@ __global__ void __launch_bounds__(256) gate_mix_kernel(const __grid_constant__ G
   }
 }
 
+// Prefill chunks: grid (gates, kHidden / 64, row tiles of 64), 4 warps x 16 rows x 64 channels. f / gn on BF16 MMAs
+// (the BF16 products exact in FP32), the mix as in gate_mix_kernel.
+__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__global__ void __launch_bounds__(128) gate_mix_tiles_kernel(const __grid_constant__ GateMixParams p) {
+  pdl_wait();
+  pdl_launch();
+  const int gt = blockIdx.x, c0 = blockIdx.y * 64;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+  const int R = p.rows, r0 = blockIdx.z * 64 + warp * 16;
+  if (r0 >= R) return;
+  auto u32 = [](const uint16_t* q) { return *reinterpret_cast<const uint32_t*>(q); };
+  const uint16_t* S = after_wait(p.states[gt]);
+  const int ra = min(r0 + g, R - 1), rb = min(r0 + g + 8, R - 1);
+  uint32_t a[4][4];
+#pragma unroll
+  for (int kk = 0; kk < 4; ++kk) {
+    a[kk][0] = u32(S + ra * 64 + 16 * kk + 2 * c);
+    a[kk][1] = u32(S + rb * 64 + 16 * kk + 2 * c);
+    a[kk][2] = u32(S + ra * 64 + 16 * kk + 8 + 2 * c);
+    a[kk][3] = u32(S + rb * 64 + 16 * kk + 8 + 2 * c);
+  }
+  float f[8][4], q[8][4];
+#pragma unroll
+  for (int n = 0; n < 8; ++n) {
+    const uint16_t* F = static_cast<const uint16_t*>(p.forget[gt]) + size_t(c0 + 8 * n + g) * 64;
+    const uint16_t* G = static_cast<const uint16_t*>(p.gain[gt]) + size_t(c0 + 8 * n + g) * 64;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) f[n][e] = q[n][e] = 0.0f;
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      mma_bf16(f[n], a[kk], u32(F + 16 * kk + 2 * c), u32(F + 16 * kk + 8 + 2 * c));
+      mma_bf16(q[n], a[kk], u32(G + 16 * kk + 2 * c), u32(G + 16 * kk + 8 + 2 * c));
+    }
+  }
+  const float* h = after_wait(p.h[gt]);
+  const float* m = after_wait(p.m[gt]);
+  float* out = after_wait(p.out[gt]);
+#pragma unroll
+  for (int n = 0; n < 8; ++n)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const int row = r0 + g + 8 * (e >> 1), col = c0 + 8 * n + 2 * c + (e & 1);
+      if (row < R)
+        out[size_t(row) * p.out_stride + col] = (1.0f - tanhf(f[n][e])) * h[size_t(row) * p.h_stride + col] +
+                                                tanhf(q[n][e]) * m[size_t(row) * p.m_stride + col];
+    }
+}
+
 }  // namespace
 
 void visit_boundary(const BoundaryParams& p, cudaStream_t stream) {
@@ -408,6 +461,10 @@ void post_attention(const PostAttentionParams& p, cudaStream_t stream) {
 
 void gate_mix(const GateMixParams& p, cudaStream_t stream) {
   if (p.count < 1 || p.count > 3) throw std::invalid_argument("gate_mix: 1 to 3 gates");
+  if (p.rows > kMaxRows) {
+    launch_pdl(gate_mix_tiles_kernel, dim3(p.count, kHidden / 64, (p.rows + 63) / 64), dim3(128), 0, stream, p);
+    return;
+  }
   const int outputs = p.count * kHidden * (p.rows < 1 ? 1 : p.rows);
   launch_pdl(gate_mix_kernel, dim3((outputs * 8 + 255) / 256), dim3(256), 0, stream, p);
 }
