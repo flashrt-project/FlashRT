@@ -140,6 +140,16 @@ else()
   message(STATUS "SM80-family CUTLASS INT8: DISABLED (current: sm_${GPU_ARCH})")
 endif()
 
+# Opt-in tile measured for Pi0.5's 15-token decoder on Jetson Orin.
+option(FLASHRT_ENABLE_PI05_GATED_TILE_SM87
+       "Use the 64-row INT8 gated GEMM tile for Pi0.5 M15/N4096/K1024 on SM87" OFF)
+if(FLASHRT_ENABLE_PI05_GATED_TILE_SM87 AND
+   (NOT GPU_ARCH STREQUAL "87" OR NOT ENABLE_SM80_INT8_CUTLASS))
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_PI05_GATED_TILE_SM87 requires GPU_ARCH=87 and ENABLE_SM80_INT8_CUTLASS=ON")
+endif()
+message(STATUS "FLASHRT_ENABLE_PI05_GATED_TILE_SM87=${FLASHRT_ENABLE_PI05_GATED_TILE_SM87}")
+
 # Pi0.5 strict consumer fusion: tested BF16 vision / dynamic INT8 prefix
 # on Orin only. Default builds and Qwen3-VL's own target stay unchanged.
 option(FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87
@@ -2492,6 +2502,10 @@ if(ENABLE_SM80_INT8_CUTLASS)
     csrc/gemm/cutlass_sm80_int8_rowwise_t64x128.cu
     csrc/gemm/cutlass_sm80_int8_silu_gated.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM80_INT8_CUTLASS=1)
+  if(FLASHRT_ENABLE_PI05_GATED_TILE_SM87)
+    set_property(SOURCE csrc/gemm/cutlass_sm80_int8_silu_gated.cu APPEND
+                 PROPERTY COMPILE_DEFINITIONS FLASHRT_PI05_GATED_TILE_SM87=1)
+  endif()
 endif()
 
 # ── Chameleon-7B model kernels (opt-in, see FLASHRT_ENABLE_CHAMELEON) ──

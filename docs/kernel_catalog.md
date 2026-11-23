@@ -377,6 +377,15 @@ Shape features that currently have no fused kernels in FlashRT:
 File a request (or a PR adding the instantiation) if your model
 needs one of the above.
 
+## Pi0.5 SM87 gated INT8 tile (opt-in)
+
+`FLASHRT_ENABLE_PI05_GATED_TILE_SM87=ON` selects a 64x128x64 CTA tile only
+for the gated INT8 GEMM shape `(M,N,K)=(15,4096,1024)` on SM87. The existing
+`cutlass_int8_silu_gated_bf16out` binding, output type, gate and scale semantics
+are unchanged. Other shapes keep the 128-row tile. The build option defaults
+off and rejects unsupported architectures. See
+[Pi0.5 SM87 gated tile](pi05_sm87_gated_tile.md) for validation and limits.
+
 ## Pi0.5 SM87 strict visual consumers (opt-in)
 
 Build with `FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=ON`; select the path with
