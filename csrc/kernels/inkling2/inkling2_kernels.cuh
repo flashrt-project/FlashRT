@@ -214,13 +214,13 @@ struct ExpertParams {
   float* xq_amax;
   // grouped MMA passes (prefill chunks): the raw quantized inputs per row / slot (codes, scale bytes; written by
   // expert_route / expert_act_quant when set), the slots sorted by expert (expert_sort): order[i] = slot,
-  // offset[e] .. offset[e + 1] the expert's range, tile_off[e] its first 64-slot tile, tile_off[128] the tiles
+  // offset[e] .. offset[e + 1] the expert's range, tile_off[e] its first tile, tile_off[128] the tiles
   uint8_t* xq_codes;
   uint8_t* xq_sc8;
   int* order;
   int* offset;
   int* tile_off;
-  int max_tiles;                    // grid of the MMA passes: at most rows * 8 / 64 + 128 tiles
+  int max_tiles;                    // grid of the MMA passes: at most rows * 8 / expert_mma_tile_slots() + 128
 };
 void expert_w13(const ExpertParams& p, cudaStream_t stream);
 void expert_w2(const ExpertParams& p, cudaStream_t stream);
@@ -233,6 +233,7 @@ void expert_w2_flat(const ExpertParams& p, cudaStream_t stream);
 // Prefill chunks (up to kMaxChunk rows): expert_route (+ xq_codes / xq_sc8), expert_sort, expert_mma_w13 (act per
 // slot), expert_act_quant (+ raw), expert_mma_w2 (out per slot) on the SM120 block-scaled MMAs
 // (kind::mxf4nvf4 m16n8k64 for NVFP4, kind::mxf8f6f4 m16n8k32 for MXFP8).
+int expert_mma_tile_slots();            // slots per MMA tile (expert_sort's tiles; max_tiles = rows * 8 / it + 128)
 void expert_sort(const ExpertParams& p, cudaStream_t stream);
 void expert_mma_w13(const ExpertParams& p, cudaStream_t stream);
 void expert_mma_w2(const ExpertParams& p, cudaStream_t stream);
