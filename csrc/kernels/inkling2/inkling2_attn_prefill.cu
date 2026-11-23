@@ -4,11 +4,11 @@
 // Per tile of 64 keys: S = Q K^T (mma.sync m16n8k16 BF16, FP32), scaled, plus the relative bias
 // bf16(r . rel_proj[:, distance]) for distances < 1024 (per warp the 79 distances of the tile on MMAs from the
 // transposed rel_proj [1024][16], then looked up per logit), causal /
-// sliding-window mask, online softmax, O += P V (FP16 P from the S fragments, V converted to FP16 in shared
-// memory, read by ldmatrix.trans). The sink
+// sliding-window mask, online softmax, O += P V (P as two FP16 parts from the S fragments, V converted to FP16 in
+// shared memory, read by ldmatrix.trans). The sink
 // joins the denominator at the end; the output gate as in the decode merge. Queries come prepared from kv_rows
 // (q_pre), keys from the cache (sliding layers: the staged rows of the chunk at positions >= pos).
-// Numerics differ from the decode kernels' FP32 per-row arithmetic in the accumulation order and the FP16 P.
+// Numerics differ from the decode kernels' FP32 per-row arithmetic in the accumulation order (P carries ~22 bits).
 
 #include "kernels/inkling2/inkling2_common.cuh"
 #include "kernels/inkling2/inkling2_kernels.cuh"
@@ -39,6 +39,14 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], const uint32_t (&a)[4], u
 __device__ __forceinline__ uint32_t pack_f16(float lo, float hi) {
   const __half2 h = __floats2half2_rn(lo, hi);
   return *reinterpret_cast<const uint32_t*>(&h);
+}
+// (lo, hi) -> FP16 pairs hi_part + lo_part with hi_part = f16(x), lo_part = f16(x - hi_part)
+__device__ __forceinline__ void split_f16(float x0, float x1, uint32_t& hi, uint32_t& lo) {
+  const __half2 h = __floats2half2_rn(x0, x1);
+  const float2 hf = __half22float2(h);
+  const __half2 l = __floats2half2_rn(x0 - hf.x, x1 - hf.y);
+  hi = *reinterpret_cast<const uint32_t*>(&h);
+  lo = *reinterpret_cast<const uint32_t*>(&l);
 }
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -174,13 +182,13 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
     }
     float corr[2], rs[2] = {0.0f, 0.0f};
 #pragma unroll
-    for (int hr = 0; hr < 2; ++hr) corr[hr] = mx[hr] == -INFINITY ? 1.0f : __expf(m[hr] - mx[hr]);
+    for (int hr = 0; hr < 2; ++hr) corr[hr] = mx[hr] == -INFINITY ? 1.0f : expf(m[hr] - mx[hr]);
 #pragma unroll
     for (int n = 0; n < 8; ++n)
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int hr = q >> 1;
-        const float e = s[n][q] == -INFINITY ? 0.0f : __expf(s[n][q] - mx[hr]);
+        const float e = s[n][q] == -INFINITY ? 0.0f : expf(s[n][q] - mx[hr]);
         s[n][q] = e;
         rs[hr] += e;
       }
@@ -199,8 +207,12 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
     // O += P V: 4 k-steps of 16 keys, 16 n-tiles of 8 dims
 #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      const uint32_t pa[4] = {pack_f16(s[2 * kk][0], s[2 * kk][1]), pack_f16(s[2 * kk][2], s[2 * kk][3]),
-                              pack_f16(s[2 * kk + 1][0], s[2 * kk + 1][1]), pack_f16(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+      // P = hi + lo in FP16 (about 22 significant bits): two MMAs per tile keep P V at FP32-like precision
+      uint32_t pa[4], pl[4];
+      split_f16(s[2 * kk][0], s[2 * kk][1], pa[0], pl[0]);
+      split_f16(s[2 * kk][2], s[2 * kk][3], pa[1], pl[1]);
+      split_f16(s[2 * kk + 1][0], s[2 * kk + 1][1], pa[2], pl[2]);
+      split_f16(s[2 * kk + 1][2], s[2 * kk + 1][3], pa[3], pl[3]);
 #pragma unroll
       for (int n = 0; n < 16; n += 2) {
         uint32_t b[4];
@@ -208,6 +220,8 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
         ldsm4t(b, &vs[16 * kk + 8 * (mi & 1) + (lane & 7)][8 * (n + (mi >> 1))]);
         mma_f16(o[n], pa, b[0], b[1]);
         mma_f16(o[n + 1], pa, b[2], b[3]);
+        mma_f16(o[n], pl, b[0], b[1]);
+        mma_f16(o[n + 1], pl, b[2], b[3]);
       }
     }
   }
@@ -220,8 +234,8 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
     if (r >= R) continue;
     const float sink = bf16_to_f32(sinks[size_t(r) * kHeads + qh]);
     const float mf = fmaxf(m[hr], sink);
-    const float f = __expf(m[hr] - mf);
-    const float den = l[hr] * f + __expf(sink - mf);
+    const float f = expf(m[hr] - mf);
+    const float den = l[hr] * f + expf(sink - mf);
 #pragma unroll
     for (int n = 0; n < 16; ++n)
 #pragma unroll
