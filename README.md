@@ -293,6 +293,22 @@ llama.cpp F16 KV. [Protocol, accuracy and reproduction](docs/flint_usage.md).
 
 **Guide:** [RTX 5090 setup and limits](docs/flint_usage.md).
 
+### Inkling 2 Mini (NVFP4 / MXFP8, RTX 5090)
+
+Native SM120 kernels for the text decoder of `thinkingmachines/Inkling-2-Mini`
+at the checkpoint's precision (BF16 attention, NVFP4 / MXFP8 experts with the
+activation quantization the checkpoint declares), with the checkpoint's DSpark
+drafter for speculative decoding. Verification rows run the decode step's
+arithmetic, so DSpark returns exactly the greedy tokens. Batch 1, greedy, the
+reference benchmark's 512-token prompt and 512 new tokens; the reference is
+KERN 0.5.0 on the same GPU. [Protocol, numerics and reproduction](docs/inkling2_rtx_usage.md).
+
+| | KERN 0.5.0 | FlashRT | Speedup |
+|---|---:|---:|---:|
+| Prefill, 512 tokens | 117-142 ms | **42.3 ms** | **2.8-3.4x** |
+| Decode | 155.8 tok/s | **179.1 tok/s** | **1.15x** |
+| DSpark decode | 206.8 tok/s | **221.7 tok/s** | **1.07x** |
+
 ### Flint (MLX int4, Apple Silicon)
 
 Native Metal plan for the `RecursiveSI/flint-int4` checkpoint on M4 Pro / M4
@@ -993,7 +1009,7 @@ have been built and tested, and the dispatch map that selects them.
 | Hardware | Architecture | Status | Validated paths / notes |
 |---|---:|---|---|
 | Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6 and N1.7, Pi0-FAST, LingBot-VLA, Hy-Embodied-0.5-VLA, Alpamayo 1.5 (full request and FlashDrive streaming), Cosmos3-Edge AV / Reasoner, Qwen3.6, and Qwen3-VL BF16 with opt-in W8/W4 decode; reproduction guides for [π0.5](docs/thor/pi05.md) and [GR00T N1.7](docs/thor/groot-n17.md). |
-| RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). |
+| RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). Inkling 2 Mini (NVFP4 / MXFP8) with DSpark speculative decoding; see [Inkling 2 Mini on RTX 5090](docs/inkling2_rtx_usage.md). |
 | AMD Instinct MI350X | gfx950 (CDNA4) | Supported | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Uses the gfx950 source set, checked at build and runtime. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300X | gfx942 (CDNA3) | Supported | Architecture-specific BF16/FP8 FNUZ kernels and HIP graphs. See [AMD deployment](docs/deployment_amd.md), [π0.5](docs/deployment_amd_pi05.md), and [GR00T N1.7](docs/deployment_amd_groot_n17.md). |
 | Ascend 910B4 | Ascend NPU | Supported | Pi0.5 and GR00T N1.7 backend with native AscendC kernels and NPU graphs. See [π0.5 deployment](docs/deployment_npu.md) and [GR00T N1.7 deployment](docs/deployment_npu_groot_n17.md). |
