@@ -152,6 +152,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # -- the kernels build into a separate module gated on GPU_ARCH 120.
     ("spark_x25", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.spark_x25_rtx", "SparkX25TorchFrontendRtx"),
+    # Inkling 2 Mini (thinkingmachines/Inkling-2-Mini, NVFP4 / MXFP8 experts) with its DSpark drafter: text LLM,
+    # constructed directly. SM120 kernels in the separate module flash_rt_inkling2 (FLASHRT_ENABLE_INKLING2).
+    ("inkling2", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.inkling2_rtx", "Inkling2TorchFrontendRtx"),
     # Flint (RecursiveSI/flint) official NVFP4 GGUF: text LLM, constructed directly (see flash_rt/api.py).
     ("flint", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.flint_rtx", "FlintTorchFrontendRtx"),
