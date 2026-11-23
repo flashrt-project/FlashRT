@@ -110,24 +110,29 @@ The kernels by program:
   convolution states, logits, drafter context), past the sliding window.
 - **Fast prefill is equivalent, not bit-identical**: tensor-core products and
   attention accumulate in another order. With the experts' FP4 rounding the
-  checkpoint's logits are sensitive to such reorderings; the reference's own
-  perturbations (its quantizer written as the kernel's arithmetic, or W4A16
-  instead of W4A4) move the greedy continuation of the benchmark prompt after
-  16-19 tokens. Measured against a reference implementation written from the
-  upstream model definition, teacher-forced over 48 positions after the
-  512-token prompt:
+  checkpoint's logits are sensitive to such reorderings, so the comparison is
+  teacher-forced (the reference's tokens fed at every step) against an FP32
+  reference implementation written from `mlx-lm`'s `inkling2_loop` model with
+  the checkpoint's W4A4 / W8A8 expert inputs, next to the reference's own
+  perturbation (its quantizer evaluated in the kernels' order of operations):
 
-  | Prefill | argmax agreement | KL median | KL p90 | KL max |
-  |---|---:|---:|---:|---:|
-  | token steps / exact chunks | 48 / 48 | 1.1e-4 | 1.8e-2 | 8.6e-2 |
-  | fast chunks | 47 / 48 | 1.3e-4 | 1.5e-2 | 5.9e-2 |
-  | fast chunks, router product on FP32 CUDA cores | 47 / 48 | 1.3e-4 | 4.3e-2 | 1.8e-1 |
+  | Prompt | Steps | Path | argmax agreement | KL median | KL max |
+  |---|---:|---|---:|---:|---:|
+  | review task, 512 tokens | 48 | token steps / exact chunks | 48 / 48 | 1.1e-4 | 8.6e-2 |
+  | | | fast chunks | 47 / 48 | 1.3e-4 | 5.9e-2 |
+  | | | reference against its own variant | 47 / 48 | 2.5e-4 | 5.0e-2 |
+  | Python source, 8192 tokens | 16 | exact chunks | 15 / 16 | 4.4e-4 | 1.1e-1 |
+  | | | fast chunks | 16 / 16 | 3.1e-3 | 1.6e-1 |
+  | | | reference against its own variant | 14 / 16 | 1.5e-3 | 2.2e-1 |
+  | Python source, 32768 tokens | 16 | exact chunks | 16 / 16 | 8.5e-5 | 3.3e-2 |
+  | | | fast chunks | 16 / 16 | 3.2e-5 | 4.3e-2 |
+  | | | reference against its own variant | 15 / 16 | 1.3e-4 | 2.7e-2 |
 
-  The last row only sums the router's exact products in another order; that
-  moves single positions by up to 0.1-0.2 in KL (a routing near-tie resolved
-  the other way changes the prompt's KV), the spread of any reordering of the
-  fast path.
-
+  The first token after each prompt equals the reference's on every path. Past
+  8192 positions the global layers' log-scaled queries take effect (the
+  32768-token row). Summing the router's exact products on FP32 CUDA cores
+  instead of TF32 tensor cores moves the 512-token fast row to KL max 1.8e-1
+  (p90 4.3e-2): the spread of any reordering of the fast path.
 - **KV cache in BF16** (the checkpoint's attention precision); no FP8 KV.
 
 ## Validation
@@ -149,39 +154,72 @@ against the flat passes, speculative against plain greedy decoding (both
 prefill modes, widths 2, 4 and 8), stop tokens and lengths, input checks and
 the chat path.
 
-## RTX 5090 numbers
+## RTX 5090 results
 
-RTX 5090 (170 SMs, 32 GB), batch 1, greedy. Reference: KERN 0.5.0
-(`pegainfer-project/kern-inkling-2mini`), the fastest Inkling 2 Mini runtime
-for this GPU we know of, on the same GPU with its own benchmark driver: the
-512-token prompt below, 512 new tokens, plain decoding and DSpark (KERN's
-8-row speculative mode), three runs each. FlashRT: the same token ids, plain
-and DSpark (width 4) interleaved, three runs each after a warm-up request, 30 s
-between runs and 0.2 s of decode steps before each timed request (the GPU at
-its clocks rather than idle). Decode tokens/s = (new tokens - 1) / time from
-the first token to the last; prefill = prompt to first token (with DSpark
-including the drafter context). Medians:
+RTX 5090 (170 SMs, 32 GB), PyTorch 2.9, CUDA 13; batch 1, greedy, DSpark
+width 4. Each row is one process (`examples/inkling2_rtx_benchmark.py`): an
+untimed request, then plain and DSpark interleaved (three runs at 512 tokens,
+two above), 30-60 s between runs and 0.2 s of decode steps before each timed
+request (the GPU at its clocks rather than idle); runs of a row differ by less
+than 0.1 %. Prefill = prompt to first token (with DSpark the drafter context is
+written too: +1.1 ms at 512 tokens, under 1 % from 4096); decode tokens/s = (new tokens - 1) / time from the first
+token to the last, 512 new tokens without stop tokens. The review prompt is
+the default one; the Python-source prompts ask to explain the interpreter's
+standard library (Python 3.12) cut to the length (`--prompt code --isl N`).
 
-| | KERN 0.5.0 | FlashRT | |
+| Prompt | Prefill | Decode, tok/s | DSpark, tok/s (tokens / step) |
 |---|---:|---:|---:|
-| Prefill, 512 tokens | 117-142 ms | **42.3 ms** (DSpark 42.9 ms) | 2.8-3.4x |
-| Plain decode | 155.8 tok/s | **179.1 tok/s** | 1.15x |
-| DSpark decode | 206.8 tok/s (2.17 tokens / step) | **221.7 tok/s** (2.18 tokens / step) | 1.07x |
+| review task, 512 tokens | 41.8 ms | 178.9 | 221.4 (2.18) |
+| Python source, 4096 tokens | 394 ms | 172.4 | 294.3 (3.14) |
+| Python source, 8192 tokens | 844 ms | 166.7 | 234.0 (2.64) |
+| Python source, 32768 tokens | 4.59 s | 136.2 | 155.9 (2.51) |
+| Python source, 131072 tokens | 37.1 s | 71.9 | 64.3 (2.21) |
 
-Every DSpark run returned exactly the plain greedy tokens; the three runs of
-each mode are within 0.1 %. PyTorch's peak allocation is 20.3 GB. The prompt
-is a review task rendered with the checkpoint's chat template
-(`reasoning_effort="none"`), its first 64 and last 448 token ids; the accepted
-length depends on the continuation (and so on the prefill's numerics: 2.06 to
-2.26 tokens per step across the fast-path variants measured on this prompt),
-so the DSpark rate differs on other text.
+Sixteen short requests of each kind (`--suite code` / `--suite general`:
+19-41 prompt tokens, up to 512 new tokens or the end-of-generation token),
+aggregate decode rate and DSpark's accepted tokens per step (range over the
+requests):
 
-A decode step reads about 5.6 GB: BF16 attention, projections, gates and LM
-head 3.8 GB, the eight experts of each of the 48 layer visits 1.8 GB. At the
-5090's 1.79 TB/s that is 3.1 ms; a step takes 5.58 ms.
+| Requests | Generated tokens | Decode, tok/s | DSpark, tok/s (tokens / step) |
+|---|---:|---:|---:|
+| code (functions and classes in Python, C, C++, Rust, Go, SQL, ...) | 7369 | 181.5 | 275.6 (2.66; 2.26-3.07) |
+| general (explanations, summaries, arithmetic, letters, stories, ...) | 5516 | 180.3 | 218.6 (2.08; 1.72-2.55) |
+
+Every DSpark run returned exactly the plain greedy tokens.
+
+- **Decode.** At 512 tokens of context a step reads about 5.6 GB: BF16
+  attention, projections, gates and LM head 3.8 GB (the looped layers are read
+  once per pass), the eight experts of each of the 48 layer visits 1.8 GB. At
+  the 5090's 1.79 TB/s that is 3.1 ms; a step takes 5.59 ms. With context the
+  global layers' KV adds 32 KiB per token per step (4.3 GB at 128K, a 5.5 ms
+  floor against the step's 13.9 ms).
+- **DSpark.** The accepted length depends on the text (2.1-3.1 tokens per step
+  above). A speculative step costs 1.8 plain steps at 512 tokens of context and
+  2.5 at 128K (34.4 ms against 13.9 ms), where it is slower than plain
+  decoding: the verification's attention reads the context's KV once per
+  verified row, and the drafter's full-attention layer once per block
+  position.
+- **Prefill.** 512 tokens: 19.4 ms in the expert MMAs, 9.9 ms in the cuBLAS
+  projections, 3.3 ms in the layer-visit boundaries, 2.9 ms in attention, 1.4
+  ms after attention (eager per-kernel times). Long prompts are bound by the
+  global layers' attention (12.3K prompt tokens/s at 512, 3.5K at 128K). The
+  exact path takes 0.71 s for 512 tokens, 12.6 s for 8192 and 61 s for 32768.
+
+## Memory
+
+| | |
+|---|---:|
+| Text decoder weights (non-expert BF16 / FP32 3.0 GiB, NVFP4 / MXFP8 experts 14.6 GiB) | 17.6 GiB |
+| DSpark drafter weights | 0.6 GiB |
+| Derived copies: FP32 router, E4M3 LM head and folded drafter correction | 0.6 GiB |
+| KV per token of `max_seq`: global layers 32 KiB, drafter 12 KiB | 44 KiB |
+| Sliding-window rings (40 layer visits x 1024 slots), fixed | 160 MiB |
+| PyTorch peak allocation, `max_seq` 4096 / 36864 / 132096 | 20.3 / 21.6 / 25.7 GiB |
 
 ```bash
 python examples/inkling2_rtx_benchmark.py --checkpoint /path/to/Inkling-2-Mini --new 512 --reps 3
+python examples/inkling2_rtx_benchmark.py --checkpoint /path/to/Inkling-2-Mini --prompt code --isl 32768 --max-seq 36864 --reps 2
+python examples/inkling2_rtx_benchmark.py --checkpoint /path/to/Inkling-2-Mini --suite code --cooldown 5
 ```
 
 ## Limitations

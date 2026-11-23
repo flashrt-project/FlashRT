@@ -299,15 +299,19 @@ Native SM120 kernels for the text decoder of `thinkingmachines/Inkling-2-Mini`
 at the checkpoint's precision (BF16 attention, NVFP4 / MXFP8 experts with the
 activation quantization the checkpoint declares), with the checkpoint's DSpark
 drafter for speculative decoding. Verification rows run the decode step's
-arithmetic, so DSpark returns exactly the greedy tokens. Batch 1, greedy, the
-reference benchmark's 512-token prompt and 512 new tokens; the reference is
-KERN 0.5.0 on the same GPU. [Protocol, numerics and reproduction](docs/inkling2_rtx_usage.md).
+arithmetic, so DSpark returns exactly the greedy tokens. Batch 1, greedy, 512
+new tokens; contexts up to 128K tokens on the 32 GB card.
+[Protocol, numerics and reproduction](docs/inkling2_rtx_usage.md).
 
-| | KERN 0.5.0 | FlashRT | Speedup |
+| Prompt | Prefill | Decode, tok/s | DSpark, tok/s (tokens / step) |
 |---|---:|---:|---:|
-| Prefill, 512 tokens | 117-142 ms | **42.3 ms** | **2.8-3.4x** |
-| Decode | 155.8 tok/s | **179.1 tok/s** | **1.15x** |
-| DSpark decode | 206.8 tok/s | **221.7 tok/s** | **1.07x** |
+| 512 tokens | **41.8 ms** | **178.9** | **221.4** (2.18) |
+| 4K tokens | **394 ms** | **172.4** | **294.3** (3.14) |
+| 32K tokens | **4.59 s** | **136.2** | **155.9** (2.51) |
+| 128K tokens | **37.1 s** | **71.9** | 64.3 (2.21) |
+
+On sixteen short code requests DSpark decodes at 275.6 tok/s (2.66 tokens per
+step), on sixteen general ones at 218.6 (2.08), against 181.5 and 180.3 plain.
 
 ### Flint (MLX int4, Apple Silicon)
 
