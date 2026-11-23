@@ -93,9 +93,13 @@ each ICB command, a buffer-scope memory barrier between direct dispatches).
 a dispatch without that barrier: it may run concurrently with the dispatches
 since the last barrier, and the next dispatch with a barrier waits for all of
 them. The caller guarantees that none of them writes memory another one reads
-or writes. A dispatch after a buffer copy still waits for the copy. Callers that
-never pass the flag record exactly the programs they recorded before it;
-`flashrt_apple_smoke` and `tests/test_apple_native_concurrent.py` cover both.
+or writes. A dispatch without a barrier still starts only after every command
+before the last barrier completed, so it may read what they wrote. Metal
+documents an ICB command's barrier only as "earlier commands complete before
+this one"; the in-order start this relies on is checked on the device by step 4 of
+`flashrt_apple_smoke` and by `tests/test_apple_native_concurrent.py`. A dispatch
+after a buffer copy still waits for the copy. Callers that never pass the flag
+record exactly the programs they recorded before it; both tests cover both.
 
 ### Fixed vision + prefix + decoder replay
 

@@ -194,3 +194,34 @@ def test_mma_tiles_match_per_expert_passes(tokens):
     finally:
         Inkling2Runtime.mma_tile_rows = saved
     assert np.array_equal(out[0].view(np.uint32), out[1].view(np.uint32))
+
+
+def test_concurrent_expert_stages_match_barriers(tokens):
+    """Up to expert_overlap_rows rows the qmv experts and the MMA (NVFP4 layers) / TensorOps (MXFP8 layers) experts
+    of a stage run as concurrent dispatches: every visit's hidden state of every row equals the program with a
+    barrier before each dispatch, bit for bit, on repeated runs (a race would show as a run-to-run difference)."""
+    from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
+    shapes, H = (8, 32), None
+    ids = (tokens * 8)[:32]
+    saved, traces = Inkling2Runtime.expert_overlap_rows, {}
+    try:
+        for overlap in (0, saved):
+            Inkling2Runtime.expert_overlap_rows = overlap
+            rt = _runtime(max_seq=64, row_capacity=32, row_shapes=[(n, 1) for n in shapes], trace_rows=True)
+            try:
+                H = rt.cfg.hidden_size
+                for n in shapes:
+                    info = np.array([[0, i, 0, n - 1] for i in range(n)], np.uint32)
+                    for rep in range(3):
+                        rt.run_rows(ids[:n], info, 1)
+                        traces[(overlap, n, rep)] = rt.plan.read(rt.buf["r_trace"], 0, np.uint16, 48 * n * H).copy()
+            finally:
+                rt.close()
+    finally:
+        Inkling2Runtime.expert_overlap_rows = saved
+    assert saved >= max(shapes)
+    for n in shapes:
+        ref = traces[(0, n, 0)]
+        for overlap in (0, saved):
+            for rep in range(3):
+                assert np.array_equal(traces[(overlap, n, rep)], ref), f"{n} rows, overlap {overlap}, run {rep}"
