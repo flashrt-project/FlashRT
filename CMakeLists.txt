@@ -148,6 +148,7 @@ if(FLASHRT_ENABLE_PI05_GATED_TILE_SM87 AND
   message(FATAL_ERROR
     "FLASHRT_ENABLE_PI05_GATED_TILE_SM87 requires GPU_ARCH=87 and ENABLE_SM80_INT8_CUTLASS=ON")
 endif()
+message(STATUS "FLASHRT_ENABLE_PI05_GATED_TILE_SM87=${FLASHRT_ENABLE_PI05_GATED_TILE_SM87}")
 
 # ── FA2 build slimming flags (opt-in; defaults keep today's behaviour) ──
 # FA2's vendored CUTLASS 3.x templates dominate FlashRT's build cost
