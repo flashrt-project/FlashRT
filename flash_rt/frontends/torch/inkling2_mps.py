@@ -134,9 +134,14 @@ class Inkling2TorchFrontendMps:
             def raise_exception(message):
                 raise ValueError(message)
 
+            def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+                """transformers' filter: the template sorts tool declarations and arguments, compact separators."""
+                return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators,
+                                  sort_keys=sort_keys)
+
             env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                                 extensions=[GenerationBlock, "jinja2.ext.loopcontrols"])
-            env.filters["tojson"] = lambda v, ensure_ascii=True, **kw: json.dumps(v, ensure_ascii=ensure_ascii)
+            env.filters["tojson"] = tojson
             env.globals["raise_exception"] = raise_exception
             self._template = env.from_string(self.tokenizer.chat_template)
         return self._template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,

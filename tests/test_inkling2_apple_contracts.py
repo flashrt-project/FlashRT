@@ -204,3 +204,19 @@ def test_nvfp4_mma_arrangement_holds_every_weight_once():
                         seen[r, kb * 128 + k] += 1
     assert (seen == 1).all() and np.array_equal(rebuilt, nibbles)
     assert np.array_equal(ascales[1, 0, 3], scales[11, :8]) and np.array_equal(ascales[0, 1, 7], scales[7, 8:])
+
+
+def test_chat_template_tojson_matches_transformers():
+    """The template's tojson takes transformers' arguments and defaults (ensure_ascii=False): tool declarations
+    render with sorted keys and compact separators as the checkpoint's template asks."""
+    pytest.importorskip("jinja2")
+    from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
+
+    class _Tokenizer:
+        chat_template = ('{{ tools | tojson }}|{{ tools | tojson(sort_keys=true, separators=(",", ":")) }}|'
+                         '{% generation %}{{ messages[0]["content"] }}{% endgeneration %}')
+
+    fe = Inkling2TorchFrontendMps.__new__(Inkling2TorchFrontendMps)
+    fe.tokenizer, fe._template = _Tokenizer(), None
+    out = fe.apply_chat_template([{"role": "user", "content": "x"}], tools={"b": 1, "a": "é"})
+    assert out == '{"b": 1, "a": "é"}|{"a":"é","b":1}|x'
