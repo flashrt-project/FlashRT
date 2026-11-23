@@ -2,7 +2,8 @@
 //
 // Prefill-chunk attention on tensor cores (flash): one block per (query head, 64 query rows), 4 warps x 16 rows.
 // Per tile of 64 keys: S = Q K^T (mma.sync m16n8k16 BF16, FP32), scaled, plus the relative bias
-// bf16(r . rel_proj[:, distance]) for distances < 1024 (CUDA cores, the transposed rel_proj [1024][16]), causal /
+// bf16(r . rel_proj[:, distance]) for distances < 1024 (per warp the 79 distances of the tile on MMAs from the
+// transposed rel_proj [1024][16], then looked up per logit), causal /
 // sliding-window mask, online softmax, O += P V (FP16 P from the S fragments, V converted to FP16 in shared
 // memory, read by ldmatrix.trans). The sink
 // joins the denominator at the end; the output gate as in the decode merge. Queries come prepared from kv_rows
@@ -21,6 +22,7 @@ constexpr int kHd = 128, kHeads = 24, kKvHeads = 8, kGroup = 3, kRel = 16, kExte
 constexpr int kQPre = kGroup * kHd + kGroup * kRel;
 constexpr int kQRows = 64, kKeys = 64, kFlashThreads = 128;
 constexpr int kKPitch = kHd + 8;                   // bf16 row pitch of the key / value tiles (ldmatrix: no conflicts)
+constexpr int kBiasCols = 80;                      // distances of a warp's 16 rows x 64 keys (79), 10 n-tiles
 
 __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
   asm volatile(
@@ -55,16 +57,16 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
 __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_constant__ AttnDecodeParams p) {
   __shared__ __align__(16) uint16_t ks[kKeys][kKPitch];
   __shared__ __align__(16) uint16_t vs[kKeys][kKPitch];
+  __shared__ float bias_t[kFlashThreads / 32][16][kBiasCols];   // per warp: r . rel_proj[:, d] of its distances
   pdl_wait();
   pdl_launch();
   const int qh = blockIdx.x, h = qh / kGroup, gq = qh % kGroup;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31, g = lane >> 2, c = lane & 3;
   const int pos = *after_wait(p.pos), R = p.rows;
-  const int r0 = blockIdx.y * kQRows;                         // first row of the block
+  const int r0 = (gridDim.y - 1 - blockIdx.y) * kQRows;      // the longest (last) query tiles start first
   const int wr0 = r0 + warp * 16;                             // first row of the warp
   // the warp's query fragments (8 k-steps of 16 dims) and relative queries (rows g, g + 8)
-  uint32_t qa[8][4];
-  float rq[2][kRel];
+  uint32_t qa[8][4], ra[4];
   const float* qpre = after_wait(p.q_pre);
 #pragma unroll
   for (int hr = 0; hr < 2; ++hr) {
@@ -76,8 +78,8 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
       qa[kk][2 + hr] = pack_bf16(q[16 * kk + 8 + 2 * c], q[16 * kk + 8 + 2 * c + 1]);
     }
     const float* rr = qpre + (size_t(r) * kKvHeads + h) * kQPre + kGroup * kHd + gq * kRel;
-#pragma unroll
-    for (int i = 0; i < kRel; ++i) rq[hr][i] = rr[i];
+    ra[hr] = pack_bf16(rr[2 * c], rr[2 * c + 1]);
+    ra[2 + hr] = pack_bf16(rr[8 + 2 * c], rr[8 + 2 * c + 1]);
   }
   float o[16][4];
 #pragma unroll
@@ -134,33 +136,37 @@ __global__ void __launch_bounds__(kFlashThreads) attn_flash_kernel(const __grid_
         mma_bf16(s[n + 1], qa[kk], b[2], b[3]);
       }
     }
+    // relative bias of the warp's distances: rows wr0 .. wr0 + 15, keys k0 .. k0 + 63 -> distance d = dmin + i - j + 63
+    // for row i, key j; T[i][dd] = r_i . rel_proj[:, dmin + dd] for dd < 80 (10 n-tiles of 8 distances, MMA)
+    const int dmin = pos + wr0 - (k0 + kKeys - 1);
+#pragma unroll
+    for (int n = 0; n < kBiasCols / 8; ++n) {
+      const int d = min(max(dmin + 8 * n + g, 0), kExtent - 1);
+      const uint32_t* rt = reinterpret_cast<const uint32_t*>(relt + size_t(d) * kRel);
+      float bt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      mma_bf16(bt, ra, rt[c], rt[4 + c]);
+      bias_t[warp][g][8 * n + 2 * c] = bt[0];
+      bias_t[warp][g][8 * n + 2 * c + 1] = bt[1];
+      bias_t[warp][g + 8][8 * n + 2 * c] = bt[2];
+      bias_t[warp][g + 8][8 * n + 2 * c + 1] = bt[3];
+    }
+    __syncwarp();
     // logits: scale, relative bias, mask; online softmax per row
     float mx[2] = {m[0], m[1]};
 #pragma unroll
     for (int n = 0; n < 8; ++n)
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        const int hr = q >> 1, r = wr0 + g + 8 * hr, qpos = pos + r, kp = k0 + 8 * n + 2 * c + (q & 1);
+        const int hr = q >> 1, i = g + 8 * hr, r = wr0 + i, qpos = pos + r, j = 8 * n + 2 * c + (q & 1), kp = k0 + j;
         float v = -INFINITY;
         if (r < R && kp <= qpos && kp >= first_of(qpos)) {
           v = s[n][q] * scale;
-          const int dist = qpos - kp;
-          if (dist < kExtent) {
-            const uint4* rt = reinterpret_cast<const uint4*>(relt + size_t(dist) * kRel);
-            const uint4 w0 = rt[0], w1 = rt[1];
-            const uint32_t ww[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
-            float b = 0.0f;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-              b = fmaf(rq[hr][2 * i], bf16lo(ww[i]), b);
-              b = fmaf(rq[hr][2 * i + 1], bf16hi(ww[i]), b);
-            }
-            v += round_bf16(b);
-          }
+          if (qpos - kp < kExtent) v += round_bf16(bias_t[warp][i][i - j + kKeys - 1]);
         }
         s[n][q] = v;
         mx[hr] = fmaxf(mx[hr], v);
       }
+    __syncwarp();
 #pragma unroll
     for (int hr = 0; hr < 2; ++hr) {
       mx[hr] = fmaxf(mx[hr], __shfl_xor_sync(0xffffffffu, mx[hr], 1));
