@@ -395,14 +395,14 @@ void visit_boundary(const BoundaryParams& p, cudaStream_t stream) {
   if (p.n_blocks < 0 || p.n_blocks > kMaxBlocks || p.nq < 0 || p.nq > 3)
     throw std::invalid_argument("visit_boundary: bad block or query count");
   const int R = p.rows < 1 ? 1 : p.rows;
-  if (R > kMaxRows) throw std::invalid_argument("visit_boundary: at most 8 rows");
+  if (R > kMaxChunk) throw std::invalid_argument("visit_boundary: at most kMaxChunk rows");
   launch_pdl(visit_boundary_kernel, dim3(R + (p.prefetch.count ? kPrefetchBlocks : 0)), dim3(kThreads), 0, stream, p);
 }
 
 void post_attention(const PostAttentionParams& p, cudaStream_t stream) {
   if (p.n_blocks < 1 || p.n_blocks > kMaxBlocks) throw std::invalid_argument("post_attention: bad block count");
   const int R = p.rows < 1 ? 1 : p.rows;
-  if (R > kMaxRows) throw std::invalid_argument("post_attention: at most 8 rows");
+  if (R > kMaxChunk) throw std::invalid_argument("post_attention: at most kMaxChunk rows");
   launch_pdl(post_attention_kernel, dim3(R + (p.prefetch.count ? kPrefetchBlocks : 0)), dim3(kThreads), 0, stream, p);
 }
 

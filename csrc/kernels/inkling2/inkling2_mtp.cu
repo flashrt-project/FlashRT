@@ -61,6 +61,9 @@ __device__ __forceinline__ void head_norm_rope(float (&v)[4], const uint16_t* w,
   }
 }
 
+// rows of the context buffers x / kvc (a prefill chunk's rows, else the block's 8) and the context grid
+__host__ __device__ __forceinline__ int ctx_rows(const MtpParams& p) { return p.ctx_rows > 0 ? p.ctx_rows : kMtpBlock; }
+
 __device__ __forceinline__ int committed(const MtpParams& p) { return (p.count ? *after_wait(p.count) : 0) + p.count_add; }
 
 // ---------------------------------------------------------------------------------------------- context
@@ -84,7 +87,7 @@ __global__ void __launch_bounds__(kThreads) mtp_context_mix_kernel(const __grid_
       ss = fmaf(v, v, ss);
     }
     const float inv = rsqrtf(block_sum(ss, red) / float(kHidden) + 1e-6f);
-    uint16_t* dst = m == 3 ? after_wait(p.frnn) : after_wait(p.x) + (size_t(m) * kMtpBlock + j) * kHidden;
+    uint16_t* dst = m == 3 ? after_wait(p.frnn) : after_wait(p.x) + (size_t(m) * ctx_rows(p) + j) * kHidden;
     for (int i = threadIdx.x; i < kHidden; i += kThreads) dst[i] = f32_to_bf16_bits(mixed[i] * inv * bf16_to_f32(p.norm[m][i]));
   }
 }
@@ -97,8 +100,8 @@ __global__ void __launch_bounds__(kThreads) mtp_context_write_kernel(const __gri
   if (j >= n) return;
   const int pos = *after_wait(p.pos) - n + j;
   const int h = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const uint16_t* kc = after_wait(p.kvc) + (size_t(l * 2) * kMtpBlock + j) * (kKvHeads * kHd) + h * kHd;
-  const uint16_t* vc = after_wait(p.kvc) + (size_t(l * 2 + 1) * kMtpBlock + j) * (kKvHeads * kHd) + h * kHd;
+  const uint16_t* kc = after_wait(p.kvc) + (size_t(l * 2) * ctx_rows(p) + j) * (kKvHeads * kHd) + h * kHd;
+  const uint16_t* vc = after_wait(p.kvc) + (size_t(l * 2 + 1) * ctx_rows(p) + j) * (kKvHeads * kHd) + h * kHd;
   float k[4];
 #pragma unroll
   for (int t = 0; t < 4; ++t) k[t] = bf16_to_f32(kc[4 * lane + t]);
@@ -409,10 +412,10 @@ __global__ void __launch_bounds__(kThreads) mtp_pick_kernel(const __grid_constan
 }  // namespace
 
 void mtp_context_mix(const MtpParams& p, cudaStream_t s) {
-  launch_pdl(mtp_context_mix_kernel, dim3(kMtpBlock), dim3(kThreads), 0, s, p);
+  launch_pdl(mtp_context_mix_kernel, dim3(ctx_rows(p)), dim3(kThreads), 0, s, p);
 }
 void mtp_context_write(const MtpParams& p, cudaStream_t s) {
-  launch_pdl(mtp_context_write_kernel, dim3(kMtpBlock, kMtpLayers), dim3(kThreads), 0, s, p);
+  launch_pdl(mtp_context_write_kernel, dim3(ctx_rows(p), kMtpLayers), dim3(kThreads), 0, s, p);
 }
 void mtp_block_embed(const MtpParams& p, cudaStream_t s) {
   launch_pdl(mtp_block_embed_kernel, dim3(kMtpBlock), dim3(kThreads), 0, s, p);

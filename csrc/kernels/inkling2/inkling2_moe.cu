@@ -142,11 +142,6 @@ __device__ __forceinline__ float block_dot_mxfp8(uint4 w0, uint4 w1, const __hal
   return acc;
 }
 
-__device__ __forceinline__ float softcapped_swiglu(float g, float u, float gcap, float ucap) {
-  const float gc = tanhf(g / gcap) * gcap;
-  const float uc = tanhf(u / ucap) * ucap;
-  return gc * (1.0f / (1.0f + expf(-g))) * uc;
-}
 
 // Stage one quantized input row: NVFP4 codes as f16x2 pairs + FP32 block scales; MXFP8 values as half (exact).
 template <int Threads>
@@ -582,6 +577,16 @@ __device__ __forceinline__ void make_table(const int* ids, int slots, GroupTable
   __syncthreads();
 }
 
+// The raw quantized row n (codes, scale bytes) for the block-scaled MMA passes: NVFP4 k / 2 code bytes and k / 16
+// E4M3 scales per row, MXFP8 k code bytes and k / 32 UE8M0 scales per row (rows at the format's own stride).
+template <bool MX>
+__device__ __forceinline__ void copy_raw(const uint8_t* qc, const uint8_t* qs, int k, uint8_t* codes, uint8_t* scales, int n) {
+  const int cb = MX ? k : k / 2, sb = MX ? k / 32 : k / 16;
+  for (int i = threadIdx.x; i < cb / 16; i += blockDim.x)
+    reinterpret_cast<uint4*>(codes + size_t(n) * cb)[i] = reinterpret_cast<const uint4*>(qc)[i];
+  for (int i = threadIdx.x; i < sb; i += blockDim.x) scales[size_t(n) * sb + i] = qs[i];
+}
+
 // expert_route: one block per row: the routing of route_rows, the norm and the quantization of expert_w13_body, the
 // staged row (NVFP4 f16x2 pairs / MXFP8 half values, FP32 block scales, the amax) written to xq / xq_scale / xq_amax.
 template <bool MX>
@@ -653,6 +658,7 @@ __device__ void expert_route_body(const ExpertParams& p) {
   uint8_t* xq = static_cast<uint8_t*>(after_wait(p.xq)) + size_t(r) * kHidden * 2;
   quantize_stage_rows<MX>(xb, 1, kHidden, reinterpret_cast<uint32_t*>(xq), after_wait(p.xq_scale) + r * (kHidden / 16),
                           reinterpret_cast<__half*>(xq), after_wait(p.xq_amax) + r, qc, qs);
+  if (p.xq_codes) copy_raw<MX>(qc, qs, kHidden, after_wait(p.xq_codes), after_wait(p.xq_sc8), r);
 }
 
 __global__ void __launch_bounds__(kExpertThreads) expert_route_kernel(const __grid_constant__ ExpertParams p) {
@@ -883,6 +889,7 @@ __device__ void expert_act_quant_body(const ExpertParams& p) {
   quantize_stage_rows<MX, kActThreads>(ab, 1, kInter, reinterpret_cast<uint32_t*>(xq),
                                        after_wait(p.xq_scale) + s * (kInter / 16), reinterpret_cast<__half*>(xq),
                                        after_wait(p.xq_amax) + s, qc, qs);
+  if (p.xq_codes) copy_raw<MX>(qc, qs, kInter, after_wait(p.xq_codes), after_wait(p.xq_sc8), s);
 }
 
 __global__ void __launch_bounds__(kActThreads) expert_act_quant_kernel(const __grid_constant__ ExpertParams p) {
@@ -997,15 +1004,16 @@ int sm_count() {
   }();
   return n;
 }
-void check_flat(const ExpertParams& p, const char* what) {
+// max_rows: kMaxRows for the flat weight passes, kMaxChunk for the row / slot parallel route and act quantization
+void check_flat(const ExpertParams& p, const char* what, int max_rows = kMaxRows) {
   const int rows = p.rows < 1 ? 1 : p.rows;
-  if (rows > kMaxRows || !p.xq || !p.xq_scale || !p.xq_amax)
-    throw std::invalid_argument(std::string(what) + ": 1..8 rows and the staged inputs xq, xq_scale, xq_amax");
+  if (rows > max_rows || !p.xq || !p.xq_scale || !p.xq_amax)
+    throw std::invalid_argument(std::string(what) + ": too many rows or missing staged inputs xq, xq_scale, xq_amax");
 }
 }  // namespace
 
 void expert_route(const ExpertParams& p, cudaStream_t stream) {
-  check_flat(p, "expert_route");
+  check_flat(p, "expert_route", kMaxChunk);
   if (!p.logits || !p.bias || !p.x_in || !p.norm_w || !p.ids_out || !p.weights_out)
     throw std::invalid_argument("expert_route: logits, bias, x_in, norm_w, ids_out, weights_out");
   launch_pdl(expert_route_kernel, dim3(p.rows < 1 ? 1 : p.rows), dim3(kExpertThreads), 0, stream, p);
@@ -1019,7 +1027,7 @@ void expert_w13_flat(const ExpertParams& p, cudaStream_t stream) {
 }
 
 void expert_act_quant(const ExpertParams& p, cudaStream_t stream) {
-  check_flat(p, "expert_act_quant");
+  check_flat(p, "expert_act_quant", kMaxChunk);
   if (!p.act) throw std::invalid_argument("expert_act_quant: act");
   launch_pdl(expert_act_quant_kernel, dim3((p.rows < 1 ? 1 : p.rows) * kTopK), dim3(kActThreads), 0, stream, p);
 }
