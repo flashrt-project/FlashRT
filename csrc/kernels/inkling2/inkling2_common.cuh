@@ -61,6 +61,12 @@ constexpr uint32_t kPrefetchChunk = 64u << 10;
 __device__ __forceinline__ void prefetch_l2(const void* p, uint32_t bytes) {
   asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
 }
+// The checkpoint's MLP activation: softcapped SwiGLU of the gate / up projections.
+__device__ __forceinline__ float softcapped_swiglu(float g, float u, float gcap, float ucap) {
+  const float gc = tanhf(g / gcap) * gcap;
+  const float uc = tanhf(u / ucap) * ucap;
+  return gc * (1.0f / (1.0f + expf(-g))) * uc;
+}
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" :::); }
 template <typename T>

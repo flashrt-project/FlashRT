@@ -61,6 +61,8 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   m.doc() = "Inkling-2-Mini (SM120) kernels: batch-one decode GEMVs, attention, routed experts";
 
   m.attr("MAX_GEMV_TASKS") = ik::kMaxGemvTasks;
+  m.attr("MAX_ROWS") = ik::kMaxRows;
+  m.attr("MAX_CHUNK") = ik::kMaxChunk;
   m.attr("MAX_PREFETCH") = ik::kMaxPrefetch;
 
   m.attr("GEMV_PLAIN") = int(ik::kGemvPlain);
@@ -232,6 +234,12 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.xq = dptr<void>(d, "xq");
     p.xq_scale = dptr<float>(d, "xq_scale");
     p.xq_amax = dptr<float>(d, "xq_amax");
+    p.xq_codes = dptr<uint8_t>(d, "xq_codes");
+    p.xq_sc8 = dptr<uint8_t>(d, "xq_sc8");
+    p.order = dptr<int>(d, "order");
+    p.offset = dptr<int>(d, "offset");
+    p.tile_off = dptr<int>(d, "tile_off");
+    p.max_tiles = dint(d, "max_tiles");
     return p;
   };
   m.def("expert_w13", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13(expert(d), to_stream(stream)); });
@@ -240,6 +248,9 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   m.def("expert_w13_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13_flat(expert(d), to_stream(stream)); });
   m.def("expert_act_quant", [expert](const py::dict& d, uintptr_t stream) { ik::expert_act_quant(expert(d), to_stream(stream)); });
   m.def("expert_w2_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w2_flat(expert(d), to_stream(stream)); });
+  m.def("expert_sort", [expert](const py::dict& d, uintptr_t stream) { ik::expert_sort(expert(d), to_stream(stream)); });
+  m.def("expert_mma_w13", [expert](const py::dict& d, uintptr_t stream) { ik::expert_mma_w13(expert(d), to_stream(stream)); });
+  m.def("expert_mma_w2", [expert](const py::dict& d, uintptr_t stream) { ik::expert_mma_w2(expert(d), to_stream(stream)); });
   auto mtp = [](const py::dict& d) {
     ik::MtpParams p = {};
     for (int i = 0; i < 4; ++i) {
@@ -268,6 +279,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     }
     p.count = dptr<const int>(d, "count");
     p.count_add = dint(d, "count_add");
+    p.ctx_rows = dint(d, "ctx_rows");
     p.kvc = dptr<const uint16_t>(d, "kvc");
     p.pos = dptr<const int>(d, "pos");
     p.kv = dptr<uint16_t>(d, "kv");

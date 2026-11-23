@@ -37,6 +37,9 @@ enum GemvPrologue { kGemvPlain = 0, kGemvNorm = 1, kGemvGate = 2 };
 // rows > 1 (up to kMaxRows): x [rows][k], y [rows][n], a gate aux [rows][k]; every row's arithmetic is the one-row
 // kernel's (same staging order, same per-lane accumulation and warp sum), so row r equals a one-row launch on row r.
 constexpr int kMaxRows = 8;
+// Rows of a prefill chunk: the row-parallel kernels (visit boundary / post attention / gate mix, attention, kv_rows,
+// norm_rows, commit) take up to kMaxChunk rows; the GEMV rows kernel and the flat expert passes up to kMaxRows.
+constexpr int kMaxChunk = 512;
 struct GemvTask {
   const void* w;     // [n][k] BF16
   const void* x;     // [k] BF16 or FP32 (x_f32)
@@ -209,6 +212,15 @@ struct ExpertParams {
   void* xq;
   float* xq_scale;
   float* xq_amax;
+  // grouped MMA passes (prefill chunks): the raw quantized inputs per row / slot (codes, scale bytes; written by
+  // expert_route / expert_act_quant when set), the slots sorted by expert (expert_sort): order[i] = slot,
+  // offset[e] .. offset[e + 1] the expert's range, tile_off[e] its first 64-slot tile, tile_off[128] the tiles
+  uint8_t* xq_codes;
+  uint8_t* xq_sc8;
+  int* order;
+  int* offset;
+  int* tile_off;
+  int max_tiles;                    // grid of the MMA passes: at most rows * 8 / 64 + 128 tiles
 };
 void expert_w13(const ExpertParams& p, cudaStream_t stream);
 void expert_w2(const ExpertParams& p, cudaStream_t stream);
@@ -218,6 +230,12 @@ void expert_route(const ExpertParams& p, cudaStream_t stream);
 void expert_w13_flat(const ExpertParams& p, cudaStream_t stream);
 void expert_act_quant(const ExpertParams& p, cudaStream_t stream);
 void expert_w2_flat(const ExpertParams& p, cudaStream_t stream);
+// Prefill chunks (up to kMaxChunk rows): expert_route (+ xq_codes / xq_sc8), expert_sort, expert_mma_w13 (act per
+// slot), expert_act_quant (+ raw), expert_mma_w2 (out per slot) on the SM120 block-scaled MMAs
+// (kind::mxf4nvf4 m16n8k64 for NVFP4, kind::mxf8f6f4 m16n8k32 for MXFP8).
+void expert_sort(const ExpertParams& p, cudaStream_t stream);
+void expert_mma_w13(const ExpertParams& p, cudaStream_t stream);
+void expert_mma_w2(const ExpertParams& p, cudaStream_t stream);
 
 // ---- LM head + greedy (inkling2_lmhead.cu)
 struct LmHeadParams {
@@ -251,6 +269,7 @@ struct MtpParams {
   const uint16_t* feat[4];          // target features [rows][kHidden] (hidden after visits 4 / 22 / 40, final norm)
   const int* count;
   int count_add;
+  int ctx_rows;                     // rows of the context buffers x / kvc ([3][ctx_rows][..]; 0: kMtpBlock)
   float alpha[16];                  // fuse mixes [4][4]: layers 0..2, the Markov head
   const uint16_t* norm[4];          // their dflare norms
   const uint16_t* kvc;              // [3][2][8][1024] context k / v projections

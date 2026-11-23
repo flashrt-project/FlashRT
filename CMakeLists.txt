@@ -1914,6 +1914,7 @@ if(FLASHRT_ENABLE_INKLING2)
     csrc/kernels/inkling2/inkling2_visit.cu
     csrc/kernels/inkling2/inkling2_attention.cu
     csrc/kernels/inkling2/inkling2_moe.cu
+    csrc/kernels/inkling2/inkling2_moe_mma.cu
     csrc/kernels/inkling2/inkling2_lmhead.cu
     csrc/kernels/inkling2/inkling2_spec.cu
     csrc/kernels/inkling2/inkling2_mtp.cu)

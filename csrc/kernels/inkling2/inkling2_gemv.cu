@@ -297,8 +297,8 @@ void norm_rows(const NormRowsTask* tasks, int count, cudaStream_t stream) {
   int blocks = 0, max_k = 0;
   for (int t = 0; t < count; ++t) {
     const NormRowsTask& task = tasks[t];
-    if (!task.x || !task.w || !task.out || task.k < 8 || task.rows < 1 || task.rows > kMaxRows)
-      throw std::invalid_argument("norm_rows: task needs pointers, k >= 8 and 1 to 8 rows");
+    if (!task.x || !task.w || !task.out || task.k < 8 || task.rows < 1 || task.rows > kMaxChunk)
+      throw std::invalid_argument("norm_rows: task needs pointers, k >= 8 and 1 to kMaxChunk rows");
     p.task[t] = task;
     p.block_start[t] = blocks;
     blocks += task.rows;

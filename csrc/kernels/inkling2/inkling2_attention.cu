@@ -349,14 +349,14 @@ __global__ void __launch_bounds__(kAttnThreads) kv_rows_kernel(const __grid_cons
 }  // namespace
 
 void kv_rows(const AttnDecodeParams& p, cudaStream_t stream) {
-  if (p.rows < 1 || p.rows > kMaxRows || !p.stage_in || (p.sliding && !p.stage_kv))
-    throw std::invalid_argument("kv_rows: 1..8 rows, stage_in, and stage_kv for sliding layers");
+  if (p.rows < 1 || p.rows > kMaxChunk || !p.stage_in || (p.sliding && !p.stage_kv))
+    throw std::invalid_argument("kv_rows: 1..kMaxChunk rows, stage_in, and stage_kv for sliding layers");
   launch_pdl(kv_rows_kernel, dim3(p.rows, kKvHeads, 2), dim3(kAttnThreads), 0, stream, p);
 }
 
 void attn_decode(const AttnDecodeParams& p, cudaStream_t stream) {
   if (p.max_splits < 1) throw std::invalid_argument("attn_decode: max_splits >= 1");
-  if (p.rows > kMaxRows) throw std::invalid_argument("attn_decode: at most 8 rows");
+  if (p.rows > kMaxChunk) throw std::invalid_argument("attn_decode: at most kMaxChunk rows");
   launch_pdl(attn_decode_kernel, dim3(kKvHeads, p.max_splits, p.rows < 1 ? 1 : p.rows), dim3(kAttnThreads), 0, stream, p);
 }
 
