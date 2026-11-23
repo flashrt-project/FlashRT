@@ -167,35 +167,6 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
       throw std::invalid_argument("gate_mix: lists of equal length");
     ik::gate_mix(p, to_stream(stream));
   });
-  m.def("attn_prologue", [](const py::dict& d, uintptr_t stream) {
-    ik::AttnPrologueParams p = {};
-    p.sliding = dint(d, "sliding");
-    p.pos = dptr<const int>(d, "pos");
-    p.q_lin = dptr<const uint16_t>(d, "q_lin");
-    p.r_lin = dptr<const uint16_t>(d, "r_lin");
-    p.k_lin = dptr<const uint16_t>(d, "k_lin");
-    p.v_lin = dptr<const uint16_t>(d, "v_lin");
-    p.k_dyn = dptr<const uint16_t>(d, "k_dyn");
-    p.v_dyn = dptr<const uint16_t>(d, "v_dyn");
-    p.k_conv_state = dptr<uint16_t>(d, "k_conv_state");
-    p.v_conv_state = dptr<uint16_t>(d, "v_conv_state");
-    p.k_conv_w = dptr<const uint16_t>(d, "k_conv_w");
-    p.v_conv_w = dptr<const uint16_t>(d, "v_conv_w");
-    p.q_clip = dptr<const uint16_t>(d, "q_clip");
-    p.rel_clip = dptr<const uint16_t>(d, "rel_clip");
-    p.rel_proj = dptr<const uint16_t>(d, "rel_proj");
-    p.qk_threshold = dflt(d, "qk_threshold");
-    p.rel_threshold = dflt(d, "rel_threshold");
-    p.log_alpha = dflt(d, "log_alpha");
-    p.log_floor = dflt(d, "log_floor", 1.0f);
-    p.q_out = dptr<uint16_t>(d, "q_out");
-    p.bias = dptr<uint16_t>(d, "bias");
-    p.k_cache = dptr<uint16_t>(d, "k_cache");
-    p.v_cache = dptr<uint16_t>(d, "v_cache");
-    if (!p.sliding && (!p.k_dyn || !p.v_dyn)) throw std::invalid_argument("attn_prologue: full layers need k_dyn, v_dyn");
-    p.prefetch = dprefetch(d);
-    ik::attn_prologue(p, to_stream(stream));
-  });
   auto attn_params = [](const py::dict& d) {
     ik::AttnDecodeParams p = {};
     p.rows = dint(d, "rows", 1);
@@ -235,23 +206,6 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   };
   m.def("attn_decode", [attn_params](const py::dict& d, uintptr_t stream) { ik::attn_decode(attn_params(d), to_stream(stream)); });
   m.def("kv_rows", [attn_params](const py::dict& d, uintptr_t stream) { ik::kv_rows(attn_params(d), to_stream(stream)); });
-  m.def("router", [](const py::dict& d, uintptr_t stream) {
-    ik::RouterParams p = {};
-    p.in = dptr<const float>(d, "in");
-    p.norm_w = dptr<const uint16_t>(d, "norm_w");
-    p.weight = dptr<const uint16_t>(d, "weight");
-    p.bias = dptr<const float>(d, "bias");
-    p.route_scale = dflt(d, "route_scale");
-    p.mxfp8 = dint(d, "mxfp8");
-    p.logits = dptr<float>(d, "logits");
-    p.counter = dptr<int>(d, "counter");
-    p.ids = dptr<int>(d, "ids");
-    p.weights = dptr<float>(d, "weights");
-    p.x_codes = dptr<uint8_t>(d, "x_codes");
-    p.x_scales = dptr<uint8_t>(d, "x_scales");
-    p.x_amax = dptr<float>(d, "x_amax");
-    ik::router(p, to_stream(stream));
-  });
   auto expert = [](const py::dict& d) {
     ik::ExpertParams p = {};
     p.mxfp8 = dint(d, "mxfp8");
@@ -263,9 +217,6 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.denominator = dflt(d, "denominator", 1.0f);
     p.gate_cap = dflt(d, "gate_cap");
     p.up_cap = dflt(d, "up_cap");
-    p.x_codes = dptr<const uint8_t>(d, "x_codes");
-    p.x_scales = dptr<const uint8_t>(d, "x_scales");
-    p.x_amax = dptr<const float>(d, "x_amax");
     p.act = dptr<uint16_t>(d, "act");
     p.out = dptr<uint16_t>(d, "out");
     p.logits = dptr<const float>(d, "logits");
@@ -277,14 +228,6 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.weights_out = dptr<float>(d, "weights_out");
     if (p.logits && (!p.bias || !p.x_in || !p.norm_w || !p.ids_out || !p.weights_out))
       throw std::invalid_argument("expert: folded routing needs bias, x_in, norm_w, ids_out, weights_out");
-    if (d.contains("w2_prefetch")) {       // [(base, bytes per expert)] x 2: w2 codes, w2 scales
-      const auto v = d["w2_prefetch"].cast<std::vector<std::tuple<uintptr_t, uint64_t>>>();
-      if (v.size() != 2) throw std::invalid_argument("expert: w2_prefetch needs 2 (base, bytes) entries");
-      for (int i = 0; i < 2; ++i) {
-        p.w2_base[i] = reinterpret_cast<const uint8_t*>(std::get<0>(v[i]));
-        p.w2_bytes[i] = std::get<1>(v[i]);
-      }
-    }
     p.prefetch = dprefetch(d);
     p.xq = dptr<void>(d, "xq");
     p.xq_scale = dptr<float>(d, "xq_scale");
