@@ -37,13 +37,17 @@ __global__ void accept_kernel(const __grid_constant__ AcceptParams p) {
   }
 }
 
-// grid (visits): table rows of kCommitFields pointers per visit.
+// grid (visits, ceil(rows / kCommitRows)): table rows of kCommitFields pointers per visit; the blocks of a visit copy
+// kCommitRows ring rows each, the first also shifts the conv states.
 __global__ void __launch_bounds__(256) commit_kernel(const __grid_constant__ CommitParams p) {
   pdl_wait();
   pdl_launch();
   const uint64_t* row = after_wait(p.table) + size_t(blockIdx.x) * kCommitFields;
   const int n = *after_wait(p.accepted) + 1;                     // rows to commit
   const int pos = *after_wait(p.pos);
+  const int j0 = blockIdx.y * kCommitRows, j1 = min(n, j0 + kCommitRows);
+  if (j0 >= n) return;
+  if (blockIdx.y == 0) {
   // conv states: last 3 of [state (3 rows), inputs of rows 0 .. n - 1]
   struct Conv { int field_state, field_in, channels, in_stride, in_offset; };
   const Conv convs[4] = {{0, 4, kKv, 2 * kKv, 0}, {1, 4, kKv, 2 * kKv, kKv},
@@ -64,16 +68,18 @@ __global__ void __launch_bounds__(256) commit_kernel(const __grid_constant__ Com
       for (int j = 0; j < 3; ++j) st[j * C + c] = v[j];
     }
   }
-  // sliding rings
+  }
+  // sliding rings: rows j0 .. j1 - 1 of this block, 16-byte pieces
   if (row[10]) {
-    uint16_t* rk = reinterpret_cast<uint16_t*>(row[7]);
-    uint16_t* rv = reinterpret_cast<uint16_t*>(row[8]);
-    const uint16_t* skv = reinterpret_cast<const uint16_t*>(row[9]);
-    for (int i = threadIdx.x; i < n * kKv; i += 256) {
-      const int j = i / kKv, e = i % kKv;
+    uint4* rk = reinterpret_cast<uint4*>(row[7]);
+    uint4* rv = reinterpret_cast<uint4*>(row[8]);
+    const uint4* skv = reinterpret_cast<const uint4*>(row[9]);
+    constexpr int kPieces = kKv / 8;
+    for (int i = threadIdx.x; i < (j1 - j0) * kPieces; i += 256) {
+      const int j = j0 + i / kPieces, e = i % kPieces;
       const int slot = (pos + j) % 1024;
-      rk[size_t(slot) * kKv + e] = skv[(size_t(j) * 2) * kKv + e];
-      rv[size_t(slot) * kKv + e] = skv[(size_t(j) * 2 + 1) * kKv + e];
+      rk[size_t(slot) * kPieces + e] = skv[(size_t(j) * 2) * kPieces + e];
+      rv[size_t(slot) * kPieces + e] = skv[(size_t(j) * 2 + 1) * kPieces + e];
     }
   }
 }
@@ -87,7 +93,8 @@ void accept(const AcceptParams& p, cudaStream_t stream) {
 
 void commit(const CommitParams& p, cudaStream_t stream) {
   if (p.visits < 1) throw std::invalid_argument("commit: visits >= 1");
-  launch_pdl(commit_kernel, dim3(p.visits), dim3(256), 0, stream, p);
+  const int rows = p.rows < 1 ? kMaxRows : p.rows;
+  launch_pdl(commit_kernel, dim3(p.visits, (rows + kCommitRows - 1) / kCommitRows), dim3(256), 0, stream, p);
 }
 
 }  // namespace inkling2

@@ -362,7 +362,9 @@ struct CommitParams {
   const uint64_t* table;            // [visits][kCommitFields]
   const int* accepted;
   const int* pos;
+  int rows;                         // rows of the program (bounds accepted + 1); the ring copy runs in kCommitRows pieces
 };
+constexpr int kCommitRows = 16;
 void commit(const CommitParams& p, cudaStream_t stream);
 
 }  // namespace inkling2

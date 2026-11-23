@@ -392,6 +392,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.table = dptr<const uint64_t>(d, "table");
     p.accepted = dptr<const int>(d, "accepted");
     p.pos = dptr<const int>(d, "pos");
+    p.rows = dint(d, "rows");
     ik::commit(p, to_stream(stream));
   });
 }
