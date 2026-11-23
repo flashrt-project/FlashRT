@@ -27,12 +27,40 @@ from typing import Dict, Iterator, List, Optional, Sequence
 
 import torch
 
-from flash_rt.frontends.torch._inkling2_rtx_runtime import Inkling2RtxRuntime
+from flash_rt.frontends.torch._inkling2_rtx_runtime import Inkling2RtxRuntime, read_config, visit_count
 from flash_rt.models.flint.tokenizer import FlintTokenizer as _JsonTokenizer   # model-independent tokenizer.json
 
-__all__ = ["Inkling2TorchFrontendRtx"]
+__all__ = ["Inkling2TorchFrontendRtx", "compile_chat_template"]
 
 PREFILL_MODES = ("fast", "exact")
+
+
+def compile_chat_template(source: str):
+    """The checkpoint's Jinja chat template in transformers' environment: ``{% generation %}`` blocks render their
+    body, ``loopcontrols``, ``raise_exception`` and ``tojson`` with transformers' arguments and defaults."""
+    import json
+    from jinja2.ext import Extension
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    class GenerationBlock(Extension):
+        """``{% generation %} ... {% endgeneration %}`` (transformers' assistant-mask markers): the body."""
+        tags = {"generation"}
+
+        def parse(self, parser):
+            next(parser.stream)
+            return parser.parse_statements(("name:endgeneration",), drop_needle=True)
+
+    def raise_exception(message):
+        raise ValueError(message)
+
+    def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+        return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                        extensions=[GenerationBlock, "jinja2.ext.loopcontrols"])
+    env.filters["tojson"] = tojson
+    env.globals["raise_exception"] = raise_exception
+    return env.from_string(source)
 
 
 class Inkling2TorchFrontendRtx:
@@ -51,6 +79,10 @@ class Inkling2TorchFrontendRtx:
             raise ValueError(f"prefill must be one of {PREFILL_MODES}")
         if check_block < 1 or check_rounds < 1:
             raise ValueError("check_block and check_rounds must be positive")
+        if speculative:   # the drafter's configuration, before any weight is loaded
+            from flash_rt.frontends.torch._inkling2_rtx_mtp import check_mtp_config
+            raw, text = read_config(checkpoint_dir)
+            check_mtp_config(raw, visit_count(text))
         self.rt = Inkling2RtxRuntime(checkpoint_dir, max_seq=max_seq, device=device)
         self.cfg = self.rt.c
         self.vocab = self.rt.vocab
@@ -152,26 +184,7 @@ class Inkling2TorchFrontendRtx:
         if self.tokenizer.chat_template is None:
             raise ValueError("no chat template (chat_template.jinja)")
         if self._template is None:
-            import json
-            from jinja2.ext import Extension
-            from jinja2.sandbox import ImmutableSandboxedEnvironment
-
-            class GenerationBlock(Extension):
-                """``{% generation %} ... {% endgeneration %}`` (transformers' assistant-mask markers): the body."""
-                tags = {"generation"}
-
-                def parse(self, parser):
-                    next(parser.stream)
-                    return parser.parse_statements(("name:endgeneration",), drop_needle=True)
-
-            def raise_exception(message):
-                raise ValueError(message)
-
-            env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                                extensions=[GenerationBlock, "jinja2.ext.loopcontrols"])
-            env.filters["tojson"] = lambda v, ensure_ascii=True, **kw: json.dumps(v, ensure_ascii=ensure_ascii)
-            env.globals["raise_exception"] = raise_exception
-            self._template = env.from_string(self.tokenizer.chat_template)
+            self._template = compile_chat_template(self.tokenizer.chat_template)
         return self._template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                      **template_kwargs)
 

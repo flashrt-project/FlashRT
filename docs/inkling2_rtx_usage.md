@@ -9,7 +9,9 @@ depth-attention queries; NVFP4 experts (E2M1 codes, E4M3 scales per 16 inputs,
 per-expert global scale) in layers 0-19 and MXFP8 experts (E4M3 codes, E8M0
 scales per 32) in layers 20-23, multiplied with the expert inputs quantized as
 `hf_quant_config.json` requires (NVFP4 with the `fouroversix_mae` scale rule,
-MXFP8). Weights are loaded as stored; nothing is re-quantized.
+MXFP8). The model's weights are loaded as stored; nothing is re-quantized. (The
+drafter's draft-only vocabulary products read E4M3 copies of the LM head and of
+its folded correction; they choose drafts, never the verified tokens.)
 
 Every forward is a recorded program: a fixed list of kernel launches over
 device pointers that reads the position and the input tokens from device
@@ -29,9 +31,10 @@ cmake -B build -DGPU_ARCH=120 -DFLASHRT_ENABLE_INKLING2=ON
 cmake --build build --target flash_rt_inkling2 -j     # flash_rt/flash_rt_inkling2*.so
 ```
 
-A checkpoint with another geometry, layer layout or drafter is refused before
-any weight is loaded. `INKLING2_PDL=0` launches without programmatic dependent
-launch (for per-kernel profiling).
+A checkpoint with another geometry, layer layout or drafter configuration is
+refused before any weight is loaded; expert formats are checked while loading.
+`INKLING2_PDL=0` launches without programmatic dependent launch (for
+per-kernel profiling).
 
 ## Usage
 
@@ -50,7 +53,7 @@ for block in fe.stream(ids, max_new_tokens=256, speculative=False, prefill="exac
 
 | Argument | Meaning |
 |---|---|
-| `max_seq` | prompt plus generated tokens (KV capacity of the global-attention layers; sliding-window layers keep 1024 slots) |
+| `max_seq` | KV capacity of the global-attention layers (sliding-window layers keep 1024 slots): prompt plus generated tokens plus a margin, 1 position for plain decoding and `(check_rounds + 1) * draft_width + 8` (28 by default) for speculative decoding |
 | `speculative` | load the DSpark drafter and decode speculatively by default; `stream(..., speculative=False)` decodes plainly |
 | `draft_width` | verified rows per speculative step: the anchor and `draft_width - 1` drafts (2..8, default 4) |
 | `prefill` | `"fast"`: tensor-core chunks (default); `"exact"`: per-row chunks, bit-identical to decoding the prompt token by token |
