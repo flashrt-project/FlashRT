@@ -315,6 +315,26 @@ Qwen3 kernels, `GemmRunner.fp8_nt_dev` and `flash_rt_fa2`. See
 | Elementwise | `groot_n15_add_rows_bf16`, `groot_n15_bias_act_bf16`, `groot_n15_concat_bias_bf16`, `groot_n15_gelu_tanh_bf16`, `groot_n15_actions_init`, `groot_n15_euler_step` | Bias / position add, bias + ReLU / swish, action-encoder concat, GELU (tanh), flow-matching state |
 | FP8 tier | `groot_n15_quant_rows_fp8`, `groot_n15_rescale_rows_bf16` | Per-token E4M3 activation quantization; token x channel dequantization + bias after a unit-scale FP8 GEMM |
 
+## 15. Inkling 2 Mini (`flash_rt_inkling2`, `-DFLASHRT_ENABLE_INKLING2=ON`, `GPU_ARCH=120`)
+
+A separate module for `thinkingmachines/Inkling-2-Mini` at the checkpoint's
+precision (BF16 attention, NVFP4 / MXFP8 experts with NVFP4 / MXFP8 inputs);
+nothing builds into `flash_rt_kernels`. Shapes are the checkpoint's (hidden
+2304, 24/8 heads of 128, 128 experts top-8, 48 layer visits); every entry takes
+a dict of device pointers and a stream, and the launchers reject row counts
+outside `1..MAX_ROWS` (per-row programs) or `1..MAX_CHUNK` (prompt chunks). See
+`docs/inkling2_rtx_usage.md`.
+
+| Group | Symbols | What it is |
+|---|---|---|
+| Products | `gemv_multi`, `norm_rows` | Several BF16 GEMVs per launch over 1-8 rows (RMSNorm / gate prologues, BF16 or FP32 out, per-row arithmetic independent of the row count); RMSNorm of up to 512 rows |
+| Layer visit | `visit_boundary`, `post_attention`, `gate_mix` | Depth attention over the block residuals with the previous visit's expert combine, message gates between passes of the looped layers (per-row kernel, MMA tiles above 8 rows), post-attention convolution and residual |
+| Attention | `kv_rows`, `attn_decode`, `attn_flash` | K / V convolutions, L2 clips, V norm and staged KV rows; split-key decode / verification attention with relative bias, sinks and the output gate; tensor-core prompt attention (BF16 Q K, bias from MMA tables, P V in two FP16 parts) |
+| Experts, per row | `expert_w13`, `expert_w2`, `expert_route`, `expert_w13_flat`, `expert_act_quant`, `expert_w2_flat` | Routing (sigmoid + bias top-8), NVFP4 (`fouroversix_mae`) / MXFP8 input quantization, exact FP4 / FP8 block products: fused for one row, flat passes over the distinct experts of up to 8 rows |
+| Experts, prompt chunks | `expert_sort`, `expert_mma_w13`, `expert_mma_w2` | Slots sorted by expert, grouped `mma.sync` `kind::mxf4nvf4` m16n8k64 (NVFP4) / `kind::mxf8f6f4` m16n8k32 (MXFP8) tiles on the checkpoint's codes and scale rows |
+| Head and speculation | `lm_head`, `accept`, `commit` | Final norm + LM head + greedy argmax over up to 8 rows (optional E4M3 weight copy), acceptance of drafts against the targets, commit of the accepted rows' KV / convolution states |
+| DSpark drafter | `mtp_context_mix`, `mtp_context_write`, `mtp_block_embed`, `mtp_norm`, `mtp_qk`, `mtp_attention`, `mtp_silu`, `mtp_rnn_in`, `mtp_gates`, `mtp_pick` | Context rows from the target features, the 8-position block over three layers, the Markov RNN head and the folded vocabulary pick |
+
 ## Re-use decision tree
 
 When evaluating FlashRT for a new model, walk this checklist:
