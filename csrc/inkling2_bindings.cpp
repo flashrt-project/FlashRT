@@ -63,6 +63,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   m.attr("MAX_GEMV_TASKS") = ik::kMaxGemvTasks;
   m.attr("MAX_ROWS") = ik::kMaxRows;
   m.attr("MAX_CHUNK") = ik::kMaxChunk;
+  m.attr("MMA_TILE_SLOTS") = ik::expert_mma_tile_slots();
   m.attr("MAX_PREFETCH") = ik::kMaxPrefetch;
 
   m.attr("GEMV_PLAIN") = int(ik::kGemvPlain);

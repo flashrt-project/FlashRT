@@ -44,12 +44,6 @@ __device__ __forceinline__ float l2_clip_scale(float sumsq, float threshold) {
 constexpr int kSplitKeys = 64;
 constexpr int kAttnThreads = 128;
 
-__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem))),
-               "l"(gmem) : "memory");
-}
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
-
 // The new K / V row (one head, 128 threads): conv of x over the three previous inputs (s[0] oldest), then the K L2
 // clip or the V RMS norm, BF16. Static (sliding) or dynamic (full, dyn = the row's 4 weights of this head) conv.
 __device__ __forceinline__ uint16_t new_kv(bool is_k, bool sliding, const uint16_t* w, const uint16_t* dyn, int c, int C,
@@ -124,6 +118,78 @@ __device__ __forceinline__ void prepare_queries(const AttnDecodeParams& p, int h
   }
 }
 
+// Row r's split over its keys ks[0 .. kn) / vs (positions k0 ..): logits with the relative bias, softmax, P V; the
+// split's partial (max, sum, acc). The queries in sm.qs / sm.rs.
+template <class Sm>
+__device__ __forceinline__ void split_rows(const AttnDecodeParams& p, Sm& sm, const uint16_t (*ks)[kHd],
+                                           const uint16_t (*vs)[kHd], int h, int split, int r, int qpos, int k0, int kn) {
+  const int t = threadIdx.x;
+  {
+    const int key = t >> 1, half = t & 1;
+    float acc[kGroup] = {0.0f, 0.0f, 0.0f};
+    const uint4* kr = reinterpret_cast<const uint4*>(&ks[key][half * 64]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint4 v = kr[i];
+      const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int d = half * 64 + i * 8 + j * 2;
+#pragma unroll
+        for (int g = 0; g < kGroup; ++g) {
+          acc[g] = fmaf(bf16lo(w[j]), sm.qs[g][d], acc[g]);
+          acc[g] = fmaf(bf16hi(w[j]), sm.qs[g][d + 1], acc[g]);
+        }
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) acc[g] += __shfl_xor_sync(0xffffffffu, acc[g], 1);
+    if (half == 0) {
+      const int dist = qpos - (k0 + key);
+#pragma unroll
+      for (int g = 0; g < kGroup; ++g) {
+        float l = -INFINITY;
+        if (key < kn) {
+          l = acc[g] * (1.0f / sqrtf(float(kHd)));
+          if (dist < kExtent) {
+            float b = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kRel; ++i) b = fmaf(sm.rs[g][i], bf16_to_f32(p.rel_proj[i * kExtent + dist]), b);
+            l += round_bf16(b);
+          }
+        }
+        sm.lg[g][key] = l;
+      }
+    }
+  }
+  __syncthreads();
+  const int lane = t & 31, warp = t >> 5;
+  if (warp < kGroup) {
+    const float a = sm.lg[warp][lane], b = sm.lg[warp][lane + 32];
+    const float m = warp_max(fmaxf(a, b));
+    const float ea = a == -INFINITY ? 0.0f : expf(a - m), eb = b == -INFINITY ? 0.0f : expf(b - m);
+    sm.lg[warp][lane] = ea;
+    sm.lg[warp][lane + 32] = eb;
+    const float s = warp_sum(ea + eb);
+    if (lane == 0) { sm.red[warp][0] = m; sm.red[warp][1] = s; }
+  }
+  __syncthreads();
+  float acc[kGroup] = {0.0f, 0.0f, 0.0f};
+#pragma unroll 8
+  for (int key = 0; key < kn; ++key) {
+    const float v = bf16_to_f32(vs[key][t]);
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) acc[g] = fmaf(sm.lg[g][key], v, acc[g]);
+  }
+  const int R = p.rows < 1 ? 1 : p.rows;
+  float* out = after_wait(p.partial) + ((size_t(h) * p.max_splits + split) * R + r) * kGroup * (kHd + 2);
+#pragma unroll
+  for (int g = 0; g < kGroup; ++g) {
+    out[g * (kHd + 2) + 2 + t] = acc[g];
+    if (t == 0) { out[g * (kHd + 2)] = sm.red[g][0]; out[g * (kHd + 2) + 1] = sm.red[g][1]; }
+  }
+}
+
 __device__ void attend_split(const AttnDecodeParams& p, AttnSmem& sm, int h, int split, int r, int pos, int qpos,
                              bool verify) {
   const int t = threadIdx.x;
@@ -177,71 +243,43 @@ __device__ void attend_split(const AttnDecodeParams& p, AttnSmem& sm, int h, int
   }
   cp_async_wait_all();
   __syncthreads();
+  split_rows(p, sm, sm.ks, sm.vs, h, split, r, qpos, k0, kn);
+  __syncthreads();
+}
+
+// Row r of head h: its splits merged with the sinks (and the output gate); the row's counter reset.
+__device__ __forceinline__ void merge_row(const AttnDecodeParams& p, int h, int r, int pos, int R) {
+  const int t = threadIdx.x;
+  __threadfence();
+  const uint16_t* sinks = after_wait(p.sinks);
+  const float* part = after_wait(p.partial);
+  uint16_t* o = after_wait(p.out);
+  const size_t stride = size_t(R) * kGroup * (kHd + 2);           // one split
   {
-    const int key = t >> 1, half = t & 1;
-    float acc[kGroup] = {0.0f, 0.0f, 0.0f};
-    const uint4* kr = reinterpret_cast<const uint4*>(&sm.ks[key][half * 64]);
+    const int qpos = pos + r;
+    const int first = p.sliding ? max(0, qpos - (kWindow - 1)) : 0;
+    const int nsplit = (qpos - first + kSplitKeys) / kSplitKeys;
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const uint4 v = kr[i];
-      const uint32_t w[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int d = half * 64 + i * 8 + j * 2;
-#pragma unroll
-        for (int g = 0; g < kGroup; ++g) {
-          acc[g] = fmaf(bf16lo(w[j]), sm.qs[g][d], acc[g]);
-          acc[g] = fmaf(bf16hi(w[j]), sm.qs[g][d + 1], acc[g]);
-        }
+    for (int g = 0; g < kGroup; ++g) {
+      const int qh = h * kGroup + g;
+      const float sink = bf16_to_f32(sinks[size_t(r) * kHeads + qh]);
+      const float* base = part + size_t(h) * p.max_splits * stride + (size_t(r) * kGroup + g) * (kHd + 2);
+      float mx = sink;
+      for (int sp = 0; sp < nsplit; ++sp) mx = fmaxf(mx, base[sp * stride]);
+      float den = expf(sink - mx), num = 0.0f;
+#pragma unroll 4
+      for (int sp = 0; sp < nsplit; ++sp) {
+        const float f = expf(base[sp * stride] - mx);
+        den = fmaf(base[sp * stride + 1], f, den);
+        num = fmaf(base[sp * stride + 2 + t], f, num);
       }
-    }
-#pragma unroll
-    for (int g = 0; g < kGroup; ++g) acc[g] += __shfl_xor_sync(0xffffffffu, acc[g], 1);
-    if (half == 0) {
-      const int dist = qpos - (k0 + key);
-#pragma unroll
-      for (int g = 0; g < kGroup; ++g) {
-        float l = -INFINITY;
-        if (key < kn) {
-          l = acc[g] * (1.0f / sqrtf(float(kHd)));
-          if (dist < kExtent) {
-            float b = 0.0f;
-#pragma unroll
-            for (int i = 0; i < kRel; ++i) b = fmaf(sm.rs[g][i], bf16_to_f32(p.rel_proj[i * kExtent + dist]), b);
-            l += round_bf16(b);
-          }
-        }
-        sm.lg[g][key] = l;
-      }
+      const size_t at = (size_t(r) * kHeads + qh) * kHd + t;
+      float v = num / den;
+      if (p.gate) v = round_bf16(v) * (1.0f / (1.0f + expf(-bf16_to_f32(after_wait(p.gate)[at]))));
+      o[at] = f32_to_bf16_bits(v);
     }
   }
-  __syncthreads();
-  const int lane = t & 31, warp = t >> 5;
-  if (warp < kGroup) {
-    const float a = sm.lg[warp][lane], b = sm.lg[warp][lane + 32];
-    const float m = warp_max(fmaxf(a, b));
-    const float ea = a == -INFINITY ? 0.0f : expf(a - m), eb = b == -INFINITY ? 0.0f : expf(b - m);
-    sm.lg[warp][lane] = ea;
-    sm.lg[warp][lane + 32] = eb;
-    const float s = warp_sum(ea + eb);
-    if (lane == 0) { sm.red[warp][0] = m; sm.red[warp][1] = s; }
-  }
-  __syncthreads();
-  float acc[kGroup] = {0.0f, 0.0f, 0.0f};
-#pragma unroll 8
-  for (int key = 0; key < kn; ++key) {
-    const float v = bf16_to_f32(sm.vs[key][t]);
-#pragma unroll
-    for (int g = 0; g < kGroup; ++g) acc[g] = fmaf(sm.lg[g][key], v, acc[g]);
-  }
-  const int R = p.rows < 1 ? 1 : p.rows;
-  float* out = after_wait(p.partial) + ((size_t(h) * p.max_splits + split) * R + r) * kGroup * (kHd + 2);
-#pragma unroll
-  for (int g = 0; g < kGroup; ++g) {
-    out[g * (kHd + 2) + 2 + t] = acc[g];
-    if (t == 0) { out[g * (kHd + 2)] = sm.red[g][0]; out[g * (kHd + 2) + 1] = sm.red[g][1]; }
-  }
-  __syncthreads();
+  if (t == 0) after_wait(p.counters)[h * R + r] = 0;
 }
 
 // Fused decode attention: grid (8 KV heads, max_splits), 128 threads. rows 0 / 1: one row at the device position
@@ -274,36 +312,74 @@ __global__ void __launch_bounds__(kAttnThreads) attn_decode_kernel(const __grid_
   if (t == 0) last = atomicAdd(after_wait(p.counters) + h * R + r, 1) == int(gridDim.y) - 1;
   __syncthreads();
   if (!last) return;
-  __threadfence();
-  const uint16_t* sinks = after_wait(p.sinks);
-  const float* part = after_wait(p.partial);
-  uint16_t* o = after_wait(p.out);
-  const size_t stride = size_t(R) * kGroup * (kHd + 2);           // one split
-  {
-    const int qpos = pos + r;
-    const int first = p.sliding ? max(0, qpos - (kWindow - 1)) : 0;
-    const int nsplit = (qpos - first + kSplitKeys) / kSplitKeys;
-#pragma unroll
-    for (int g = 0; g < kGroup; ++g) {
-      const int qh = h * kGroup + g;
-      const float sink = bf16_to_f32(sinks[size_t(r) * kHeads + qh]);
-      const float* base = part + size_t(h) * p.max_splits * stride + (size_t(r) * kGroup + g) * (kHd + 2);
-      float mx = sink;
-      for (int sp = 0; sp < nsplit; ++sp) mx = fmaxf(mx, base[sp * stride]);
-      float den = expf(sink - mx), num = 0.0f;
-#pragma unroll 4
-      for (int sp = 0; sp < nsplit; ++sp) {
-        const float f = expf(base[sp * stride] - mx);
-        den = fmaf(base[sp * stride + 1], f, den);
-        num = fmaf(base[sp * stride + 2 + t], f, num);
+  merge_row(p, h, r, pos, R);
+}
+
+// Prefill chunks (rows > kMaxRows): grid (8 KV heads, max_splits, row tiles of kRowTile), 128 threads. The block
+// loads the split's keys for all rows of its tile once (sliding windows: the union of the rows' windows), then runs
+// each row's split with the per-row arithmetic above; merges as attn_decode_kernel.
+constexpr int kRowTile = 16;
+struct AttnTileSmem {
+  __align__(16) uint16_t ks[kSplitKeys + kRowTile][kHd];
+  __align__(16) uint16_t vs[kSplitKeys + kRowTile][kHd];
+  float qs[kGroup][kHd];
+  float rs[kGroup][kRel];
+  float lg[kGroup][kSplitKeys];
+  float scratch[4];
+  float red[kGroup][4];
+};
+__global__ void __launch_bounds__(kAttnThreads) attn_rows_kernel(const __grid_constant__ AttnDecodeParams p) {
+  __shared__ AttnTileSmem sm;
+  __shared__ int last[kRowTile];
+  pdl_wait();
+  pdl_launch();
+  const int t = threadIdx.x, h = blockIdx.x, split = blockIdx.y;
+  const int pos = *after_wait(p.pos);
+  const int R = p.rows;
+  const int r_lo = blockIdx.z * kRowTile, r_hi = min(R, r_lo + kRowTile);
+  auto first_of = [&](int q) { return p.sliding ? max(0, q - (kWindow - 1)) : 0; };
+  const int kmin = first_of(pos + r_lo) + split * kSplitKeys;
+  const int kmax = min(first_of(pos + r_hi - 1) + (split + 1) * kSplitKeys, pos + r_hi);
+  if (kmin < kmax) {
+    const uint16_t* kc = after_wait(p.k_cache);
+    const uint16_t* vc = after_wait(p.v_cache);
+    const uint16_t* skv = after_wait(p.stage_kv);
+    for (int i = t; i < (kmax - kmin) * 16; i += kAttnThreads) {
+      const int key = i >> 4, part16 = i & 15, kp = kmin + key;
+      if (p.sliding && kp >= pos) {
+        const uint16_t* src = skv + ((size_t(kp - pos) * 2) * kKvHeads + h) * kHd + part16 * 8;
+        cp_async16(&sm.ks[key][part16 * 8], src);
+        cp_async16(&sm.vs[key][part16 * 8], src + kKvHeads * kHd);
+      } else {
+        const int slot = p.sliding ? kp % kWindow : kp;
+        cp_async16(&sm.ks[key][part16 * 8], kc + (size_t(slot) * kKvHeads + h) * kHd + part16 * 8);
+        cp_async16(&sm.vs[key][part16 * 8], vc + (size_t(slot) * kKvHeads + h) * kHd + part16 * 8);
       }
-      const size_t at = (size_t(r) * kHeads + qh) * kHd + t;
-      float v = num / den;
-      if (p.gate) v = round_bf16(v) * (1.0f / (1.0f + expf(-bf16_to_f32(after_wait(p.gate)[at]))));
-      o[at] = f32_to_bf16_bits(v);
     }
+    cp_async_wait_all();
   }
-  if (t == 0) after_wait(p.counters)[h * R + r] = 0;
+  __syncthreads();
+  for (int r = r_lo; r < r_hi; ++r) {
+    const int qpos = pos + r, first = first_of(qpos);
+    if (split >= (qpos - first + kSplitKeys) / kSplitKeys) continue;
+    const int k0 = first + split * kSplitKeys, kn = min(kSplitKeys, qpos + 1 - k0);
+    const float* pre = after_wait(p.q_pre) + (size_t(r) * kKvHeads + h) * kQPre;
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) sm.qs[g][t] = pre[g * kHd + t];
+    if (t < kGroup * kRel) sm.rs[t >> 4][t & 15] = pre[kGroup * kHd + t];
+    __syncthreads();
+    split_rows(p, sm, sm.ks + (k0 - kmin), sm.vs + (k0 - kmin), h, split, r, qpos, k0, kn);
+    __syncthreads();
+  }
+  __threadfence();
+  __syncthreads();
+  if (t < r_hi - r_lo) last[t] = atomicAdd(after_wait(p.counters) + h * R + r_lo + t, 1) == int(gridDim.y) - 1;
+  __syncthreads();
+  for (int r = r_lo; r < r_hi; ++r)
+    if (last[r - r_lo]) {
+      __threadfence();
+      merge_row(p, h, r, pos, R);
+    }
 }
 
 // New K / V rows of a verification step: grid (rows, 8 heads, 2 = K / V), 128 threads. Row r's conv window: the
@@ -357,6 +433,13 @@ void kv_rows(const AttnDecodeParams& p, cudaStream_t stream) {
 void attn_decode(const AttnDecodeParams& p, cudaStream_t stream) {
   if (p.max_splits < 1) throw std::invalid_argument("attn_decode: max_splits >= 1");
   if (p.rows > kMaxChunk) throw std::invalid_argument("attn_decode: at most kMaxChunk rows");
+  if (p.rows > kMaxRows) {
+    if (!p.stage_kv && p.sliding) throw std::invalid_argument("attn_decode: prefill chunks need the staged rows");
+    if (!p.q_pre) throw std::invalid_argument("attn_decode: prefill chunks need q_pre (kv_rows)");
+    launch_pdl(attn_rows_kernel, dim3(kKvHeads, p.max_splits, (p.rows + kRowTile - 1) / kRowTile), dim3(kAttnThreads),
+               0, stream, p);
+    return;
+  }
   launch_pdl(attn_decode_kernel, dim3(kKvHeads, p.max_splits, p.rows < 1 ? 1 : p.rows), dim3(kAttnThreads), 0, stream, p);
 }
 
