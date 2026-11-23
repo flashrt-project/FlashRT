@@ -142,31 +142,6 @@ struct GateMixParams {
 void gate_mix(const GateMixParams& p, cudaStream_t stream);
 
 // ---- attention (inkling2_attention.cu)
-struct AttnPrologueParams {
-  Prefetch prefetch;                // weights of later kernels (issued by kPrefetchBlocks extra blocks)
-  int sliding;
-  const int* pos;                   // device position of the new row
-  const uint16_t* q_lin;            // [24 * 128] projections (BF16)
-  const uint16_t* r_lin;            // [24 * 16]
-  const uint16_t* k_lin;            // [8 * 128]
-  const uint16_t* v_lin;
-  const uint16_t* k_dyn;            // full layers: dynamic conv weights [8 * 4] (weight_proj outputs)
-  const uint16_t* v_dyn;
-  uint16_t* k_conv_state;           // [3][1024]
-  uint16_t* v_conv_state;
-  const uint16_t* k_conv_w;         // sliding: [1024][4]; full: static [4][1024]
-  const uint16_t* v_conv_w;
-  const uint16_t* q_clip;           // [24 * 128]
-  const uint16_t* rel_clip;         // [24 * 16]
-  const uint16_t* rel_proj;         // [16][1024]
-  float qk_threshold, rel_threshold, log_alpha, log_floor;
-  uint16_t* q_out;                  // [24 * 128]
-  uint16_t* bias;                   // [24][1024]
-  uint16_t* k_cache;                // sliding: ring [1024][8][128]; full: [capacity][8][128]
-  uint16_t* v_cache;
-};
-void attn_prologue(const AttnPrologueParams& p, cudaStream_t stream);
-
 struct AttnDecodeParams {
   Prefetch prefetch;                // weights of later kernels, prefetched into L2 before the PDL wait
   int rows;                         // a verification step (rows > 1 with stage_kv set): rows at pos .. pos + rows - 1
@@ -174,7 +149,7 @@ struct AttnDecodeParams {
   uint16_t* stage_in;               // verification: the k / v conv inputs [rows][2][1024] (kv_rows)
   int sliding;
   const int* pos;
-  // the projections and the prologue's operands (see AttnPrologueParams): the attention block that holds the new
+  // the projections and the prologue's operands (the q / k / v projections, convs, clips and the relative bias): the attention block that holds the new
   // position computes its K / V row; every block its query heads and its keys' relative bias
   const uint16_t* q_lin;
   const uint16_t* r_lin;
@@ -207,23 +182,6 @@ void kv_rows(const AttnDecodeParams& p, cudaStream_t stream);
 int attn_split_keys();
 
 // ---- routed experts (inkling2_moe.cu)
-struct RouterParams {
-  const float* in;                  // MLP input (FP32) before the norm
-  const uint16_t* norm_w;           // mlp_norm
-  const uint16_t* weight;           // [128][kHidden]
-  const float* bias;                // [128]
-  float route_scale;
-  int mxfp8;                        // layer's expert format
-  float* logits;                    // [128]
-  int* counter;                     // zero between launches
-  int* ids;                         // [kTopK]
-  float* weights;                   // [kTopK]
-  uint8_t* x_codes;                 // NVFP4 [kHidden / 2] or MXFP8 [kHidden]
-  uint8_t* x_scales;                // [kHidden / 16] or [kHidden / 32]
-  float* x_amax;
-};
-void router(const RouterParams& p, cudaStream_t stream);
-
 struct ExpertParams {
   int mxfp8;
   int rows;                         // token rows (0 / 1: one); slots row * 8 + k grouped by expert
@@ -233,9 +191,6 @@ struct ExpertParams {
   const float* amax;                // NVFP4: per-expert weight amax [128]
   float denominator;                // NVFP4: outer scale denominator
   float gate_cap, up_cap;
-  const uint8_t* x_codes;           // w13: the quantized input (router kernel)
-  const uint8_t* x_scales;
-  const float* x_amax;
   // w13 with the routing folded in (logits set): every block takes the top-8 of sigmoid(logits) + bias, normalizes
   // and quantizes the MLP input itself; block (0, 0) writes ids_out / weights_out for w2 and the combination
   const float* logits;              // [128] router logits (FP32, gemv_multi)
@@ -247,9 +202,6 @@ struct ExpertParams {
   float* weights_out;
   uint16_t* act;                    // [kTopK][kInter] BF16 (w13 output, w2 input)
   uint16_t* out;                    // [kTopK][kHidden] BF16 (w2 output)
-  // w13: the routed experts' w2 codes / scales (base, bytes per expert), prefetched into L2 slot by slot
-  const uint8_t* w2_base[2];
-  uint64_t w2_bytes[2];
   Prefetch prefetch;                // w2: weights of the next visit (host ranges)
   // flat passes: the staged quantized inputs per row (expert_route -> expert_w13_flat) or per slot
   // (expert_act_quant -> expert_w2_flat): NVFP4 codes as f16x2 pairs / MXFP8 values as half ([n][k * 2 bytes]),

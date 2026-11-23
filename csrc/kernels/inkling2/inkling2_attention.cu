@@ -30,96 +30,8 @@ __device__ __forceinline__ float block_sum128(float v, float* scratch) {
   return t;
 }
 
-
-// Static short convolution of the new row, as in inkling2_visit.cu (window and conv in BF16).
-__device__ __forceinline__ float short_conv_row(uint16_t* state, const uint16_t* w, int c, int C, float x) {
-  const float s0 = bf16_to_f32(state[c]), s1 = bf16_to_f32(state[C + c]), s2 = bf16_to_f32(state[2 * C + c]);
-  float conv = bf16_to_f32(w[4 * c]) * s0;
-  conv = fmaf(bf16_to_f32(w[4 * c + 1]), s1, conv);
-  conv = fmaf(bf16_to_f32(w[4 * c + 2]), s2, conv);
-  conv = fmaf(bf16_to_f32(w[4 * c + 3]), x, conv);
-  state[c] = state[C + c];
-  state[C + c] = state[2 * C + c];
-  state[2 * C + c] = f32_to_bf16_bits(x);
-  return round_bf16((round_bf16(conv) + x) / sqrtf(5.0f));
-}
-
-// Dynamic short convolution (full layers): FP32 weights static[j][c] + dyn[head][j] over the lags j = 0..3
-// (j = 0 the new row), then (sum + x) / sqrt(2K + 1).
-__device__ __forceinline__ float dyn_conv_row(uint16_t* state, const uint16_t* static_w, const uint16_t* dyn, int c,
-                                              int C, float x) {
-  const int h = c / kHd;
-  const float xs[4] = {x, bf16_to_f32(state[2 * C + c]), bf16_to_f32(state[C + c]), bf16_to_f32(state[c])};
-  float out = 0.0f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const float wj = bf16_to_f32(static_w[j * C + c]) + bf16_to_f32(dyn[h * 4 + j]);
-    out = __fadd_rn(out, __fmul_rn(xs[j], wj));
-  }
-  state[c] = state[C + c];
-  state[C + c] = state[2 * C + c];
-  state[2 * C + c] = f32_to_bf16_bits(x);
-  return round_bf16((out + x) / sqrtf(9.0f));
-}
-
 __device__ __forceinline__ float l2_clip_scale(float sumsq, float threshold) {
   return fminf(threshold / (sqrtf(sumsq) + 1e-6f), 1.0f);
-}
-
-// Blocks 0..7: K heads, 8..15: V heads, 16..39: query heads (with their relative-bias rows). 128 threads.
-__global__ void __launch_bounds__(128) attn_prologue_kernel(const __grid_constant__ AttnPrologueParams p) {
-  __shared__ float scratch[4];
-  if (prefetch_block(p.prefetch, 2 * kKvHeads + kHeads)) return;
-  pdl_wait();
-  pdl_launch();
-  const int t = threadIdx.x;
-  const int b = blockIdx.x;
-  const int pos = *after_wait(p.pos);
-  float tau = 1.0f;
-  if (!p.sliding) tau = 1.0f + p.log_alpha * logf(fmaxf((float(pos) + 1.0f) / p.log_floor, 1.0f));
-  if (b < 2 * kKvHeads) {
-    const bool is_k = b < kKvHeads;
-    const int h = is_k ? b : b - kKvHeads;
-    const int c = h * kHd + t;
-    const float x = bf16_to_f32(after_wait(is_k ? p.k_lin : p.v_lin)[c]);
-    uint16_t* st = after_wait(is_k ? p.k_conv_state : p.v_conv_state);
-    float y;
-    if (p.sliding) y = short_conv_row(st, is_k ? p.k_conv_w : p.v_conv_w, c, kKvHeads * kHd, x);
-    else y = dyn_conv_row(st, is_k ? p.k_conv_w : p.v_conv_w, after_wait(is_k ? p.k_dyn : p.v_dyn), c,
-                          kKvHeads * kHd, x);
-    const float ss = block_sum128(y * y, scratch);
-    float out;
-    if (is_k) out = y * l2_clip_scale(ss, p.qk_threshold);
-    else out = y * (1.0f / sqrtf(ss / float(kHd) + 1e-6f));
-    const int slot = p.sliding ? pos % kWindow : pos;
-    uint16_t* cache = after_wait(is_k ? p.k_cache : p.v_cache);
-    cache[(size_t(slot) * kKvHeads + h) * kHd + t] = f32_to_bf16_bits(out);
-    return;
-  }
-  const int h = b - 2 * kKvHeads;
-  const float q = bf16_to_f32(after_wait(p.q_lin)[h * kHd + t]) * bf16_to_f32(p.q_clip[h * kHd + t]);
-  const float qs = block_sum128(q * q, scratch);
-  float qo = round_bf16(q * l2_clip_scale(qs, p.qk_threshold));
-  if (!p.sliding) qo = round_bf16(qo * tau);
-  after_wait(p.q_out)[h * kHd + t] = f32_to_bf16_bits(qo);
-  // relative states (16 per head): clip, scale, then the bias row r @ proj [16][1024]
-  __shared__ float r[kRel];
-  float rv = 0.0f;
-  if (t < kRel) rv = bf16_to_f32(after_wait(p.r_lin)[h * kRel + t]) * bf16_to_f32(p.rel_clip[h * kRel + t]);
-  const float rs = block_sum128(t < kRel ? rv * rv : 0.0f, scratch);
-  if (t < kRel) {
-    float ro = round_bf16(rv * l2_clip_scale(rs, p.rel_threshold));
-    if (!p.sliding) ro = round_bf16(ro * tau);
-    r[t] = ro;
-  }
-  __syncthreads();
-  uint16_t* bias = after_wait(p.bias) + size_t(h) * kExtent;
-  for (int d = t; d < kExtent; d += 128) {
-    float acc = 0.0f;
-#pragma unroll
-    for (int i = 0; i < kRel; ++i) acc = fmaf(r[i], bf16_to_f32(p.rel_proj[i * kExtent + d]), acc);
-    bias[d] = f32_to_bf16_bits(acc);
-  }
 }
 
 // Fused decode attention: one block per (KV head h, split of kSplitKeys keys), 128 threads.
@@ -435,11 +347,6 @@ __global__ void __launch_bounds__(kAttnThreads) kv_rows_kernel(const __grid_cons
 }
 
 }  // namespace
-
-void attn_prologue(const AttnPrologueParams& p, cudaStream_t stream) {
-  launch_pdl(attn_prologue_kernel, dim3(2 * kKvHeads + kHeads + (p.prefetch.count ? kPrefetchBlocks : 0)), dim3(128), 0,
-             stream, p);
-}
 
 void kv_rows(const AttnDecodeParams& p, cudaStream_t stream) {
   if (p.rows < 1 || p.rows > kMaxRows || !p.stage_in || (p.sliding && !p.stage_kv))

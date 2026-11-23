@@ -5,10 +5,13 @@
 // absolute error, "fouroversix_mae", global amax / 1536) in layers 0-19 and MXFP8 (E4M3, UE8M0 scale per 32) in
 // layers 20-23, and multiply the exact quantized weights. Block products are exact (FP16 pair sums of E2M1 x E2M1
 // products stay below 2^9, FP32 for E4M3); scales and the block sums accumulate in FP32.
-//   router:  logits = W_r x (x = bf16(rms_norm(in) * w)), sigmoid + bias top-8, weights renormalized x route_scale;
-//            the last block quantizes x for the experts.
-//   w13:     per routed slot, gate/up rows interleaved: act = bf16(softcapped_swiglu(bf16(g), bf16(u))).
-//   w2:      per slot, the act quantized per slot, y = bf16(W2 act).
+//   routing: logits = W_r x from gemv_multi (x = bf16(rms_norm(in) * w)), sigmoid + bias top-8, weights renormalized
+//            x route_scale.
+//   w13:     gate/up rows interleaved: act = bf16(softcapped_swiglu(bf16(g), bf16(u))) per routed slot.
+//   w2:      the act quantized per slot, y = bf16(W2 act).
+// One row (decode): expert_w13 / expert_w2, every block routing, normalizing and quantizing behind its first weight
+// loads. Several rows (verification): expert_route, expert_w13_flat, expert_act_quant, expert_w2_flat (flat passes
+// over the groups of distinct experts, the same per-row arithmetic).
 
 #include "kernels/inkling2/inkling2_common.cuh"
 #include "kernels/inkling2/inkling2_kernels.cuh"
@@ -96,131 +99,6 @@ __device__ __forceinline__ void quant_block_mxfp8(const float* x, uint8_t* codes
   scale = uint8_t(ex);
 }
 
-// Quantize a row of n FP32 values held in shared memory with the block's threads (n / 16 or n / 32 blocks).
-// NVFP4: codes [n / 2], scales [n / 16], *amax; MXFP8: codes [n], scales [n / 32].
-template <int Threads>
-__device__ void quantize_row(const float* x, int n, int mx, uint8_t* codes, uint8_t* scales, float* amax_out,
-                             float* scratch) {
-  if (mx) {
-    for (int b = threadIdx.x; b < n / 32; b += Threads) quant_block_mxfp8(x + 32 * b, codes + 32 * b, scales[b]);
-    return;
-  }
-  float m = 0.0f;
-  for (int i = threadIdx.x; i < n; i += Threads) m = fmaxf(m, fabsf(x[i]));
-  m = warp_max(m);
-  if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = m;
-  __syncthreads();
-  float amax = 0.0f;
-#pragma unroll
-  for (int w = 0; w < Threads / 32; ++w) amax = fmaxf(amax, scratch[w]);
-  __syncthreads();
-  const float encoder = amax > 0.0f ? fminf(__fdiv_rn(1536.0f, amax), kFltMax) : kFltMax;
-  const float decoder = __fdiv_rn(1.0f, encoder);
-  const float outer = __fmul_rn(amax, float(1.0 / 1536.0));
-  for (int b = threadIdx.x; b < n / 16; b += Threads) quant_block_nvfp4(x + 16 * b, encoder, decoder, outer, codes + 8 * b, scales[b]);
-  if (threadIdx.x == 0) *amax_out = amax;
-}
-
-// ---------------------------------------------------------------------------------------------------- router
-constexpr int kRouterBlocks = kExperts / 8;
-
-__global__ void __launch_bounds__(256) router_kernel(const __grid_constant__ RouterParams p) {
-  __shared__ __align__(16) float xs[kHidden];
-  __shared__ float scratch[8];
-  __shared__ int last;
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int row = blockIdx.x * 8 + warp;
-  const uint4* w = reinterpret_cast<const uint4*>(p.weight) + size_t(row) * (kHidden / 8);
-  pdl_wait();
-  pdl_launch();
-  const float* in = after_wait(p.in);
-  float ss = 0.0f;
-  for (int i = threadIdx.x; i < kHidden; i += 256) {
-    xs[i] = in[i];
-    ss = fmaf(xs[i], xs[i], ss);
-  }
-  ss = warp_sum(ss);
-  if (lane == 0) scratch[warp] = ss;
-  __syncthreads();
-  float tot = 0.0f;
-#pragma unroll
-  for (int i = 0; i < 8; ++i) tot += scratch[i];
-  const float inv = 1.0f / sqrtf(tot / float(kHidden) + 1e-6f);
-  __syncthreads();
-  for (int i = threadIdx.x; i < kHidden; i += 256) xs[i] = round_bf16(xs[i] * inv * bf16_to_f32(p.norm_w[i]));
-  __syncthreads();
-  float acc = 0.0f;
-  for (int i = lane; i < kHidden / 8; i += 32) {
-    const uint4 v = ldg_stream(w + i);
-    const uint32_t ww[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      acc = fmaf(bf16lo(ww[j]), xs[8 * i + 2 * j], acc);
-      acc = fmaf(bf16hi(ww[j]), xs[8 * i + 2 * j + 1], acc);
-    }
-  }
-  acc = warp_sum(acc);
-  float* logits = after_wait(p.logits);
-  if (lane == 0) logits[row] = acc;
-  __threadfence();
-  __syncthreads();
-  if (threadIdx.x == 0) last = atomicAdd(after_wait(p.counter), 1) == kRouterBlocks - 1;
-  __syncthreads();
-  if (!last) return;
-  __threadfence();
-  if (warp == 0) {
-    // top-8 of sigmoid(logit) + bias (first index on ties), weights = scores / sum * route_scale
-    float sc[4], bi[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int e = lane + 32 * i;
-      sc[i] = 1.0f / (1.0f + expf(-logits[e]));
-      bi[i] = sc[i] + p.bias[e];
-    }
-    int ids[kTopK];
-    float ws[kTopK];
-    float wsum = 0.0f;
-#pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-      float best = -INFINITY;
-      int bidx = 1 << 30;
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        if (bi[i] > best) { best = bi[i]; bidx = lane + 32 * i; }
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) {
-        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
-        const int oi = __shfl_xor_sync(0xffffffffu, bidx, o);
-        if (ob > best || (ob == best && oi < bidx)) { best = ob; bidx = oi; }
-      }
-      ids[k] = bidx;
-      const int owner = bidx & 31, slot = bidx >> 5;
-      float s = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) if (i == slot) s = sc[i];
-      s = __shfl_sync(0xffffffffu, s, owner);
-      ws[k] = s;
-      wsum = __fadd_rn(wsum, s);
-      if (lane == owner) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) if (i == slot) bi[i] = -INFINITY;
-      }
-    }
-    if (lane == 0) {
-      int* oid = after_wait(p.ids);
-      float* ow = after_wait(p.weights);
-      for (int k = 0; k < kTopK; ++k) {
-        oid[k] = ids[k];
-        ow[k] = __fmul_rn(__fdiv_rn(ws[k], __fadd_rn(wsum, 1e-20f)), p.route_scale);
-      }
-    }
-  }
-  __syncthreads();
-  quantize_row<256>(xs, kHidden, p.mxfp8, after_wait(p.x_codes), after_wait(p.x_scales), after_wait(p.x_amax), scratch);
-  if (threadIdx.x == 0) *after_wait(p.counter) = 0;
-}
-
-// ------------------------------------------------------------------------------------------------ experts
 __device__ __forceinline__ void e2m1x8_to_h2(uint2 codes, uint32_t (&out)[8]) {
   asm("{ .reg .b8 b0, b1, b2, b3, b4, b5, b6, b7;\n"
       "mov.b32 {b0, b1, b2, b3}, %8;\n mov.b32 {b4, b5, b6, b7}, %9;\n"
@@ -1096,10 +974,6 @@ constexpr size_t kW13Smem = size_t(kMaxRows) * kHidden * 2 + size_t(kMaxRows) * 
                             size_t(kMaxRows) * kHidden + size_t(kMaxRows) * (kHidden / 16);
 
 }  // namespace
-
-void router(const RouterParams& p, cudaStream_t stream) {
-  launch_pdl(router_kernel, dim3(kRouterBlocks), dim3(256), 0, stream, p);
-}
 
 void expert_w13(const ExpertParams& p, cudaStream_t stream) {
   const int rows = p.rows < 1 ? 1 : p.rows;
