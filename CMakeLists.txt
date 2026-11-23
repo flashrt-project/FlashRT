@@ -150,6 +150,17 @@ if(FLASHRT_ENABLE_PI05_GATED_TILE_SM87 AND
 endif()
 message(STATUS "FLASHRT_ENABLE_PI05_GATED_TILE_SM87=${FLASHRT_ENABLE_PI05_GATED_TILE_SM87}")
 
+# Pi0.5 strict consumer fusion: tested BF16 vision / dynamic INT8 prefix
+# on Orin only. Default builds and Qwen3-VL's own target stay unchanged.
+option(FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87
+       "Build Pi0.5 strict visual consumer fusion for SM87" OFF)
+if(FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87 AND
+   (NOT GPU_ARCH STREQUAL "87" OR NOT ENABLE_SM80_INT8_CUTLASS))
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87 requires GPU_ARCH=87 and ENABLE_SM80_INT8_CUTLASS=ON")
+endif()
+message(STATUS "FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=${FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87}")
+
 # ── FA2 build slimming flags (opt-in; defaults keep today's behaviour) ──
 # FA2's vendored CUTLASS 3.x templates dominate FlashRT's build cost
 # (~8–10 min on a warm container for the default matrix of 3 hdims ×
@@ -2476,6 +2487,13 @@ endif()
 if(ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:gemm_kernels_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_NVFP4=1)
+endif()
+
+if(FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/bias_epilogue_bf16.cu
+    csrc/kernels/pi05/pi05_projector_norm_int8.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_PI05_STRICT_VISUAL_SM87=1)
 endif()
 
 if(ENABLE_SM80_INT8_CUTLASS)

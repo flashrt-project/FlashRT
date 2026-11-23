@@ -270,6 +270,24 @@ class Pi05Pipeline:
         if self.fp8_layout not in ("kn", "nk"):
             raise ValueError(f"unsupported FP8 layout: {self.fp8_layout!r}")
         self.hardware = weights.get("hardware")
+        self._strict_visual_fusion = os.environ.get("FLASHRT_PI05_STRICT_VISUAL", "0") == "1"
+        if self._strict_visual_fusion:
+            required = ("pi05_strict_visual_available", "qkv_split_bias_bf16",
+                        "pi05_projector_bias_rms_norm_int8")
+            if any(not callable(getattr(fvk, name, None)) for name in required):
+                raise RuntimeError("Pi0.5 strict visual fusion: rebuild the extension with "
+                                   "FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=ON")
+            if not fvk.pi05_strict_visual_available():
+                raise RuntimeError("Pi0.5 strict visual fusion was not built; enable "
+                                   "FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=ON on SM87")
+            if (type(self) is not Pi05Pipeline
+                    or self.use_fp8 or self.use_int8_vision or self.use_int8_vision_static
+                    or not self.use_int8_encoder or not self.use_int8_decoder
+                    or self._fixed_shape or self.vision_pool_factor != 1
+                    or os.environ.get("FVK_PI05_RTX_INT8_ENCODER_STATIC", "0") == "1"):
+                raise ValueError("Pi0.5 strict visual fusion requires the single-policy pipeline, "
+                                 "BF16 vision, dynamic INT8 encoder+decoder, pool=1 "
+                                 "and exact prompt lengths")
         self._autotune_fp8_nt = _fp8_nt_autotune_enabled(
             self.hardware, self.fp8_layout)
         if self.fp8_layout == "nk" and not self._autotune_fp8_nt:
@@ -1587,11 +1605,12 @@ class Pi05Pipeline:
             W["vision_patch_embedding_w"],
             B["vision_x"].ptr.value,
             seq, VIS_D, VIS_PATCH_FLAT, stream=stream)
-        fvk.bias_residual(
-            B["vision_x"].ptr.value,
-            B["vision_pos_embed_expanded"].ptr.value,
-            W["vision_patch_embedding_b"],
-            seq, VIS_D, stream=stream)
+        if not self._strict_visual_fusion:
+            fvk.bias_residual(
+                B["vision_x"].ptr.value,
+                B["vision_pos_embed_expanded"].ptr.value,
+                W["vision_patch_embedding_b"],
+                seq, VIS_D, stream=stream)
 
         # A2-A6: SigLIP transformer layers (vision_num_layers ≤ VIS_L=27)
         # Reducing layers is a quality/speed trade-off (untrained skip).
@@ -1601,7 +1620,14 @@ class Pi05Pipeline:
         # the prior layer's post-FFN bias_residual, so each iteration
         # arrives with vision_x_norm already containing LN of vision_x).
         # The NVFP4 layers run their own norm straight to e2m1.
-        if not (self._ffn_fp4 and self._vis_attn_fp4 and use_fp8 and self.fp8_calibrated):
+        if self._strict_visual_fusion:
+            # Preserve BF16 residual storage before the original LN reductions.
+            fvk.bias_residual_layer_norm_bf16(
+                B["vision_x"].ptr.value, B["vision_pos_embed_expanded"].ptr.value,
+                W["vision_patch_embedding_b"],
+                W["vision_pre_attn_norm_w"][0], W["vision_pre_attn_norm_b"][0],
+                B["vision_x_norm"].ptr.value, seq, VIS_D, 1e-5, stream=stream)
+        elif not (self._ffn_fp4 and self._vis_attn_fp4 and use_fp8 and self.fp8_calibrated):
             fvk.layer_norm(
                 B["vision_x"].ptr.value,
                 W["vision_pre_attn_norm_w"][0], W["vision_pre_attn_norm_b"][0],
@@ -1680,16 +1706,22 @@ class Pi05Pipeline:
                 B["vision_x_norm"].ptr.value, W["vision_attn_qkv_w"][i],
                 B["vision_QKV"].ptr.value,
                 seq, 3 * VIS_D, VIS_D, stream=stream)
-        # add_bias_bf16 is a proper in-place add (no zero-buffer bandwidth waste)
-        fvk.add_bias_bf16(
-            B["vision_QKV"].ptr.value, W["vision_attn_qkv_b"][i],
-            seq, 3 * VIS_D, stream=stream)
+        if self._strict_visual_fusion:
+            fvk.qkv_split_bias_bf16(
+                B["vision_QKV"].ptr.value, W["vision_attn_qkv_b"][i],
+                attn_ptrs["vis_Q"], attn_ptrs["vis_K"], attn_ptrs["vis_V"],
+                seq, VIS_D, VIS_D, VIS_D, stream=stream)
+        else:
+            # add_bias_bf16 is a proper in-place add (no zero-buffer bandwidth waste)
+            fvk.add_bias_bf16(
+                B["vision_QKV"].ptr.value, W["vision_attn_qkv_b"][i],
+                seq, 3 * VIS_D, stream=stream)
 
-        # Split QKV into attn_backend's Q/K/V buffers
-        fvk.qkv_split(
-            B["vision_QKV"].ptr.value,
-            attn_ptrs["vis_Q"], attn_ptrs["vis_K"], attn_ptrs["vis_V"],
-            seq, VIS_D, VIS_D, VIS_D, stream=stream)
+            # Split QKV into attn_backend's Q/K/V buffers
+            fvk.qkv_split(
+                B["vision_QKV"].ptr.value,
+                attn_ptrs["vis_Q"], attn_ptrs["vis_K"], attn_ptrs["vis_V"],
+                seq, VIS_D, VIS_D, VIS_D, stream=stream)
 
         # Self-attention (per-view batched)
         vis_o_ptr = self.attn.run(
@@ -1895,9 +1927,10 @@ class Pi05Pipeline:
                 B["vision_x_norm"].ptr.value, W["encoder_multi_modal_projector_w"],
                 B["encoder_x"].ptr.value,
                 vs_enc, ENC_D, VIS_D, stream=stream)
-        fvk.add_bias_bf16(
-            B["encoder_x"].ptr.value, W["encoder_multi_modal_projector_b"],
-            vs_enc, ENC_D, stream=stream)
+        if not self._strict_visual_fusion:
+            fvk.add_bias_bf16(
+                B["encoder_x"].ptr.value, W["encoder_multi_modal_projector_b"],
+                vs_enc, ENC_D, stream=stream)
 
         # Language embeds have been written by frontend into encoder_x[vs_enc:vs_enc+lang_len]
 
@@ -1922,10 +1955,18 @@ class Pi05Pipeline:
             qkv_name = f"encoder_attn_qkv_w_{i}"
             layer_scale_qkv = self._int8_scale_buf(qkv_name, seq)
             act_i8_ptr = self._pick_enc_int8_scratch(seq * ENC_D)
-            fvk.rms_norm_int8_rowwise(
-                B["encoder_x"].ptr.value, self._rms_ones_enc.ptr.value,
-                act_i8_ptr, layer_scale_qkv.ptr.value,
-                seq, ENC_D, 1e-6, stream=stream)
+            if self._strict_visual_fusion and i == 0:
+                # Consume the pending projector bias only for visual tokens.
+                # Store BF16 back to encoder_x before the unchanged RMS/amax.
+                fvk.pi05_projector_bias_rms_norm_int8(
+                    B["encoder_x"].ptr.value, W["encoder_multi_modal_projector_b"],
+                    self._rms_ones_enc.ptr.value, act_i8_ptr, layer_scale_qkv.ptr.value,
+                    seq, ENC_D, self.vision_seq_enc, 1e-6, stream=stream)
+            else:
+                fvk.rms_norm_int8_rowwise(
+                    B["encoder_x"].ptr.value, self._rms_ones_enc.ptr.value,
+                    act_i8_ptr, layer_scale_qkv.ptr.value,
+                    seq, ENC_D, 1e-6, stream=stream)
             self._int8_gemm_fused(
                 act_i8_ptr, qkv_name,
                 B["encoder_QKV"].ptr.value,

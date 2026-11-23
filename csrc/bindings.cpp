@@ -16,6 +16,10 @@
 #ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "kernels/wan_adaln.cuh"
 #endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
+#ifdef FLASHRT_PI05_STRICT_VISUAL_SM87
+#include "kernels/bias_epilogue_bf16.cuh"
+#include "kernels/pi05/pi05_projector_norm_int8.cuh"
+#endif
 #include "context.h"
 #include "gemm/gemm_runner.h"
 #include "gemm/fp8_block128_gemm.cuh"
@@ -12167,6 +12171,54 @@ stages in {2,3}. M in 1..48; K%64==0; (K/64)%kg==0; N%cols==0.
             nv, H, W, dim, pool_factor, to_stream(stream));
     }, py::arg("x"), py::arg("out"), py::arg("nv"), py::arg("H"), py::arg("W"),
        py::arg("dim"), py::arg("pool_factor"), py::arg("stream") = 0);
+
+    m.def("pi05_strict_visual_available", []() {
+#ifdef FLASHRT_PI05_STRICT_VISUAL_SM87
+        return true;
+#else
+        return false;
+#endif
+    }, "Whether this build owns the optional SM87 Pi0.5 strict visual kernels.");
+
+    m.def("qkv_split_bias_bf16",
+          [](uintptr_t x, uintptr_t bias, uintptr_t q, uintptr_t k, uintptr_t v,
+             int rows, int hq, int hk, int hv, uintptr_t stream) {
+#ifdef FLASHRT_PI05_STRICT_VISUAL_SM87
+              if (!x || !bias || !q || !k || !v || rows <= 0 ||
+                  hq <= 0 || hk <= 0 || hv <= 0)
+                  throw std::invalid_argument(
+                      "qkv_split_bias_bf16: require non-null pointers and positive dimensions");
+              flash_rt::kernels::qkv_split_bias_bf16(
+                  typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(bias),
+                  typed_ptr<__nv_bfloat16>(q), typed_ptr<__nv_bfloat16>(k),
+                  typed_ptr<__nv_bfloat16>(v), rows, hq, hk, hv, to_stream(stream));
+              CUDA_CHECK(cudaGetLastError());
+#else
+              throw std::runtime_error(
+                  "qkv_split_bias_bf16 was not built; enable FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87");
+#endif
+          }, py::arg("x"), py::arg("bias"), py::arg("q"), py::arg("k"), py::arg("v"),
+          py::arg("rows"), py::arg("hq"), py::arg("hk"), py::arg("hv"), py::arg("stream") = 0,
+          "Split BF16(x+bias) from [rows,hq+hk+hv] into row-major Q/K/V.");
+
+    m.def("pi05_projector_bias_rms_norm_int8",
+          [](uintptr_t x, uintptr_t bias, uintptr_t weight, uintptr_t out, uintptr_t scales,
+             int rows, int cols, int image_rows, float eps, uintptr_t stream) {
+#ifdef FLASHRT_PI05_STRICT_VISUAL_SM87
+              flash_rt::pi05::projector_bias_rms_norm_int8(
+                  typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(bias),
+                  typed_ptr<__nv_bfloat16>(weight), reinterpret_cast<int8_t*>(out),
+                  reinterpret_cast<float*>(scales), rows, cols, image_rows, eps,
+                  to_stream(stream));
+#else
+              throw std::runtime_error(
+                  "pi05_projector_bias_rms_norm_int8 was not built; "
+                  "enable FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87");
+#endif
+          }, py::arg("x"), py::arg("bias"), py::arg("weight"), py::arg("out"),
+          py::arg("scales"), py::arg("rows"), py::arg("cols"), py::arg("image_rows"),
+          py::arg("eps"), py::arg("stream") = 0,
+          "In-place BF16 bias on visual prefix, then RMSNorm and dynamic per-token INT8.");
 
     m.def("rms_norm_int8_rowwise", [](uintptr_t x, uintptr_t weight,
                                        uintptr_t out, uintptr_t scales,

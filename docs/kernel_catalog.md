@@ -385,3 +385,19 @@ for the gated INT8 GEMM shape `(M,N,K)=(15,4096,1024)` on SM87. The existing
 are unchanged. Other shapes keep the 128-row tile. The build option defaults
 off and rejects unsupported architectures. See
 [Pi0.5 SM87 gated tile](pi05_sm87_gated_tile.md) for validation and limits.
+
+## Pi0.5 SM87 strict visual consumers (opt-in)
+
+Build with `FLASHRT_ENABLE_PI05_STRICT_VISUAL_SM87=ON`; select the path with
+`FLASHRT_PI05_STRICT_VISUAL=1`. Both are off by default. See
+[Pi0.5 strict visual consumers](pi05_sm87_strict_visual.md) for constraints,
+rounding semantics and reproduction commands.
+
+| Binding | Ownership and contract |
+|---|---|
+| `pi05_strict_visual_available` | Always-importable capability probe; false when not built |
+| `qkv_split_bias_bf16` | Existing shared BF16 bias/split kernel, additionally owned by the main target under the Pi0.5 gate; separate Qwen3-VL target unchanged |
+| `pi05_projector_bias_rms_norm_int8` | Pi0.5-owned mutable visual-prefix bias, strict BF16 residual, RMSNorm and dynamic per-token INT8; language rows unchanged |
+
+The optional bindings raise explicit not-built errors when unavailable. The
+existing patch/residual/LayerNorm and FFN strict kernels retain their ABI.
