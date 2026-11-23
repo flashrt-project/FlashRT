@@ -11,6 +11,7 @@
 // epilogue); only the FP32 accumulation order differs.
 
 #include <cub/block/block_radix_sort.cuh>
+#include <utility>
 
 #include "kernels/inkling2/inkling2_common.cuh"
 #include "kernels/inkling2/inkling2_kernels.cuh"
@@ -20,24 +21,27 @@ namespace inkling2 {
 
 namespace {
 
-// 8 warps x 64 slots, 2 stages in flight: two blocks per SM (measured best of 4 / 8 / 16 warps, 32 / 64 / 128 slots,
-// 2 .. 6 stages)
+// 8 warps x 64 slots per block, two blocks per SM
 constexpr int kMmaWarps = 8;
 constexpr int kTileRows = 16 * kMmaWarps;          // output rows per block
 constexpr int kNt = 8;                             // n-tiles of 8 slots per block
 constexpr int kTileSlots = 8 * kNt;                // slots per block
 constexpr int kMmaThreads = 32 * kMmaWarps;
-// k pipeline: stages of 2 MMA chunks (64 bytes of every weight row / input column), kPipe stages in shared memory
-constexpr int kPipe = 2;
+// k pipeline: stages of 2 MMA chunks (64 bytes of every weight row / input column) in shared memory
+// stages in shared memory: w13 (K = 2304) 4, w2 (K = 1152) 2 (measured)
+constexpr int kPipeW13 = 4, kPipeW2 = 2;
 constexpr int kStageBytes = 64;
-constexpr int kPitch = kStageBytes + 16;           // row pitch: ldmatrix rows on distinct banks
+constexpr int kPitch = kStageBytes;                // rows of 4 x 16-byte chunks, chunk ^ ((row >> 1) & 3): no conflicts
 constexpr int kStageA = kTileRows * kPitch, kStageB = kTileSlots * kPitch;
 constexpr int kStageSmem = kStageA + kStageB + kTileRows * 8 + kTileSlots * 8;   // + NVFP4 scales (8 bytes / stage)
-constexpr int kMmaSmem = kPipe * kStageSmem;
+constexpr int kMmaSmemW13 = kPipeW13 * kStageSmem, kMmaSmemW2 = kPipeW2 * kStageSmem;
 constexpr int kSortThreads = 1024;
 constexpr int kSortItems = kMaxChunk * kTopK / kSortThreads;
 static_assert(kSortItems * kSortThreads >= kMaxChunk * kTopK, "sort capacity");
-static_assert(kTileSlots * kTileRows * 2 <= kMmaSmem, "epilogue tile in the pipeline buffers");
+static_assert(kTileSlots * kTileRows * 2 <= kMmaSmemW2, "epilogue tile in the pipeline buffers");
+
+// 16-byte chunk of a 64-byte shared-memory row after the swizzle
+__device__ __forceinline__ int swz(int row, int chunk) { return chunk ^ ((row >> 1) & 3); }
 
 __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem))),
@@ -152,7 +156,7 @@ __device__ __forceinline__ bool tile_of(const ExpertParams& p, int& e, int& s0, 
 // acc[j] (n-tile j: slots 8 j .. 8 j + 7 of the tile) over the k chunks: A = the block's kTileRows weight rows from
 // row f_blk (this warp: 16 of them), B = the input rows of the tile's slots (in_row: per slot of the tile). Both are
 // staged with cp.async in a kPipe-deep pipeline of 2-chunk stages and read with ldmatrix.
-template <bool MX, int K>
+template <bool MX, int K, int kPipe>
 __device__ __forceinline__ void tile_mma(uint8_t* smem, const uint8_t* W, const uint8_t* WS, int f_blk, const uint8_t* X,
                                          const uint8_t* XS, const int* in_row, int nt, float (&acc)[kNt][4]) {
   constexpr int kStages = K / (MX ? 32 : 64) / 2;
@@ -171,12 +175,12 @@ __device__ __forceinline__ void tile_mma(uint8_t* smem, const uint8_t* W, const 
 #pragma unroll
     for (int i = 0; i < kTileRows * 4 / kMmaThreads; ++i) {
       const int idx = t + i * kMmaThreads, row = idx >> 2, part = idx & 3;
-      cp_async16(stage_a(b) + row * kPitch + 16 * part, W + size_t(f_blk + row) * rowbytes + kStageBytes * s + 16 * part);
+      cp_async16(stage_a(b) + row * kPitch + 16 * swz(row, part), W + size_t(f_blk + row) * rowbytes + kStageBytes * s + 16 * part);
     }
 #pragma unroll
     for (int i = 0; i < kTileSlots * 4 / kMmaThreads; ++i) {
       const int idx = t + i * kMmaThreads, sl = idx >> 2, part = idx & 3;
-      cp_async16(stage_b(b) + sl * kPitch + 16 * part, X + size_t(in_row[sl]) * rowbytes + kStageBytes * s + 16 * part);
+      cp_async16(stage_b(b) + sl * kPitch + 16 * swz(sl, part), X + size_t(in_row[sl]) * rowbytes + kStageBytes * s + 16 * part);
     }
     if (!MX) {
       if (t < kTileRows) cp_async8(stage_sa(b) + 8 * t, WS + size_t(f_blk + t) * sbytes + 8 * s);
@@ -199,7 +203,7 @@ __device__ __forceinline__ void tile_mma(uint8_t* smem, const uint8_t* W, const 
 #pragma unroll
     for (int cc = 0; cc < 2; ++cc) {
       uint32_t a[4];
-      ldsm4(a, stage_a(b) + arow * kPitch + 32 * cc + 16 * ahalf);
+      ldsm4(a, stage_a(b) + arow * kPitch + 16 * swz(arow, 2 * cc + ahalf));
       const uint32_t sfa = MX ? uint32_t(WS[size_t(f_blk + srow) * sbytes + 2 * s + cc])
                               : reinterpret_cast<const uint32_t*>(stage_sa(b) + 8 * srow)[cc];
 #pragma unroll
@@ -207,7 +211,8 @@ __device__ __forceinline__ void tile_mma(uint8_t* smem, const uint8_t* W, const 
         if (j >= nt) break;
         uint32_t bb[4];
         const int mi = lane >> 3, jj = j + (mi >> 1), half = mi & 1;
-        ldsm4(bb, stage_b(b) + (8 * jj + (lane & 7)) * kPitch + 32 * cc + 16 * half);
+        const int brow = 8 * jj + (lane & 7);
+        ldsm4(bb, stage_b(b) + brow * kPitch + 16 * swz(brow, 2 * cc + half));
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
           if (j + u >= nt) break;
@@ -239,7 +244,7 @@ __device__ void expert_mma_w13_body(const ExpertParams& p) {
   if (threadIdx.x < kTileSlots) in_row[threadIdx.x] = order[s0 + min(int(threadIdx.x), ns - 1)] / kTopK;
   __syncthreads();
   float acc[kNt][4];
-  tile_mma<MX, K>(smem, static_cast<const uint8_t*>(p.codes) + size_t(e) * 2 * kInter * rowbytes,
+  tile_mma<MX, K, kPipeW13>(smem, static_cast<const uint8_t*>(p.codes) + size_t(e) * 2 * kInter * rowbytes,
                   static_cast<const uint8_t*>(p.scales) + size_t(e) * 2 * kInter * sbytes, f_blk,
                   after_wait(p.xq_codes), after_wait(p.xq_sc8), in_row, nt, acc);
   const float we = MX ? 1.0f : __fdiv_rn(p.amax[e], p.denominator);
@@ -284,7 +289,7 @@ __device__ void expert_mma_w2_body(const ExpertParams& p) {
   if (threadIdx.x < kTileSlots) in_row[threadIdx.x] = order[s0 + min(int(threadIdx.x), ns - 1)];
   __syncthreads();
   float acc[kNt][4];
-  tile_mma<MX, K>(smem, static_cast<const uint8_t*>(p.codes) + size_t(e) * kHidden * rowbytes,
+  tile_mma<MX, K, kPipeW2>(smem, static_cast<const uint8_t*>(p.codes) + size_t(e) * kHidden * rowbytes,
                   static_cast<const uint8_t*>(p.scales) + size_t(e) * kHidden * sbytes, f_blk,
                   after_wait(p.xq_codes), after_wait(p.xq_sc8), in_row, nt, acc);
   const float we = MX ? 1.0f : __fdiv_rn(p.amax[e], p.denominator);
@@ -328,8 +333,10 @@ __global__ void __launch_bounds__(kMmaThreads) expert_mma_w2_kernel(const __grid
 // the pipeline's shared memory, and the full carveout so that two blocks fit on an SM
 void mma_attributes() {
   static const bool once = [] {
-    for (const void* f : {reinterpret_cast<const void*>(expert_mma_w13_kernel), reinterpret_cast<const void*>(expert_mma_w2_kernel)}) {
-      check_cuda(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, kMmaSmem), "mma smem");
+    const std::pair<const void*, int> fs[2] = {{reinterpret_cast<const void*>(expert_mma_w13_kernel), kMmaSmemW13},
+                                               {reinterpret_cast<const void*>(expert_mma_w2_kernel), kMmaSmemW2}};
+    for (const auto& [f, smem] : fs) {
+      check_cuda(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "mma smem");
       check_cuda(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared),
                  "mma carveout");
     }
@@ -357,7 +364,7 @@ void expert_mma_w13(const ExpertParams& p, cudaStream_t stream) {
   if (!p.xq_codes || !p.xq_sc8 || !p.xq_amax || !p.act || p.max_tiles < 1)
     throw std::invalid_argument("expert_mma_w13: xq_codes, xq_sc8, xq_amax, act, max_tiles");
   mma_attributes();
-  launch_pdl(expert_mma_w13_kernel, dim3(2 * kInter / kTileRows, p.max_tiles), dim3(kMmaThreads), kMmaSmem, stream, p);
+  launch_pdl(expert_mma_w13_kernel, dim3(2 * kInter / kTileRows, p.max_tiles), dim3(kMmaThreads), kMmaSmemW13, stream, p);
 }
 
 void expert_mma_w2(const ExpertParams& p, cudaStream_t stream) {
@@ -365,7 +372,7 @@ void expert_mma_w2(const ExpertParams& p, cudaStream_t stream) {
   if (!p.xq_codes || !p.xq_sc8 || !p.xq_amax || !p.out || p.max_tiles < 1)
     throw std::invalid_argument("expert_mma_w2: xq_codes, xq_sc8, xq_amax, out, max_tiles");
   mma_attributes();
-  launch_pdl(expert_mma_w2_kernel, dim3(kHidden / kTileRows, p.max_tiles), dim3(kMmaThreads), kMmaSmem, stream, p);
+  launch_pdl(expert_mma_w2_kernel, dim3(kHidden / kTileRows, p.max_tiles), dim3(kMmaThreads), kMmaSmemW2, stream, p);
 }
 
 }  // namespace inkling2
