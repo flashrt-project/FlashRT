@@ -8,18 +8,18 @@ position and the input tokens from device memory, so it is captured once into a 
   KV / convolution states (speculative decoding). Each row runs the decode step's arithmetic, so the targets equal
   the tokens W decode steps would produce, bit for bit.
 * ``exact<R>`` / ``exact<R>_last``: R prompt rows on the same per-row arithmetic (bit-equal to R decode steps).
-* ``prefill<R>`` / ``prefill<R>_last``: R prompt rows on tensor cores (cuBLAS BF16 projections, the router with
-  FP32 sums, grouped block-scaled MMA experts, tensor-core attention); not bit-equal to decode steps (different
-  accumulation order), see ``docs/inkling2_rtx_usage.md``.
+* ``prefill<R>`` / ``prefill<R>_last``: R prompt rows on tensor cores (BF16 projections and the router's FP32
+  logits on the module's cuBLAS GEMM, grouped block-scaled MMA experts, tensor-core attention); not bit-equal to
+  decode steps (different accumulation order), see ``docs/inkling2_rtx_usage.md``.
 
-``*_last`` programs also run the LM head of the last row (the first generated token). PyTorch is the allocator,
-loads the safetensors, runs the cuBLAS products of the tensor-core programs and captures the graphs.
+``*_last`` programs also run the LM head of the last row (the first generated token). Every tensor the kernels read
+is checked against the checkpoint geometry (dtype and shape, from the safetensors headers) before any is loaded.
+PyTorch is the allocator and captures the graphs; no PyTorch matmul setting is read or changed.
 """
 
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -126,26 +126,98 @@ def plan_chunks(n: int, chunk_rows: Sequence[int], exact_rows: int, exact: bool)
     return out
 
 
-@contextmanager
-def matmul_precision(fp32: str = "ieee"):
-    """cuBLAS flags while products run or are captured, independent of the process defaults (some PyTorch builds
-    enable TF32 through TORCH_ALLOW_TF32_CUBLAS_OVERRIDE): BF16 products without reduced-precision split-K sums;
-    FP32 products in IEEE FP32 (``"ieee"``) or on TF32 tensor cores (``"tf32"``, exact for BF16-valued operands)."""
-    mm = torch.backends.cuda.matmul
-    if hasattr(mm, "fp32_precision"):
-        prev = mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction
-        mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction = fp32, False
-        try:
-            yield
-        finally:
-            mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction = prev
-    else:  # pragma: no cover - PyTorch without fp32_precision
-        prev = mm.allow_tf32, mm.allow_bf16_reduced_precision_reduction
-        mm.allow_tf32, mm.allow_bf16_reduced_precision_reduction = fp32 == "tf32", False
-        try:
-            yield
-        finally:
-            mm.allow_tf32, mm.allow_bf16_reduced_precision_reduction = prev
+def safetensors_header(path) -> Dict[str, Tuple[str, Tuple[int, ...]]]:
+    """{name: (dtype, shape)} of a safetensors file, read from its header (no tensor data)."""
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        if not 2 <= n <= 1 << 28:
+            raise Inkling2ConfigError(f"{path}: not a safetensors file")
+        header = json.loads(f.read(n))
+    return {k: (v["dtype"], tuple(v["shape"])) for k, v in header.items() if k != "__metadata__"}
+
+
+def check_tensors(found: Dict[str, Tuple[str, Tuple[int, ...]]], expected: Dict[str, Tuple[str, Tuple[int, ...]]],
+                  what: str) -> None:
+    """Every expected tensor present with its dtype and shape (the kernels index them by the geometry)."""
+    missing = [k for k in expected if k not in found]
+    wrong = [f"{k}: {found[k][0]} {list(found[k][1])}, expected {v[0]} {list(v[1])}"
+             for k, v in expected.items() if k in found and tuple(found[k]) != (v[0], tuple(v[1]))]
+    if missing or wrong:
+        parts = ([f"{len(wrong)} tensors of another dtype or shape ({'; '.join(wrong[:3])})"] if wrong else []) + \
+                ([f"{len(missing)} missing ({', '.join(missing[:3])})"] if missing else [])
+        raise Inkling2ConfigError(f"{what}: " + ", ".join(parts))
+
+
+def expert_formats(found: Dict[str, Tuple[str, Tuple[int, ...]]], layers: int) -> List[str]:
+    """Per layer ``"nvfp4"`` (E2M1 codes in U8) or ``"mxfp8"`` (F8_E4M3 codes), from the stored gate/up codes."""
+    out = []
+    for l in range(layers):
+        dt = found.get(f"layers.{l}.mlp.experts.w13_weight", (None,))[0]
+        if dt is None:          # reported as missing by check_tensors
+            out.append("nvfp4")
+            continue
+        if dt not in ("U8", "F8_E4M3"):
+            raise Inkling2ConfigError(f"layer {l}: experts stored as {dt}, expected NVFP4 (U8) or MXFP8 (F8_E4M3)")
+        out.append("nvfp4" if dt == "U8" else "mxfp8")
+    return out
+
+
+def expected_tensors(c: dict, formats: Sequence[str]) -> Dict[str, Tuple[str, Tuple[int, ...]]]:
+    """The text-decoder tensors the kernels read (names without ``model.llm.``): (safetensors dtype, shape)."""
+    bf, f32 = "BF16", "F32"
+    V, L = c["vocab_size"], c["num_hidden_layers"]
+    lc = c["loop_config"]
+    core, local = range(lc["core_start"], lc["core_end"]), set(c["local_layer_ids"])
+    t = {"embed.weight": (bf, (V, D)), "unembed.weight": (bf, (V, D)), "embed_norm.weight": (bf, (D,)),
+         "norm.weight": (bf, (D,)), "attn_res.output_query": (f32, (D,)),
+         "middle_cycle_cross_pass_queries": (f32, (2 * len(core), D)),
+         "middle_cycle_cross_pass_kv_queries": (f32, (2 * len(core), D))}
+    for l in range(L):
+        p, a, ex = f"layers.{l}.", f"layers.{l}.attn.", f"layers.{l}.mlp.experts."
+        sliding = l in local
+        t.update({a + "wq_du.weight": (bf, (H * HD, D)), a + "wr_du.weight": (bf, (H * REL, D)),
+                  a + "gate_attn.weight": (bf, (H * HD, D)), a + "attn_sink_proj.weight": (bf, (H, D)),
+                  a + "wk_dv.weight": (bf, (HKV * HD, D)), a + "wv_dv.weight": (bf, (HKV * HD, D)),
+                  a + "wo_ud.weight": (bf, (D, H * HD)), a + "q_l2_clip.scale": (bf, (H, HD)),
+                  a + "rel_l2_clip.scale": (bf, (H, REL)), a + "rel_logits_proj.proj": (bf, (REL, WINDOW)),
+                  p + "attn_sconv.weight": (bf, (D, 1, 4)), p + "mlp_sconv.weight": (bf, (D, 1, 4)),
+                  p + "mlp_norm.weight": (bf, (D,)), p + "mlp.gate.weight": (bf, (E, D)),
+                  p + "mlp.gate.bias": (f32, (E,)), f"attn_res.mlp_queries.{l}": (f32, (D,))})
+        if l > 0:   # the depth-attention queries of the layer's input: one, or q / k / v for global layers
+            t[f"attn_res.attn_queries.{l - 1}"] = (f32, (D,) if sliding else (3, D))
+        if sliding:
+            t.update({a + "k_sconv.weight": (bf, (HKV * HD, 1, 4)), a + "v_sconv.weight": (bf, (HKV * HD, 1, 4)),
+                      p + "attn_norm.weight": (bf, (D,))})
+        else:
+            for n in "kv":
+                t.update({a + f"{n}_sconv.static_w": (bf, (4, HKV * HD)), a + f"{n}_sconv.weight_proj": (bf, (32, D))})
+            t.update({p + f"{n}_input_norm.weight": (bf, (D,)) for n in "qkv"})
+        if l in core:
+            for n in ("attn", "k", "v", "mlp"):
+                cp = p + f"controllers.{n}."
+                t.update({cp + "down_weight": (bf, (GATE_RANK, 2 * D)), cp + "forget_weight": (bf, (D, GATE_RANK)),
+                          cp + "gain_weight": (bf, (D, GATE_RANK))})
+        if formats[l] == "nvfp4":   # E2M1 codes (two per byte), E4M3 scales per 16, per-expert amax, denominator
+            t.update({ex + "w13_weight": ("U8", (E, 2 * I, D // 2)), ex + "w13_weight_scale": ("F8_E4M3", (E, 2 * I, D // 16)),
+                      ex + "w2_weight": ("U8", (E, D, I // 2)), ex + "w2_weight_scale": ("F8_E4M3", (E, D, I // 16))})
+            for w in ("w13", "w2"):
+                t.update({ex + f"{w}_weight_amax": (f32, (E,)), ex + f"{w}_weight_outer_scale_denominator": (f32, (1,))})
+        else:                       # E4M3 codes, E8M0 scales per 32
+            t.update({ex + "w13_weight": ("F8_E4M3", (E, 2 * I, D)), ex + "w13_weight_scale": ("U8", (E, 2 * I, D // 32)),
+                      ex + "w2_weight": ("F8_E4M3", (E, D, I)), ex + "w2_weight_scale": ("U8", (E, D, I // 32))})
+    return t
+
+
+def gemm_call(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, workspace: torch.Tensor):
+    """``c = a b^T`` on the module's cuBLAS GEMM (FP32 accumulation, precision fixed by the module): a [m][k] and
+    b [n][k] BF16, c [m][n] BF16 or FP32, rows contiguous."""
+    m, k = a.shape
+    n = b.shape[0]
+    if a.dtype != BF16 or b.dtype != BF16 or c.dtype not in (BF16, F32) or b.shape[1] != k or \
+            tuple(c.shape) != (m, n) or a.stride(1) != 1 or b.stride(1) != 1 or c.stride(1) != 1:
+        raise ValueError("gemm: a [m][k], b [n][k] BF16 and c [m][n] BF16 / FP32 with contiguous rows")
+    return (_ik.gemm, dict(m=m, n=n, k=k, a=P(a), lda=a.stride(0), b=P(b), ldb=b.stride(0), c=P(c), ldc=c.stride(0),
+                           out_f32=int(c.dtype == F32), workspace=P(workspace), workspace_bytes=nbytes(workspace)))
 
 
 def P(t: torch.Tensor) -> int:
@@ -207,15 +279,14 @@ class Inkling2RtxRuntime:
         kv = w["middle_cycle_cross_pass_kv_queries"].float().reshape(-1, 2, D)
         self.message_query = torch.cat([q[:, :1], kv, q[:, 1:]], 1).contiguous()      # [12][4][D]
         self.query_f32 = {k: v.float().contiguous() for k, v in w.items() if k.startswith("attn_res.")}
-        # tensor-core chunks: FP32 copies of the router (BF16 values), the relative projection transposed (MMA bias)
-        self.router_f32 = {k: v.float().contiguous() for k, v in w.items() if k.endswith("mlp.gate.weight")}
+        # tensor-core chunks: the relative projection transposed (the MMA bias tables)
         self.rel_t = {k: v.t().contiguous() for k, v in w.items() if k.endswith("rel_logits_proj.proj")}
         self.RC = max(exact_rows, prefill_rows)
         self._buffers()
         self.programs: Dict[str, list] = {}
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
         self.use_graphs = True
-        self._cublas_ready = False
+        self._gemm_ready = False
         self.drafter = None                 # the DSpark drafter recorded into this runtime (at most one)
         self.programs["decode"] = self._record(1, verify=False)
 
@@ -225,28 +296,21 @@ class Inkling2RtxRuntime:
 
     # ------------------------------------------------------------------------------------------- weights
     def _load(self) -> Dict[str, torch.Tensor]:
+        """The tensors of ``expected_tensors``, checked in the safetensors headers before anything is loaded."""
         from safetensors import safe_open
-        w: Dict[str, torch.Tensor] = {}
+        found, where = {}, {}
         for shard in checkpoint_shards(self.dir):
+            for key, spec in safetensors_header(shard).items():
+                if key.startswith(PREFIX):
+                    found[key[len(PREFIX):]], where[key[len(PREFIX):]] = spec, shard
+        expected = expected_tensors(self.c, expert_formats(found, self.c["num_hidden_layers"]))
+        check_tensors(found, expected, "text decoder weights")
+        w: Dict[str, torch.Tensor] = {}
+        for shard in sorted({where[k] for k in expected}):
             with safe_open(str(shard), "pt", device=str(self.dev)) as f:
-                for key in f.keys():
-                    if key.startswith(PREFIX):
-                        w[key[len(PREFIX):]] = f.get_tensor(key)
-        for layer in range(self.c["num_hidden_layers"]):
-            ex = f"layers.{layer}.mlp.experts."
-            if ex + "w13_weight" not in w:
-                raise Inkling2ConfigError(f"layer {layer}: no routed experts in the checkpoint")
-            dt = w[ex + "w13_weight"].dtype
-            if dt == U8:          # NVFP4: E2M1 codes, E4M3 scales per 16, per-expert amax / outer denominator
-                need = ("w13_weight_scale", "w13_weight_amax", "w13_weight_outer_scale_denominator",
-                        "w2_weight_scale", "w2_weight_amax", "w2_weight_outer_scale_denominator")
-            elif dt == torch.float8_e4m3fn:   # MXFP8: E4M3 codes, E8M0 scales per 32
-                need = ("w13_weight_scale", "w2_weight_scale")
-            else:
-                raise Inkling2ConfigError(f"layer {layer}: experts stored as {dt}, expected NVFP4 or MXFP8")
-            missing = [n for n in need if ex + n not in w]
-            if missing:
-                raise Inkling2ConfigError(f"layer {layer}: missing {missing}")
+                for key in expected:
+                    if where[key] == shard:
+                        w[key] = f.get_tensor(PREFIX + key)
         return w
 
     # ------------------------------------------------------------------------------------------- buffers
@@ -323,6 +387,7 @@ class Inkling2RtxRuntime:
                          P(self.kv[v][0]) if sl else 0, P(self.kv[v][1]) if sl else 0, P(self.st_kv[v]) if sl else 0,
                          1 if sl else 0])
         self.commit_table = torch.tensor(rows, dtype=torch.int64, device=dev)
+        self.gemm_ws = z(ik.GEMM_WORKSPACE_BYTES, dt=U8)    # this runtime's cuBLAS workspace (captured graphs)
 
     def reset(self):
         """Start a new sequence: position 0 and empty convolution states. KV rows are always written before they
@@ -448,7 +513,7 @@ class Inkling2RtxRuntime:
             if loop_msg:
                 names = ("attn", "k", "v")
                 if big:
-                    calls += [("mm", gate_in[g], w[p + f"controllers.{n}.down_weight"], states[g])
+                    calls += [gemm_call(gate_in[g], w[p + f"controllers.{n}.down_weight"], states[g], self.gemm_ws)
                               for g, n in enumerate(names)]
                 else:
                     calls.append(("gemv", [(P(w[p + f"controllers.{n}.down_weight"]), P(gate_in[g]), P(states[g]),
@@ -492,7 +557,7 @@ class Inkling2RtxRuntime:
                 for name, y, n in items:
                     wt = w[a + name] if name.endswith("weight_proj") else w[a + name + ".weight"]
                     if big:
-                        calls.append(("mm", self.nrm[src[g]][:R], wt, y[:R]))
+                        calls.append(gemm_call(self.nrm[src[g]][:R], wt, y[:R], self.gemm_ws))
                     elif R > 1:
                         tasks.append((P(wt), xin[g][0], P(y), n, D, 0, 0, ik.GEMV_PLAIN, 0, R, 0))
                     else:
@@ -526,7 +591,7 @@ class Inkling2RtxRuntime:
             else:
                 calls.append((ik.attn_decode, att))
             if big:
-                calls.append(("mm", self.attn_out[:R], w[a + "wo_ud.weight"], self.o_out[:R]))
+                calls.append(gemm_call(self.attn_out[:R], w[a + "wo_ud.weight"], self.o_out[:R], self.gemm_ws))
             else:
                 calls.append(("gemv", [(P(w[a + "wo_ud.weight"]), P(self.attn_out), P(self.o_out), D, H * HD, 0, 0,
                                         ik.GEMV_PLAIN, 0, R)], []))
@@ -548,8 +613,8 @@ class Inkling2RtxRuntime:
             router_in = self.mlp_in
             if loop_msg:
                 if big:
-                    calls.append(("mm", self.gate_in_mlp[:R], w[p + "controllers.mlp.down_weight"],
-                                  self.states_mlp[:R]))
+                    calls.append(gemm_call(self.gate_in_mlp[:R], w[p + "controllers.mlp.down_weight"],
+                                           self.states_mlp[:R], self.gemm_ws))
                 else:
                     calls.append(("gemv", [(P(w[p + "controllers.mlp.down_weight"]), P(self.gate_in_mlp),
                                             P(self.states_mlp), GATE_RANK, 2 * D, 0, 0, ik.GEMV_PLAIN, 0, R)], []))
@@ -563,7 +628,8 @@ class Inkling2RtxRuntime:
             if R > 1:
                 calls.append(("norm", [(P(router_in), 1, 0, P(w[p + "mlp_norm.weight"]), P(self.nrm_mlp), R, D)]))
                 if big:
-                    calls.append(("mm32", self.nrm_mlp[:R], self.router_f32[m + "gate.weight"], self.logits_r[:R]))
+                    # router logits: BF16 products summed and written in FP32
+                    calls.append(gemm_call(self.nrm_mlp[:R], w[m + "gate.weight"], self.logits_r[:R], self.gemm_ws))
                 else:
                     calls.append(("gemv", [(P(w[m + "gate.weight"]), P(self.nrm_mlp), P(self.logits_r), E, D, 0, 1,
                                             ik.GEMV_PLAIN, 0, R)], []))
@@ -663,46 +729,36 @@ class Inkling2RtxRuntime:
     def _run(self, calls):
         ik = _ik
         s = torch.cuda.current_stream().cuda_stream
-        # the only FP32 product is the router's, on BF16 values (activations, weights): TF32 keeps them exact
-        with matmul_precision("tf32"):
-            for call in calls:
-                fn = call[0]
-                if fn == "gemv":
-                    ik.gemv_multi(call[1], call[2], s)
-                elif fn == "norm":
-                    ik.norm_rows(call[1], s)
-                elif fn == "advance":
-                    self.pos.add_(1)
-                    self.history.index_copy_(0, self.pos.long(), self.token)
-                elif fn == "copy":
-                    call[1][0].copy_(call[1][1])
-                elif fn == "zero":
-                    call[1].zero_()
-                elif fn == "mm":                        # y = x W^T (cuBLAS, BF16)
-                    torch.matmul(call[1], call[2].t(), out=call[3])
-                elif fn == "mm32":                      # y = x W^T, FP32 sums (the router logits)
-                    torch.matmul(call[1].float(), call[2].t(), out=call[3])
-                elif fn == "all":                       # a prompt chunk: every row accepted
-                    self.accepted.fill_(call[1] - 1)
-                    self.next_pos.copy_(self.pos)
-                    self.next_pos.add_(call[1])
-                else:
-                    fn(call[1], s)
+        for call in calls:
+            fn = call[0]
+            if fn == "gemv":
+                ik.gemv_multi(call[1], call[2], s)
+            elif fn == "norm":
+                ik.norm_rows(call[1], s)
+            elif fn == "advance":
+                self.pos.add_(1)
+                self.history.index_copy_(0, self.pos.long(), self.token)
+            elif fn == "copy":
+                call[1][0].copy_(call[1][1])
+            elif fn == "zero":
+                call[1].zero_()
+            elif fn == "all":                       # a prompt chunk: every row accepted
+                self.accepted.fill_(call[1] - 1)
+                self.next_pos.copy_(self.pos)
+                self.next_pos.add_(call[1])
+            else:
+                fn(call[1], s)
 
-    def _warm_cublas(self):
-        """cuBLAS handles and workspaces cannot be created during capture: one product of each kind first."""
-        side = torch.cuda.Stream()
-        for st in (torch.cuda.current_stream(), side):
-            with torch.cuda.stream(st):
-                for dt in (BF16, F32):
-                    a = torch.ones(64, 64, device=self.dev, dtype=dt)
-                    torch.matmul(a, a.t(), out=torch.empty_like(a))
+    def _warm_gemm(self):
+        """The module's cuBLAS handle is created on its first product, which cannot happen during capture."""
+        a = torch.zeros(16, 16, device=self.dev, dtype=BF16)
+        self._run([gemm_call(a, a, torch.empty(16, 16, device=self.dev, dtype=F32), self.gemm_ws)])
         torch.cuda.synchronize()
-        self._cublas_ready = True
+        self._gemm_ready = True
 
     def capture(self, name: str):
-        if not self._cublas_ready and any(c[0] in ("mm", "mm32") for c in self.programs[name]):
-            self._warm_cublas()
+        if not self._gemm_ready and any(c[0] is _ik.gemm for c in self.programs[name]):
+            self._warm_gemm()
         g = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         with torch.cuda.graph(g):

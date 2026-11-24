@@ -123,6 +123,68 @@ def test_chat_template_tojson_matches_transformers():
     assert compile_chat_template("{% generation %}A{% endgeneration %}B").render() == "AB"
 
 
+def _released_tensors():
+    formats = ["nvfp4"] * 20 + ["mxfp8"] * 4
+    return rtm.expected_tensors(_config()["text_config"] | {"vocab_size": 201024}, formats)
+
+
+def test_expected_tensors_follow_the_released_layout():
+    t = _released_tensors()
+    assert t["layers.0.mlp.experts.w13_weight"] == ("U8", (128, 2304, 1152))
+    assert t["layers.0.mlp.experts.w2_weight_scale"] == ("F8_E4M3", (128, 2304, 72))
+    assert t["layers.23.mlp.experts.w2_weight"] == ("F8_E4M3", (128, 2304, 1152))
+    assert t["layers.23.mlp.experts.w13_weight_scale"] == ("U8", (128, 2304, 72))
+    assert t["attn_res.attn_queries.4"] == ("F32", (3, 2304)) and t["attn_res.attn_queries.3"] == ("F32", (2304,))
+    assert "layers.5.attn.k_sconv.static_w" in t and "layers.4.attn.k_sconv.weight" in t
+    assert "layers.6.controllers.mlp.down_weight" in t and "layers.5.controllers.mlp.down_weight" not in t
+    rtm.check_tensors(dict(t), t, "weights")
+    assert rtm.expert_formats(t, 24) == ["nvfp4"] * 20 + ["mxfp8"] * 4
+
+
+def test_bad_weights_are_refused_before_loading():
+    t = _released_tensors()
+    bad = dict(t)
+    bad["layers.0.mlp.experts.w2_weight"] = ("F32", (1,))
+    with pytest.raises(rtm.Inkling2ConfigError, match="layers.0.mlp.experts.w2_weight: F32 \\[1\\]"):
+        rtm.check_tensors(bad, t, "weights")
+    bad = dict(t)
+    bad["layers.3.attn.wq_du.weight"] = ("BF16", (3072, 2048))
+    with pytest.raises(rtm.Inkling2ConfigError, match="wq_du"):
+        rtm.check_tensors(bad, t, "weights")
+    short = {k: v for k, v in t.items() if k != "unembed.weight"}
+    with pytest.raises(rtm.Inkling2ConfigError, match="1 missing \\(unembed.weight\\)"):
+        rtm.check_tensors(short, t, "weights")
+    with pytest.raises(rtm.Inkling2ConfigError, match="layer 2: experts stored as BF16"):
+        rtm.expert_formats(dict(t, **{"layers.2.mlp.experts.w13_weight": ("BF16", (128, 2304, 2304))}), 24)
+
+
+def test_drafter_tensors_are_checked():
+    from flash_rt.frontends.torch._inkling2_rtx_mtp import expected_mtp_tensors
+    t = expected_mtp_tensors(201024)
+    assert t["markov_head.rnn_proj.weight"] == ("BF16", (768, 5120))
+    assert t["layers.2.self_attn.k_proj_ctx.weight"] == ("BF16", (1024, 2304))
+    with pytest.raises(rtm.Inkling2ConfigError, match="markov_w1"):
+        rtm.check_tensors(dict(t, **{"markov_head.markov_w1.weight": ("BF16", (1, 256))}), t, "drafter weights")
+
+
+def test_safetensors_header(tmp_path):
+    torch = pytest.importorskip("torch")
+    st = pytest.importorskip("safetensors.torch")
+    path = tmp_path / "x.safetensors"
+    st.save_file({"a": torch.zeros(3, 4, dtype=torch.bfloat16), "b": torch.zeros(1)}, str(path))
+    assert rtm.safetensors_header(path) == {"a": ("BF16", (3, 4)), "b": ("F32", (1,))}
+    (tmp_path / "bad.safetensors").write_bytes(b"\xff" * 16)
+    with pytest.raises(rtm.Inkling2ConfigError):
+        rtm.safetensors_header(tmp_path / "bad.safetensors")
+
+
+def test_runtime_reads_no_torch_matmul_setting():
+    """The products run on the module's cuBLAS handle; the runtime never reads or sets torch.backends."""
+    from pathlib import Path
+    for name in ("_inkling2_rtx_runtime.py", "_inkling2_rtx_mtp.py", "inkling2_rtx.py"):
+        assert "torch.backends" not in (Path(rtm.__file__).parent / name).read_text()
+
+
 def test_missing_extension_names_the_build_flag(monkeypatch):
     monkeypatch.setattr(rtm, "_ik", None)
     with pytest.raises(RuntimeError, match="FLASHRT_ENABLE_INKLING2"):

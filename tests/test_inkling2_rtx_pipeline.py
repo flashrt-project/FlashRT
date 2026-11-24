@@ -173,6 +173,53 @@ def test_stop_tokens_and_lengths(fe, text_ids, speculative):
     assert fe.generate(ids, 40, stop_ids=(stop,), speculative=speculative) == ref[:cut]
 
 
+def test_prefill_is_independent_of_torch_matmul_settings(fe, text_ids):
+    """The products run on the module's own cuBLAS handle: a tensor-core prefill gives the same logits bit for bit
+    whatever PyTorch's process-wide matmul settings are, and leaves them untouched (also while another thread
+    reads them)."""
+    import threading
+    rt, mm = fe.rt, torch.backends.cuda.matmul
+    flags = lambda: (mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction)
+    saved, out = flags(), []
+    seen, stop = set(), threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            seen.add(flags())
+
+    try:
+        for setting in (("ieee", False), ("tf32", True)):
+            mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction = setting
+            seen.clear()
+            stop.clear()
+            t = threading.Thread(target=watch)
+            t.start()
+            for graphs in (True, False):
+                rt.use_graphs = graphs
+                rt.reset()
+                rt.prefill(text_ids[:700])
+                out.append(rt.logits[0].clone())
+            torch.cuda.synchronize()
+            stop.set()
+            t.join()
+            assert seen == {setting} and flags() == setting
+    finally:
+        rt.use_graphs = True
+        mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction = saved
+    assert all(torch.equal(x, out[0]) for x in out[1:])
+
+
+def test_bad_weights_are_refused_before_loading(tmp_path):
+    """A tensor of another dtype or shape is refused from the safetensors headers, before any upload."""
+    import shutil
+    from safetensors.torch import save_file
+    from flash_rt.frontends.torch._inkling2_rtx_runtime import Inkling2ConfigError, Inkling2RtxRuntime
+    shutil.copy(Path(CKPT) / "config.json", tmp_path / "config.json")
+    save_file({"model.llm.layers.0.mlp.experts.w2_weight": torch.zeros(1)}, str(tmp_path / "model.safetensors"))
+    with pytest.raises(Inkling2ConfigError, match="layers.0.mlp.experts.w2_weight: F32 \\[1\\]"):
+        Inkling2RtxRuntime(str(tmp_path), max_seq=4096)
+
+
 def test_one_drafter_per_runtime(fe):
     from flash_rt.frontends.torch._inkling2_rtx_mtp import Inkling2RtxDrafter
     with pytest.raises(RuntimeError, match="already has a drafter"):
