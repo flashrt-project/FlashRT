@@ -305,13 +305,13 @@ new tokens; contexts up to 128K tokens on the 32 GB card.
 
 | Prompt | Prefill | Decode, tok/s | DSpark, tok/s (tokens / step) |
 |---|---:|---:|---:|
-| 512 tokens | **41.8 ms** | **178.9** | **221.4** (2.18) |
-| 4K tokens | **394 ms** | **172.4** | **294.3** (3.14) |
-| 32K tokens | **4.59 s** | **136.2** | **155.9** (2.51) |
-| 128K tokens | **37.1 s** | **71.9** | 64.3 (2.21) |
+| 512 tokens | **41.5 ms** | **179.3** | **214.3** (2.11) |
+| 4K tokens | **392 ms** | **172.4** | **230.2** (2.42) |
+| 32K tokens | **4.57 s** | **136.3** | **176.1** (2.88) |
+| 128K tokens | **37.0 s** | **71.9** | **73.2** (2.51) |
 
-On sixteen short code requests DSpark decodes at 275.6 tok/s (2.66 tokens per
-step), on sixteen general ones at 218.6 (2.08), against 181.5 and 180.3 plain.
+On sixteen short code requests DSpark decodes at 273.2 tok/s (2.62 tokens per
+step), on sixteen general ones at 215.4 (2.05), against 181.3 and 179.5 plain.
 
 ### Flint (MLX int4, Apple Silicon)
 
