@@ -51,6 +51,10 @@ for block in fe.stream(ids, max_new_tokens=256, temperature=1.0, top_p=0.95, top
 
 # DSpark speculative decoding: the drafter proposes, the model verifies greedily.
 spec = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True)
+# verify="exact": every verified row repeats the decode step's arithmetic (output = greedy decode, bit for bit)
+exact = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="exact")
+# q8=True: attention projections and LM head from Q8_0 copies made at load (faster; not the checkpoint's numerics)
+q8 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, q8=True)
 ```
 
 `stream` stops after an end-of-generation token (`generation_config.json`'s
@@ -89,7 +93,7 @@ row-program step per token for all sequences).
 | Runtime (weights, buffers, decode step, row programs, chunked prefill) | `flash_rt/frontends/torch/_inkling2_mps_runtime.py` |
 | DSpark drafter and the speculative loop | `flash_rt/frontends/torch/_inkling2_mtp.py` |
 | Frontend (tokenizer, chat template, streaming) | `flash_rt/frontends/torch/inkling2_mps.py` |
-| Kernels | `csrc/apple/inkling2/`: shared device functions, resident decode step, per-row kernels, TensorOps products, drafter |
+| Kernels | `csrc/apple/inkling2/`: shared device functions, resident decode step, resident verification step (`inkling2_verify_resident_bf16.h`), per-row kernels, TensorOps products, drafter; `csrc/apple/gemm/q8_0_rows.h`: Q8_0 copies and few-row products |
 | Benchmark drivers | `examples/apple/inkling2_benchmark.py`, `examples/apple/inkling2_mlx_benchmark.py` (reference engine) |
 
 The model: 24 stored layers in four blocks of six; layers 6-17 run three
@@ -138,10 +142,22 @@ final normalized state are mixed per drafter layer into context K / V; a block
 of 8 positions (the last accepted token and 7 mask embeddings) runs 3
 bidirectional layers; each drafted position takes the LM head's logits plus
 the Markov head's bias (its `hidden_out` folded into the LM head) and the
-greedy token feeds the next position. The model verifies the anchor and the
-first W - 1 drafts of every sequence in one row program (W = 8 for 1-4
-sequences, 4 for up to 16, 3 beyond: verification grows with the rows while the
-accepted length saturates). Verification stages the conv states and
+greedy token feeds the next position. The base logits come from a Q8_0 copy of
+the LM head and the Markov head ranks their 256 largest values (with the fold
+bias) instead of the whole vocabulary: drafts only decide how many tokens a step
+accepts, never which. The model verifies the anchor and the first W - 1 drafts
+(W = 8 for 1-4 sequences, 4 for up to 16, 3 beyond). One sequence is verified
+by a resident step: one dispatch over the 8 rows (36 threadgroups, device-scope
+barriers), the weights read once for all rows, the experts of the rows
+deduplicated (32 distinct experts per visit on average for 8 rows, 15-47) and
+taken by threadgroups from a counter, heavy experts first. Two variants share
+it: `exact` gives every row the decode step's arithmetic (its products, lane
+order and roundings), `fast` (the default) sums in its own order: expert
+products in half precision (the inputs scaled by a power of two per row so the
+products of BF16 inputs and E2M1 codes are exact halves, sums of 16 in half,
+FP32 beyond), coalesced 16-byte code loads with two output rows per lane, and
+attention by blocks of key positions for all 8 rows at once. Several sequences
+are verified by the row programs. Verification stages the conv states and
 sliding-window K / V of its rows; only the accepted rows are committed.
 
 ## Numerics
@@ -171,11 +187,20 @@ sliding-window K / V of its rows; only the accepted rows are committed.
   draws by Gumbel-max at the temperature with FlashRT's counter-based noise:
   sampled sequences are reproducible per seed but are not the reference
   engine's sequences.
-- **Speculative decoding** commits the tokens the verification selects: the
-  model's greedy continuation in the row programs' rounding. It follows the
-  one-token greedy output until the two orders of summation round two leading
-  candidates differently (observed once in the first 128 tokens of a code
-  prompt: two raw logits within one BF16 step became an exact tie).
+- **Speculative decoding** commits the tokens the verification selects. With
+  `verify="exact"` that is the greedy decode's continuation bit for bit (1024 of
+  1024 tokens on three benchmark slices). The fast verification and the row
+  programs sum in other orders: they follow the greedy decode until the two
+  orders round two leading candidates differently. For 8 rows at four places of
+  the corpus (after 37, 1018, 1500 and 2100 tokens) the fast verification's
+  logits differ from the exact step's by a mean KL of 1.3e-4 to 1.9e-3 per place
+  (largest row 1.4e-2), the row programs' by 1.1e-2 to 4.2e-2 (largest 0.19).
+- **Q8_0 (`q8=True`)** re-quantizes the BF16 attention projections (q, k, v,
+  relative, gate, output) and the LM head to blocks of 32 int8 codes with an
+  FP16 scale at load (in a separate buffer; prefill keeps the BF16 weights).
+  Teacher forced on the BF16 greedy continuation, the decode step's logits
+  differ by a mean KL of 2.5-8e-4 (largest 9e-3) and pick the same token in 125
+  of 128 steps.
 
 ## Validation
 
@@ -190,10 +215,13 @@ FLASHRT_INKLING2_DIR=/path/to/Inkling-2-Mini python -m pytest tests/test_inkling
 
 The Mac file checks the one-row program against the decode step (every
 visit's hidden state, bit for bit), batch invariance of a four-row decode step,
-chunked against one-chunk prefill, speculative against plain greedy decoding,
-sampling (top-k 1 equals greedy, seeds reproduce), the input checks, the chat
-path, the re-ordered expert copy against its numpy reference and the tiled
-expert passes against the per-expert ones (bit for bit).
+chunked against one-chunk prefill, speculative (exact verification) against
+plain greedy decoding and the fast verification up to a near-tie, the exact
+resident verification of 8 rows against 8 decode steps (logits bit for bit)
+with the fast one closer to it than the row program, the Q8_0 decode step
+against the BF16 one, sampling (top-k 1 equals greedy, seeds reproduce), the
+input checks, the chat path, the re-ordered expert copy against its numpy
+reference and the tiled expert passes against the per-expert ones (bit for bit).
 
 ### Equivalence with the reference engine (M4 Pro, macOS 26)
 
@@ -226,18 +254,36 @@ different prompt slices and reports the median of the last two.
 
 | C | mlx-lm, two runs | FlashRT | vs mlx-lm | FlashRT + DSpark | vs mlx-lm | accepted tokens per step |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 26.0 / 26.1 (`stream_generate` 28.4 / 28.5) | **35.3** | 1.24x | **58.9** (49.1-68.7) | 2.07x | 4.8-6.8 of 8 |
-| 4 | 53.0 / 52.2 | **64.3** | 1.22x | **89.0** (85.9-92.1) | 1.69x | 5.1-5.2 of 8 |
-| 16 | 72.5 / 72.6 | **116.3** | 1.60x | **155.8** (151.8-159.7) | 2.15x | 3.5-3.6 of 4 |
-| 64 | 120.0 / 120.3 | **210.7** | 1.75x | **218.9** (214.3-223.5) | 1.82x | 2.8 of 3 |
+| 1 | 26.0 / 26.1 (`stream_generate` 28.4 / 28.5) | **35.2** | 1.24x | **77.6** (76.1-79.1) | 2.73x | 6.0-6.3 of 8 |
+| 4 | 53.0 / 52.2 | **64.3** | 1.22x | **89.4** (89.3-89.6) | 1.70x | 5.1 of 8 |
+| 16 | 72.5 / 72.6 | **116.3** | 1.60x | **162.4** (156.4-168.3) | 2.24x | 3.5-3.6 of 4 |
+| 64 | 120.0 / 120.3 | **210.7** | 1.75x | **221.8** (215.4-228.1) | 1.85x | 2.8 of 3 |
 
 mlx-lm runs these concurrency levels on its BatchGenerator (the engine of
 `mlx_lm.server`); at C = 1 its single-sequence `stream_generate` is faster and
 is the comparison given in parentheses. FlashRT's plain decoding is the resident
-step at C = 1 and the batched row program above. DSpark's ranges are the two
-measured prompt slices: the accepted length depends on the text. From C = 16
+step at C = 1 and the batched row program above. DSpark verifies with the fast
+resident step at C = 1 and the row programs above. DSpark's ranges are the two
+measured prompt slices: the accepted length depends on the text (with the exact
+verification, C = 1 runs 58.7 tokens/s in 93-94 ms steps; with the row programs
+59.1 in 91-92 ms steps: the slices continue differently). From C = 16
 the M4 Pro's matrix units, not its bandwidth, bound a step, so verifying more
 rows buys less.
+
+With `q8=True` (C = 1): plain decoding 45.6 tokens/s, DSpark 76.4 (63.2-89.6;
+the accepted length follows the continuation, which differs from the BF16 one).
+
+### A speculative step (one sequence, 8 rows)
+
+The step drafts (8.2 ms: the drafter's three layers over the block, the Q8_0 LM
+head for 7 positions, the Markov walk over 256 candidates per position) and
+verifies the 8 rows: fast 69-71 ms, exact 84-85 ms, the row programs 82-83 ms
+(Q8_0 fast 67-68 ms), so a step takes 78-80 ms with the fast verification. In the
+fast step the expert passes take about 40 ms for the 32 distinct experts per
+visit (7.7 GB, against 28 ms at the measured streaming rate: the NVFP4 decode
+bounds them), the BF16 projections, output projection and LM head about 16 ms
+(near the streaming rate), attention 4-7 ms and the per-row vector phases with
+the barriers between phases about 6.5 ms.
 
 ### Prefill (seconds until every sequence has its first token)
 
@@ -277,6 +323,9 @@ FlashRT token on the M4 Pro takes 28.3 ms.
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --make-corpus corpus.i32
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64 --mtp
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify exact
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --q8
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --q8
 python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64
 python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --stream
 ```
@@ -289,4 +338,6 @@ python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini 
 - The resident decode step keeps 36 threadgroups co-resident (20-core GPU);
   smaller GPUs are not supported.
 - Verification widths are tuned on the M4 Pro; the accepted length depends on
-  the text (the numbers above use source code).
+  the text (the numbers above use source code). The resident verification
+  serves one sequence; `verify="exact"` is not available with `q8=True` (it
+  repeats the BF16 decode step).
