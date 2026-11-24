@@ -210,14 +210,16 @@ def expected_tensors(c: dict, formats: Sequence[str]) -> Dict[str, Tuple[str, Tu
 
 def gemm_call(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, workspace: torch.Tensor):
     """``c = a b^T`` on the module's cuBLAS GEMM (FP32 accumulation, precision fixed by the module): a [m][k] and
-    b [n][k] BF16, c [m][n] BF16 or FP32, rows contiguous."""
+    b [n][k] BF16, c [m][n] BF16 or FP32, rows contiguous. The call keeps the three tensors referenced (``_keep``,
+    not read by the kernel), so the raw pointers stay valid as long as the call does."""
     m, k = a.shape
     n = b.shape[0]
     if a.dtype != BF16 or b.dtype != BF16 or c.dtype not in (BF16, F32) or b.shape[1] != k or \
             tuple(c.shape) != (m, n) or a.stride(1) != 1 or b.stride(1) != 1 or c.stride(1) != 1:
         raise ValueError("gemm: a [m][k], b [n][k] BF16 and c [m][n] BF16 / FP32 with contiguous rows")
     return (_ik.gemm, dict(m=m, n=n, k=k, a=P(a), lda=a.stride(0), b=P(b), ldb=b.stride(0), c=P(c), ldc=c.stride(0),
-                           out_f32=int(c.dtype == F32), workspace=P(workspace), workspace_bytes=nbytes(workspace)))
+                           out_f32=int(c.dtype == F32), workspace=P(workspace), workspace_bytes=nbytes(workspace),
+                           _keep=(a, b, c, workspace)))
 
 
 def P(t: torch.Tensor) -> int:
@@ -752,8 +754,10 @@ class Inkling2RtxRuntime:
     def _warm_gemm(self):
         """The module's cuBLAS handle is created on its first product, which cannot happen during capture."""
         a = torch.zeros(16, 16, device=self.dev, dtype=BF16)
-        self._run([gemm_call(a, a, torch.empty(16, 16, device=self.dev, dtype=F32), self.gemm_ws)])
+        out = torch.empty(16, 16, device=self.dev, dtype=F32)      # alive until the product has run
+        self._run([gemm_call(a, a, out, self.gemm_ws)])
         torch.cuda.synchronize()
+        del a, out
         self._gemm_ready = True
 
     def capture(self, name: str):

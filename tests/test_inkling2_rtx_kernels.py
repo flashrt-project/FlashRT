@@ -159,3 +159,22 @@ def test_gemm_from_concurrent_threads():
         t.join()
     assert not errors, errors
     assert _torch_matmul_flags() == flags
+
+
+def test_gemm_call_keeps_its_operands_alive():
+    """A recorded product holds raw pointers: the call keeps its tensors referenced, so an output passed as a
+    temporary is not freed (and its memory not reused by the next allocation) before the product runs."""
+    import gc
+    from flash_rt.frontends.torch._inkling2_rtx_runtime import gemm_call
+    torch.manual_seed(0)
+    a, b = torch.randn(64, 2304, device="cuda").bfloat16(), torch.randn(128, 2304, device="cuda").bfloat16()
+    ws = torch.empty(ik.GEMM_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8)
+    call = gemm_call(a, b, torch.empty(64, 128, device="cuda"), ws)
+    gc.collect()
+    fillers = [torch.full((64, 128), 7.0, device="cuda") for _ in range(4)]   # would reuse a freed block
+    call[0](call[1], torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert all(bool((f == 7.0).all()) for f in fillers)
+    out = call[1]["_keep"][2]
+    assert out.data_ptr() == call[1]["c"]
+    assert torch.allclose(out, (a.float() @ b.float().t()), rtol=1e-3, atol=1e-2)
