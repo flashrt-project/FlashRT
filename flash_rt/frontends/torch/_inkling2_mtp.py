@@ -5,10 +5,13 @@ target's features, plus the RNN Markov head of DSpark): ``fuse_weight`` softmax 
 (the hidden state entering visits 5, 23, 41 and the final normalized state) give each drafter layer its context
 K / V and the Markov head its recurrent input; the Markov head's ``hidden_out`` is folded into the LM head
 (``W_lm @ hidden_out``) so a drafted position's bias is one (vocab x 256) product. Greedy drafting and greedy
-verification: a step drafts after the anchor, the target scores the anchor and the first W - 1 drafts in one row
-program (W by batch size, ``mtp_widths``), and the longest agreeing prefix plus the target's next token are
-committed. Verification uses the row programs' numerics, so where two candidates are within the rounding of the
-logits the output can differ from the single-row decode step's greedy choice.
+verification: a step drafts after the anchor, the target scores the anchor and the first W - 1 drafts (W by batch
+size, ``mtp_widths``), and the longest agreeing prefix plus the target's next token are committed. Verification of
+one sequence (``mtp_verify``): "fast" (default), a resident step over the rows with its own summation order (half
+code products, position-block attention; within the rounding of the decode step); "resident", a resident step with
+every row the decode step's arithmetic (the output is the greedy decode's bit for bit); "rows", the row programs (also
+for several sequences). The Markov walk ranks the 256 largest base logits of a drafted position (from a Q8_0 copy of
+the LM head): drafts only decide how many tokens a step accepts.
 
 Mixed into ``Inkling2Runtime`` (programs must be recorded before the plan is sealed).
 """
@@ -33,6 +36,11 @@ MTP_INTER = 9216
 MTP_THETA = 1.0e6
 MTP_WINDOW = 1024
 STAGE_ELEMS = 6656 + 2 * 8 * 128
+MTP_CAND = 256                    # Markov walk candidates per drafted position (ink_mtp_topk)
+# resident verification step (inkling2_verify_resident_bf16.h): per-row workspace and the step's shared tail
+VERIFY_ROW_BYTES = 1177792 + 83072
+VERIFY_WORKSPACE = 8 * VERIFY_ROW_BYTES + 4096
+VERIFY_ROWS = range(2, 9)
 
 
 class _MTPMixin:
@@ -114,9 +122,18 @@ class _MTPMixin:
             "m_act": RV * MTP_INTER * bf, "m_mlp": RV * H * bf, "m_hn": RV * H * bf, "m_logits": RV * V * f32,
             "m_state": S * MTP_RANK * bf, "m_rnnin": S * (2 * MTP_RANK + 2 * H) * bf, "m_proj": S * 3 * MTP_RANK * f32,
             "m_latent": S * MTP_RANK * bf, "m_bias": S * V * f32, "m_prev": S * 4, "m_drafts": S * 7 * 4,
+            "v_ws": VERIFY_WORKSPACE, "v_params": 16,
+            "m_cidx": S * 7 * MTP_CAND * 4, "m_cval": S * 7 * MTP_CAND * f32,
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
+
+    # verification program of one sequence: "rows" (the row program's numerics) or "resident" (the resident step:
+    # every row the decode step's arithmetic, so the output is the greedy decode's continuation bit for bit)
+    mtp_verify = "fast"
+    # Markov walk over the MTP_CAND largest base logits of each drafted position (0: the whole vocabulary); drafts
+    # only decide how many tokens a step accepts, never which
+    mtp_draft_candidates = MTP_CAND
 
     # verified rows per sequence and step (the anchor + W - 1 drafts) by batch size: verification grows with the
     # rows while the accepted length saturates, so larger batches verify fewer drafts
@@ -138,11 +155,51 @@ class _MTPMixin:
             W = self.mtp_width(C)
             R = W * C
             self.mtp_programs[("verify", C)] = self._record_rows(R, R, stage=True, features=True)
+            if C == 1 and R in VERIFY_ROWS:     # one sequence: the resident steps (exact / fast; Q8_0: fast only)
+                for kind in (("fast",) if self.q8 else ("resident", "fast")):
+                    self.mtp_programs[(f"verify_{kind}", R)] = self._record_verify(R, kind, reference=False)
+                    if self.trace_rows:
+                        self.mtp_programs[(f"verify_{kind}_reference", R)] = self._record_verify(R, kind, reference=True)
             self.mtp_programs[("commit", C)] = self._mtp_record_commit(R)
             self.mtp_programs[("draft", C)] = self._mtp_record_draft(C, W)
         for P in self.mtp_prefill:     # target rows with features, then the drafter context of the same rows
             self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True,
                                                                   then=lambda P=P: self._mtp_context(P))
+
+    def _record_verify(self, R: int, kind: str = "resident", reference: bool = False) -> int:
+        b, plan = self.buf, self.plan
+        program = plan.program()
+        name = f"inkling2_verify_{kind}{'_q8' if self.q8 else ''}_r{R}_{'reference_' if reference else ''}bf16"
+        extra = [(b["q8"], 0, READ), (b["q8table"], 0, READ)] if self.q8 else []
+        plan.dispatch(name, [
+            (b["weights"], 0, READ), (b["table"], 0, READ), (b["kv"], 0, READ_WRITE), (b["rings"], 0, READ),
+            (b["v_params"], 0, READ), (b["r_tokens"], 0, READ), (b["m_stage"], 0, WRITE), (b["m_feat"], 0, WRITE),
+            (b["r_logits"], 0, WRITE), (b["r_out"], 0, WRITE), (b["v_ws"], 0, READ_WRITE), (b["trace"], 0, WRITE),
+            (b["control"], 0, READ_WRITE), (b["diagnostic"], 0, WRITE),
+        ] + extra, (self._workers, 1, 1), self._threads, label="verify_resident")
+        return program
+
+    def verify_resident(self, tokens: Sequence[int], position: int, reference: bool = False,
+                        kind: str = "resident") -> np.ndarray:
+        """Resident verification step of sequence 0: rows ``tokens`` (2..8) at positions ``position ..``; caches
+        and rings are read, not written (rows staged in m_stage, global K / V written by position); drafter
+        features into m_feat, logits into r_logits. Returns the greedy target of every row."""
+        R = len(tokens)
+        key = (f"verify_{kind}_reference" if reference else f"verify_{kind}", R)
+        if key not in getattr(self, "mtp_programs", {}):
+            raise ValueError(f"no resident verification program for {R} rows")
+        if position + R > self.max_seq:
+            raise ValueError("verification rows exceed max_seq")
+        if any(not 0 <= int(t) < self.cfg.unpadded_vocab_size for t in tokens):
+            raise ValueError("token id outside the checkpoint vocabulary")
+        self.plan.write(self.buf["r_tokens"], 0, np.asarray(tokens, np.uint32))
+        self._verify_params[:] = [position, 0, 0, 0]
+        self._control[:] = 0
+        self._diagnostic[:] = 0
+        self.last_verify_timing = self.plan.run(self.mtp_programs[key])
+        if self._diagnostic.any():
+            raise RuntimeError(f"resident verification barrier timed out (diagnostic {self._diagnostic.tolist()})")
+        return self.plan.read(self.buf["r_out"], 0, np.uint32, R).copy()
 
     def _mtp_record_commit(self, R: int) -> int:
         b, plan = self.buf, self.plan
@@ -240,7 +297,17 @@ class _MTPMixin:
         norm(w["norm"], "m_mlp", final=True)
         f = self.table[cfg.num_layers]
         nd = W - 1                                 # drafted positions verified per step
-        self._gemm("ink_gemm_f32_rows", b["m_hn"], 0, H, int(f[D_HEAD]), V, H, b["m_logits"], 0, V, 0, nd * C, True)
+        if "head" in self._q8 and nd * C <= 8:
+            self._q8_rows("head", b["m_hn"], 0, H, nd * C, b["m_logits"], 0, V, "mtp_logits_q8")
+        else:
+            self._gemm("ink_gemm_f32_rows", b["m_hn"], 0, H, int(f[D_HEAD]), V, H, b["m_logits"], 0, V, 0, nd * C, True)
+        cand = self.mtp_draft_candidates
+        if cand:
+            tk = self._param(np.array([w["fold_b"]], np.uint64).tobytes() +
+                             np.array([nd * C, cfg.unpadded_vocab_size, V, 0], np.uint32).tobytes())
+            plan.dispatch("ink_mtp_topk", [(b["weights"], 0, READ), (b["m_logits"], 0, READ), (b["m_cidx"], 0, WRITE),
+                                           (b["m_cval"], 0, WRITE), (A, tk, READ)], (nd * C, 1, 1), 1024,
+                          label="mtp_topk")
         # Markov walk
         for step in range(nd):
             rnn = self._param(np.array([w["m.w1"]], np.uint64).tobytes() + np.array([C, step], np.uint32).tobytes())
@@ -254,6 +321,13 @@ class _MTPMixin:
             plan.dispatch("ink_mtp_gates", [(b["weights"], 0, READ), (b["m_proj"], 0, READ), (b["m_state"], 0, READ_WRITE),
                                             (b["m_latent"], 0, WRITE), (A, gt, READ)], ((C * MTP_RANK + 255) // 256, 1, 1),
                           256, label="mtp_gates")
+            if cand:     # the step's candidates only (the largest base logits + fold bias of the position)
+                pc = self._param(np.array([w["fold_w"]], np.uint64).tobytes() + np.array([C, step, 0, 0], np.uint32).tobytes())
+                plan.dispatch("ink_mtp_pick_cand", [(b["weights"], 0, READ), (b["m_cidx"], 0, READ), (b["m_cval"], 0, READ),
+                                                    (b["m_latent"], 0, READ), (b["m_prev"], 0, READ_WRITE),
+                                                    (b["m_drafts"], 0, WRITE), (A, pc, READ)], (C, 1, 1), 256,
+                              label="mtp_pick_cand")
+                continue
             self._gemm("ink_gemm_f32_rows", b["m_latent"], 0, MTP_RANK, w["fold_w"], V, MTP_RANK, b["m_bias"], 0, V, 0,
                        C, True)
             pk = self._param(np.array([w["fold_b"]], np.uint64).tobytes() +
@@ -311,7 +385,15 @@ class _MTPMixin:
                 vinfo[s * W:(s + 1) * W] = [[s, pos[s] + j, pos[s], pos[s] + W - 1] for j in range(W)]
             plan.write(b["r_tokens"], 0, toks.astype(np.uint32))
             plan.write(b["r_info"], 0, vinfo)
-            gpu["verify"] += plan.run(self.mtp_programs[("verify", C)])["gpu_us"]
+            if self.mtp_verify in ("resident", "fast") and C == 1 and (f"verify_{self.mtp_verify}", R) in self.mtp_programs:
+                self._verify_params[:] = [pos[0], 0, 0, 0]
+                self._control[:] = 0
+                self._diagnostic[:] = 0
+                gpu["verify"] += plan.run(self.mtp_programs[(f"verify_{self.mtp_verify}", R)])["gpu_us"]
+                if self._diagnostic.any():
+                    raise RuntimeError(f"resident verification barrier timed out ({self._diagnostic.tolist()})")
+            else:
+                gpu["verify"] += plan.run(self.mtp_programs[("verify", C)])["gpu_us"]
             target = plan.read(b["r_out"], 0, np.uint32, R).reshape(C, W)
             commit = np.zeros((R, 2), np.uint32)
             cinfo = np.zeros((R, 4), np.uint32)

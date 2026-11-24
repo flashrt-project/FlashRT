@@ -13,12 +13,14 @@
 #include "flint/flint_moe_rows_bf16.h"
 #include "flint/flint_prefill_rows_bf16.h"
 #include "gemm/bf16_tensor_ops.h"
+#include "gemm/q8_0_rows.h"
 #include "gemm/w4a16_affine_qmv.h"
 #include "gemm/w4a16_affine_tensor_ops.h"
 #include "inkling2/inkling2_decode_resident_bf16.h"
 #include "inkling2/inkling2_rows_bf16.h"
 #include "inkling2/inkling2_rows_gemm.h"
 #include "inkling2/inkling2_mtp_bf16.h"
+#include "inkling2/inkling2_verify_resident_bf16.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
 #include "kernels/gelu_bf16.h"
@@ -209,6 +211,34 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { Inkling2DecodeOptions o; o.trace = true; return inkling2_decode_resident_bf16_source(o); }},
     {"inkling2_decode_resident_sampled_bf16", "inkling2_decode_resident_bf16",
      [] { Inkling2DecodeOptions o; o.sampled = true; return inkling2_decode_resident_bf16_source(o); }},
+    // the same with the attention projections and LM head from Q8_0 copies (opt-in; not the checkpoint's numerics)
+    {"inkling2_decode_resident_q8_bf16", "inkling2_decode_resident_bf16",
+     [] { Inkling2DecodeOptions o; o.q8 = true; return inkling2_decode_resident_bf16_source(o); }},
+    {"inkling2_decode_resident_q8_reference_bf16", "inkling2_decode_resident_bf16",
+     [] { Inkling2DecodeOptions o; o.q8 = true; o.trace = true; return inkling2_decode_resident_bf16_source(o); }},
+    {"inkling2_decode_resident_q8_sampled_bf16", "inkling2_decode_resident_bf16",
+     [] { Inkling2DecodeOptions o; o.q8 = true; o.sampled = true; return inkling2_decode_resident_bf16_source(o); }},
+    // inkling2_loop resident verification step over 2..8 consecutive positions of one sequence (staged like the
+    // verify row program): exact (each row's arithmetic that of the greedy resident step) and fast (own summation
+    // order in the products). Reference: with the trace.
+#define FRT_INK_VERIFY(R) \
+    {"inkling2_verify_resident_r" #R "_bf16", "inkling2_verify_resident_bf16", \
+     [] { Inkling2VerifyOptions o; o.rows = R; return inkling2_verify_resident_bf16_source(o); }}, \
+    {"inkling2_verify_resident_r" #R "_reference_bf16", "inkling2_verify_resident_bf16", \
+     [] { Inkling2VerifyOptions o; o.rows = R; o.trace = true; return inkling2_verify_resident_bf16_source(o); }}, \
+    {"inkling2_verify_fast_r" #R "_bf16", "inkling2_verify_resident_bf16", \
+     [] { Inkling2VerifyOptions o; o.rows = R; o.fast = true; return inkling2_verify_resident_bf16_source(o); }}, \
+    {"inkling2_verify_fast_r" #R "_reference_bf16", "inkling2_verify_resident_bf16", \
+     [] { Inkling2VerifyOptions o; o.rows = R; o.fast = true; o.trace = true; \
+          return inkling2_verify_resident_bf16_source(o); }}, \
+    {"inkling2_verify_fast_q8_r" #R "_bf16", "inkling2_verify_resident_bf16", \
+     [] { Inkling2VerifyOptions o; o.rows = R; o.fast = true; o.q8 = true; return inkling2_verify_resident_bf16_source(o); }}, \
+    {"inkling2_verify_fast_q8_r" #R "_reference_bf16", "inkling2_verify_resident_bf16", \
+     [] { Inkling2VerifyOptions o; o.rows = R; o.fast = true; o.q8 = true; o.trace = true; \
+          return inkling2_verify_resident_bf16_source(o); }},
+    FRT_INK_VERIFY(2) FRT_INK_VERIFY(3) FRT_INK_VERIFY(4) FRT_INK_VERIFY(5) FRT_INK_VERIFY(6) FRT_INK_VERIFY(7)
+    FRT_INK_VERIFY(8)
+#undef FRT_INK_VERIFY
     // inkling2_loop row programs (prefill chunks and batched decode): per-row kernels and TensorOps products.
     // Inkling 2 Mini DSpark speculative decoding (verify staging / commit, drafter)
     {"ink_ring_stage_rows", "ink_ring_stage_rows", inkling2_mtp_bf16_source},
@@ -223,6 +253,11 @@ inline constexpr KernelSource kernel_registry[] = {
     {"ink_mtp_rnn_in", "ink_mtp_rnn_in", inkling2_mtp_bf16_source},
     {"ink_mtp_gates", "ink_mtp_gates", inkling2_mtp_bf16_source},
     {"ink_mtp_pick", "ink_mtp_pick", inkling2_mtp_bf16_source},
+    {"ink_mtp_topk", "ink_mtp_topk", inkling2_mtp_bf16_source},
+    // Q8_0 weights: quantization of BF16 matrices, products with up to 8 rows (FP32 out)
+    {"q8_0_quantize_bf16", "q8_0_quantize_bf16", q8_0_rows_source},
+    {"q8_0_rows_f32", "q8_0_rows_f32", q8_0_rows_source},
+    {"ink_mtp_pick_cand", "ink_mtp_pick_cand", inkling2_mtp_bf16_source},
     {"ink_embed_rows", "ink_embed_rows", inkling2_rows_bf16_source},
     {"ink_attn_inputs_rows", "ink_attn_inputs_rows", inkling2_rows_bf16_source},
     {"ink_gate_rows", "ink_gate_rows", inkling2_rows_bf16_source},

@@ -345,6 +345,100 @@ kernel void ink_mtp_pick(const device uchar* weights [[buffer(0)]],const device 
         if(lane==0u){prev[s]=bi;drafts[s*7u+p.step]=bi;}
     }
 }
+// Candidate drafting: the K largest base logits + fold bias of each drafted position (radix selection on the order-
+// preserving key of the FP32 value: 11 + 11 + 10 bits; ties at the K-th value taken in index order). grid (rows),
+// 1024 threads; cand_idx / cand_val [rows][K].
+constant constexpr uint MTP_CAND=256u;
+struct MtpTopk { ulong fold_b; uint rows, vocab, stride, pad; };
+inline uint order_key(float x){const uint u=as_type<uint>(x);return (u&0x80000000u)?~u:(u|0x80000000u);}
+kernel void ink_mtp_topk(const device uchar* weights [[buffer(0)]],const device float* logits [[buffer(1)]],
+    device uint* cand_idx [[buffer(2)]],device float* cand_val [[buffer(3)]],constant MtpTopk& p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) {
+    if(row>=p.rows)return;
+    const device float* lg=logits+size_t(row)*p.stride;
+    const device ushort* fb=(const device ushort*)(weights+p.fold_b);
+    threadgroup atomic_uint hist[2048];
+    threadgroup uint sh[4];
+    uint prefix=0u,pmask=0u,need=MTP_CAND;
+    const uint shifts[3]={21u,10u,0u},widths[3]={11u,11u,10u};
+    for(uint pass=0;pass<3u;++pass) {
+        const uint sft=shifts[pass],nb=1u<<widths[pass];
+        for(uint i=tid;i<nb;i+=1024u)atomic_store_explicit(&hist[i],0u,memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint v=tid;v<p.vocab;v+=1024u) {
+            const uint k=order_key(lg[v]+bfu(fb[v]));
+            if((k&pmask)==prefix)atomic_fetch_add_explicit(&hist[(k>>sft)&(nb-1u)],1u,memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(tid==0) {
+            uint above=0u,bin=0u;
+            for(int bi=int(nb)-1;bi>=0;--bi) {
+                const uint c=atomic_load_explicit(&hist[bi],memory_order_relaxed);
+                if(above+c>=need){bin=uint(bi);break;}
+                above+=c;
+            }
+            sh[0]=bin;sh[1]=need-above;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix|=sh[0]<<sft;pmask|=(nb-1u)<<sft;need=sh[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // prefix = key of the K-th largest; above it MTP_CAND - need elements; need of the elements equal to it
+    if(tid==0){sh[2]=0u;sh[3]=0u;}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup atomic_uint* cnt=(threadgroup atomic_uint*)(hist);
+    if(tid==0){atomic_store_explicit(&cnt[0],0u,memory_order_relaxed);atomic_store_explicit(&cnt[1],0u,memory_order_relaxed);}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint nabove=MTP_CAND-need;
+    for(uint v=tid;v<p.vocab;v+=1024u) {
+        const float x=lg[v]+bfu(fb[v]);
+        const uint k=order_key(x);
+        if(k>prefix){const uint at=atomic_fetch_add_explicit(&cnt[0],1u,memory_order_relaxed);
+            cand_idx[size_t(row)*MTP_CAND+at]=v;cand_val[size_t(row)*MTP_CAND+at]=x;}
+        else if(k==prefix){const uint at=atomic_fetch_add_explicit(&cnt[1],1u,memory_order_relaxed);
+            if(at<need){cand_idx[size_t(row)*MTP_CAND+nabove+at]=v;cand_val[size_t(row)*MTP_CAND+nabove+at]=x;}}
+    }
+}
+// Markov step on the candidates: bias = fold_w[v] . latent for the K candidates of this step, argmax of
+// candidate value + bias (ties: lowest id). grid (seqs), 256 threads (one candidate each).
+struct MtpPickCand { ulong fold_w; uint seqs, step, pad0, pad1; };
+kernel void ink_mtp_pick_cand(const device uchar* weights [[buffer(0)]],const device uint* cand_idx [[buffer(1)]],
+    const device float* cand_val [[buffer(2)]],const device ushort* latent [[buffer(3)]],device uint* prev [[buffer(4)]],
+    device uint* drafts [[buffer(5)]],constant MtpPickCand& p [[buffer(6)]],uint s [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) {
+    if(s>=p.seqs)return;
+    threadgroup float lt[256];
+    lt[tid]=bfu(latent[size_t(s)*256u+tid]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const size_t c=(size_t(p.step)*p.seqs+s)*MTP_CAND+tid;
+    const uint v=cand_idx[c];
+    const device uint4* fw=(const device uint4*)((const device ushort*)(weights+p.fold_w)+size_t(v)*256u);
+    float a0=0.0f,a1=0.0f;
+    for(uint i=0;i<32u;++i) {
+        const uint4 q=fw[i];
+        a0=metal::fma(lo_f(q.x),lt[8u*i],a0);a1=metal::fma(hi_f(q.x),lt[8u*i+1u],a1);
+        a0=metal::fma(lo_f(q.y),lt[8u*i+2u],a0);a1=metal::fma(hi_f(q.y),lt[8u*i+3u],a1);
+        a0=metal::fma(lo_f(q.z),lt[8u*i+4u],a0);a1=metal::fma(hi_f(q.z),lt[8u*i+5u],a1);
+        a0=metal::fma(lo_f(q.w),lt[8u*i+6u],a0);a1=metal::fma(hi_f(q.w),lt[8u*i+7u],a1);
+    }
+    float best=cand_val[c]+(a0+a1);uint bi=v;
+    for(ushort o=16;o>=1;o>>=1) {
+        const float ob=simd_shuffle_down(best,o);const uint oi=simd_shuffle_down(bi,o);
+        if(ob>best||(ob==best&&oi<bi)){best=ob;bi=oi;}
+    }
+    threadgroup float vb[8];threadgroup uint vi[8];
+    if(lane==0u){vb[simd]=best;vi[simd]=bi;}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(simd==0u) {
+        best=lane<8u?vb[lane]:-INFINITY;bi=lane<8u?vi[lane]:0xffffffffu;
+        for(ushort o=16;o>=1;o>>=1) {
+            const float ob=simd_shuffle_down(best,o);const uint oi=simd_shuffle_down(bi,o);
+            if(ob>best||(ob==best&&oi<bi)){best=ob;bi=oi;}
+        }
+        if(lane==0u){prev[s]=bi;drafts[s*7u+p.step]=bi;}
+    }
+}
 )MSL";
 }
 }  // namespace flashrt::apple::shaders

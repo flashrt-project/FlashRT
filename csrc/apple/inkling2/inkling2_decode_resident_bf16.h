@@ -27,6 +27,7 @@ namespace flashrt::apple::shaders {
 struct Inkling2DecodeOptions {
     bool sampled = false;   // fused top-k (<= 32) / top-p selection with Gumbel noise instead of greedy argmax
     bool trace = false;     // write the hidden state after every visit and a visit's intermediates
+    bool q8 = false;        // attention projections and LM head from Q8_0 copies (buffers 13, 14), not BF16
     int workers = 36;       // resident threadgroups (>= 36: 12 per message gate). All must be co-resident for the
                             // grid barriers: 40 (2 per core of the 20-core GPU) is 2% faster but leaves no slack,
                             // and a soak test hit a barrier timeout; 36 keeps 4 threadgroup slots free.
@@ -35,7 +36,8 @@ struct Inkling2DecodeOptions {
 inline std::string inkling2_decode_resident_bf16_source(const Inkling2DecodeOptions& o = {}) {
     std::string defines = std::string("\n#define FRT_WORKERS ") + std::to_string(o.workers) + "u" +
         "\n#define FRT_SAMPLED " + std::to_string(o.sampled ? 1 : 0) +
-        "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) + "\n";
+        "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) +
+        "\n#define FRT_Q8 " + std::to_string(o.q8 ? 1 : 0) + "\n";
     return std::string(metal_preamble) + defines + inkling2_common_msl() + R"MSL(
 static_assert(FRT_WORKERS>=36u,"message gates use threadgroups 0..35 (12 per gate)");
 constant constexpr uint FRT_GROUPS=FRT_WORKERS*8u;        // SIMD groups in the grid
@@ -71,6 +73,35 @@ inline bool grid_sync(device atomic_uint* control,uint tid,thread uint& phase,th
     return ready[0]!=0;
 }
 
+// ------------------------------------------------------------------------------------------ Q8_0 products
+// gemv4 on a Q8_0 copy: 4 rows per SIMD group, lane l takes 8 inputs of every 256 (8 code bytes, the block scale shared
+// by 4 lanes), FP32 sums; q8 table per layer: (codes, scales) of q, k, v, r, gate, o; the LM head after the layers.
+enum : uint { Q8_WQ=0, Q8_WK=2, Q8_WV=4, Q8_WR=6, Q8_WG=8, Q8_WO=10, Q8_LAYER=12 };
+template<uint K,typename XP>
+inline void q8_gemv4(const device uchar* q8,const device ulong* qt,uint row0,XP x,thread float* r,uint lane) {
+    const device char* codes=(const device char*)(q8+qt[0]);
+    const device half* sc=(const device half*)(q8+qt[1]);
+    for(uint tm=0;tm<4;++tm)r[tm]=0.0f;
+    for(uint b=0;b<K;b+=256u) {
+        const uint c=b+lane*8u;
+        float v[8];for(uint i=0;i<8u;++i)v[i]=ld(x,c+i);
+        for(uint tm=0;tm<4;++tm) {
+            const uint2 q=*((const device uint2*)(codes+size_t(row0+tm)*K+c));
+            const float4 lo=float4(as_type<char4>(q.x)),hi=float4(as_type<char4>(q.y));
+            float a=v[0]*lo.x;a=metal::fma(v[1],lo.y,a);a=metal::fma(v[2],lo.z,a);a=metal::fma(v[3],lo.w,a);
+            float bq=v[4]*hi.x;bq=metal::fma(v[5],hi.y,bq);bq=metal::fma(v[6],hi.z,bq);bq=metal::fma(v[7],hi.w,bq);
+            r[tm]=metal::fma(float(sc[size_t(row0+tm)*(K/32u)+c/32u]),a+bq,r[tm]);
+        }
+    }
+    for(uint tm=0;tm<4;++tm)r[tm]=simd_sum(r[tm]);
+}
+template<uint K,typename XP>
+inline void q8_gemv4_out(const device uchar* q8,const device ulong* qt,uint row0,XP x,device ushort* out,uint lane) {
+    float r[4];
+    q8_gemv4<K>(q8,qt,row0,x,r,lane);
+    if(lane<4u)out[row0+lane]=ubf(lane==0u?r[0]:lane==1u?r[1]:lane==2u?r[2]:r[3]);
+}
+
 // ------------------------------------------------------------------------------------------ kernel
 #define FRT_FAIL() {if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);return;}
 #define SYNC() if(!grid_sync(control,tid,phase,ready))FRT_FAIL()
@@ -89,6 +120,10 @@ kernel void inkling2_decode_resident_bf16(
     device float* debug [[buffer(10)]],
     device uint* private_control [[buffer(11)]],
     device uint* diagnostic [[buffer(12)]],
+#if FRT_Q8
+    const device uchar* q8 [[buffer(13)]],
+    const device ulong* q8t [[buffer(14)]],
+#endif
     uint3 group3 [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -276,11 +311,20 @@ kernel void inkling2_decode_resident_bf16(
                 const threadgroup ushort* xv=vx+2u*FH;
                 const uint units=2144u+24u+(full?64u:0u);
                 for(uint u=sg;u<units;u+=FRT_GROUPS) {
+#if FRT_Q8
+                    const device ulong* qt=q8t+layer*Q8_LAYER;
+                    if(u<768u)q8_gemv4_out<FH>(q8,qt+Q8_WQ,u*4u,xq,proj+P_Q,lane);
+                    else if(u<864u)q8_gemv4_out<FH>(q8,qt+Q8_WR,(u-768u)*4u,xq,proj+P_R,lane);
+                    else if(u<1632u)q8_gemv4_out<FH>(q8,qt+Q8_WG,(u-864u)*4u,xq,proj+P_G,lane);
+                    else if(u<1888u)q8_gemv4_out<FH>(q8,qt+Q8_WK,(u-1632u)*4u,xk,proj+P_K,lane);
+                    else if(u<2144u)q8_gemv4_out<FH>(q8,qt+Q8_WV,(u-1888u)*4u,xv,proj+P_V,lane);
+#else
                     if(u<768u)gemv4<FH>(wq,u*4u,xq,proj+P_Q,lane);
                     else if(u<864u)gemv4<FH>(wr,(u-768u)*4u,xq,proj+P_R,lane);
                     else if(u<1632u)gemv4<FH>(wg,(u-864u)*4u,xq,proj+P_G,lane);
                     else if(u<1888u)gemv4<FH>(wk,(u-1632u)*4u,xk,proj+P_K,lane);
                     else if(u<2144u)gemv4<FH>(wv,(u-1888u)*4u,xv,proj+P_V,lane);
+#endif
                     else if(u<2168u) {
                         const uint r=u-2144u;
                         const float v=gemv_bn8_row((const device ushort*)(weights+d[D_WS])+r*FH,FH,xq,lane);
@@ -558,7 +602,12 @@ kernel void inkling2_decode_resident_bf16(
             // ---- output projection
             {
                 const device ushort* wo=(const device ushort*)(weights+d[D_WO]);
+#if FRT_Q8
+                for(uint u=sg;u<576u;u+=FRT_GROUPS)
+                    q8_gemv4_out<FQ>(q8,q8t+layer*Q8_LAYER+Q8_WO,u*4u,(const device ushort*)attn,oproj,lane);
+#else
                 for(uint u=sg;u<576u;u+=FRT_GROUPS)gemv4<FQ>(wo,u*4u,(const device ushort*)attn,oproj,lane);
+#endif
             }
             SYNC();
             // ---- post-attention conv; residual (restarts at a block boundary); MLP input
@@ -740,6 +789,14 @@ kernel void inkling2_decode_resident_bf16(
         {
             const device ushort* head=(const device ushort*)(weights+final[D_HEAD]);
             device float* logits=block_logits+step*FVOCAB;
+#if FRT_Q8
+            for(uint u=sg;u<FVOCAB/4u;u+=FRT_GROUPS) {
+                float r[4];
+                q8_gemv4<FH>(q8,q8t+FLAYERS*Q8_LAYER,u*4u,(const threadgroup ushort*)vx,r,lane);
+                if(lane<4u)logits[u*4u+lane]=metal::precise::tanh(fdiv(rb(lane==0u?r[0]:lane==1u?r[1]:lane==2u?r[2]:r[3]),30.0f))*30.0f;
+            }
+        }
+#else
             for(uint u=sg;u<FVOCAB/4u;u+=FRT_GROUPS) {
                 float r[4]={0.0f,0.0f,0.0f,0.0f};
                 for(uint b=0;b<FH;b+=128u) {
@@ -752,10 +809,13 @@ kernel void inkling2_decode_resident_bf16(
                     }
                 }
                 for(uint tm=0;tm<4;++tm)for(ushort sn=16;sn>=1;sn>>=1)r[tm]+=simd_shuffle_down(r[tm],sn);
-                if(lane==0)for(uint tm=0;tm<4;++tm)
-                    logits[u*4u+tm]=metal::precise::tanh(fdiv(rb(r[tm]),30.0f))*30.0f;
+                // lane 0 holds the sums; lanes 0..3 one softcap each
+                float mine=0.0f;
+                for(uint tm=0;tm<4;++tm){const float v=simd_shuffle(r[tm],ushort(0));if(lane==tm)mine=v;}
+                if(lane<4u)logits[u*4u+lane]=metal::precise::tanh(fdiv(rb(mine),30.0f))*30.0f;
             }
         }
+#endif
         SYNC();
 #if FRT_SAMPLED
         // Fused top-k / top-p: group-local maximum, sum of exponentials and sorted top-K, one barrier, then every
