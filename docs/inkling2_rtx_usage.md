@@ -31,10 +31,10 @@ cmake -B build -DGPU_ARCH=120 -DFLASHRT_ENABLE_INKLING2=ON
 cmake --build build --target flash_rt_inkling2 -j     # flash_rt/flash_rt_inkling2*.so
 ```
 
-A checkpoint with another geometry, layer layout or drafter configuration is
-refused before any weight is loaded; expert formats are checked while loading.
-`INKLING2_PDL=0` launches without programmatic dependent launch (for
-per-kernel profiling).
+A checkpoint with another geometry, layer layout or drafter configuration, or
+with a tensor of another dtype or shape than the kernels index (read from the
+safetensors headers), is refused before any weight is loaded. `INKLING2_PDL=0`
+launches without programmatic dependent launch (for per-kernel profiling).
 
 ## Usage
 
@@ -85,9 +85,11 @@ The kernels by program:
 - **Verification** (2..8 rows): the same per-row arithmetic over staged rows,
   flat expert passes over the distinct experts of the rows, greedy targets,
   acceptance, and a commit of the accepted rows' KV and convolution states.
-- **Prompt chunks** (16..512 rows): projections on cuBLAS (BF16; the router
-  with FP32 sums on TF32 tensor cores, exact for its BF16-valued operands, set
-  explicitly whatever the process defaults), grouped block-scaled MMA experts (`mma.sync` `kind::mxf4nvf4`
+- **Prompt chunks** (16..512 rows): the BF16 projections and the router's
+  FP32 logits on the module's own cuBLAS GEMM (`gemm`: BF16 inputs, FP32
+  accumulation, reduced-precision reductions disallowed, a workspace per
+  runtime; PyTorch's matmul settings are never read or changed), grouped
+  block-scaled MMA experts (`mma.sync` `kind::mxf4nvf4`
   `m16n8k64` for NVFP4, `kind::mxf8f6f4` `m16n8k32` for MXFP8; the checkpoint's
   codes and scale rows load as stored) over the slots sorted by expert, a
   tensor-core attention (BF16 Q K, the relative bias from MMA tables, P V with
@@ -119,61 +121,68 @@ The kernels by program:
   | Prompt | Steps | Path | argmax agreement | KL median | KL max |
   |---|---:|---|---:|---:|---:|
   | review task, 512 tokens | 48 | token steps / exact chunks | 48 / 48 | 1.1e-4 | 8.6e-2 |
-  | | | fast chunks | 47 / 48 | 1.3e-4 | 5.9e-2 |
+  | | | fast chunks | 48 / 48 | 9.7e-5 | 8.8e-2 |
   | | | reference against its own variant | 47 / 48 | 2.5e-4 | 5.0e-2 |
   | Python source, 8192 tokens | 16 | exact chunks | 15 / 16 | 4.4e-4 | 1.1e-1 |
-  | | | fast chunks | 16 / 16 | 3.1e-3 | 1.6e-1 |
+  | | | fast chunks | 15 / 16 | 2.4e-3 | 1.7e-1 |
   | | | reference against its own variant | 14 / 16 | 1.5e-3 | 2.2e-1 |
   | Python source, 32768 tokens | 16 | exact chunks | 16 / 16 | 8.5e-5 | 3.3e-2 |
-  | | | fast chunks | 16 / 16 | 3.2e-5 | 4.3e-2 |
+  | | | fast chunks | 16 / 16 | 5.0e-5 | 2.6e-2 |
   | | | reference against its own variant | 15 / 16 | 1.3e-4 | 2.7e-2 |
 
   The first token after each prompt equals the reference's on every path. Past
   8192 positions the global layers' log-scaled queries take effect (the
-  32768-token row). Summing the router's exact products on FP32 CUDA cores
-  instead of TF32 tensor cores moves the 512-token fast row to KL max 1.8e-1
-  (p90 4.3e-2): the spread of any reordering of the fast path.
+  32768-token row). Reordering only the router's FP32 sums of exact products
+  moves the 512-token fast row between KL p90 1.5e-2 / max 5.9e-2 (TF32 tensor
+  cores) and 4.3e-2 / 1.8e-1 (FP32 CUDA cores), against 4.0e-2 / 8.8e-2 here:
+  the spread of any reordering of the fast path.
 - **KV cache in BF16** (the checkpoint's attention precision); no FP8 KV.
 
 ## Validation
 
 ```bash
-# anywhere (no GPU): configuration and drafter checks, chunk planning, routing
+# anywhere (no GPU): configuration, drafter and tensor checks, chunk planning, routing
 python -m pytest tests/test_inkling2_rtx_contracts.py
-# SM120 GPU, module built: GEMV rows against one-row launches (bit for bit), MMA gate tiles, row limits
+# SM120 GPU, module built: GEMV rows against one-row launches (bit for bit), MMA gate tiles, the GEMM
 python -m pytest tests/test_inkling2_rtx_kernels.py
 # SM120 GPU + checkpoint
 FLASHRT_INKLING2_DIR=/path/to/Inkling-2-Mini python -m pytest tests/test_inkling2_rtx_pipeline.py
 ```
 
+The kernel file also checks the GEMM against FP64 (BF16 and FP32 outputs,
+strided inputs), that its results do not depend on PyTorch's matmul settings,
+and that threads on their own streams get the sequential results bit for bit.
 The pipeline file checks verification rows against decode steps (logits bit for
 bit, acceptance, committed state with a correct and a wrong draft), exact
 prefill against token steps past the sliding window (bit for bit), fast
 prefill against exact prefill for several chunk plans, the grouped MMA experts
-against the flat passes, speculative against plain greedy decoding (both
-prefill modes, widths 2, 4 and 8), stop tokens and lengths, input checks and
-the chat path.
+against the flat passes, that a prefill gives the same logits whatever
+PyTorch's matmul settings are and leaves them unchanged, that a checkpoint
+with a tensor of another dtype or shape is refused before loading, speculative
+against plain greedy decoding (both prefill modes, widths 2, 4 and 8), stop
+tokens and lengths, input checks and the chat path.
 
 ## RTX 5090 results
 
-RTX 5090 (170 SMs, 32 GB), PyTorch 2.9, CUDA 13; batch 1, greedy, DSpark
-width 4. Each row is one process (`examples/inkling2_rtx_benchmark.py`): an
-untimed request, then plain and DSpark interleaved (three runs at 512 tokens,
-two above), 30-60 s between runs and 0.2 s of decode steps before each timed
+RTX 5090 (170 SMs, 32 GB), PyTorch 2.9, CUDA 13; batch 1, greedy, DSpark width
+4. Each row is one process (`examples/inkling2_rtx_benchmark.py`): an untimed
+request, then plain and DSpark interleaved (three runs at 512 tokens, two
+above), 30-60 s between runs and 0.2 s of decode steps before each timed
 request (the GPU at its clocks rather than idle); runs of a row differ by less
-than 0.1 %. Prefill = prompt to first token (with DSpark the drafter context is
-written too: +1.1 ms at 512 tokens, under 1 % from 4096); decode tokens/s = (new tokens - 1) / time from the first
-token to the last, 512 new tokens without stop tokens. The review prompt is
-the default one; the Python-source prompts ask to explain the interpreter's
-standard library (Python 3.12) cut to the length (`--prompt code --isl N`).
+than 0.1 %. Prefill = prompt to first token (with DSpark the drafter context
+is written too: +1.2 ms at 512 tokens, under 1 % from 4096); decode tokens/s =
+(new tokens - 1) / time from the first token to the last, 512 new tokens
+without stop tokens. The review prompt is the default one; the Python-source
+prompts ask to explain the interpreter's standard library (Python 3.12) cut to
+the length (`--prompt code --isl N`).
 
 | Prompt | Prefill | Decode, tok/s | DSpark, tok/s (tokens / step) |
 |---|---:|---:|---:|
-| review task, 512 tokens | 41.8 ms | 178.9 | 221.4 (2.18) |
-| Python source, 4096 tokens | 394 ms | 172.4 | 294.3 (3.14) |
-| Python source, 8192 tokens | 844 ms | 166.7 | 234.0 (2.64) |
-| Python source, 32768 tokens | 4.59 s | 136.2 | 155.9 (2.51) |
-| Python source, 131072 tokens | 37.1 s | 71.9 | 64.3 (2.21) |
+| review task, 512 tokens | 41.5 ms | 179.3 | 214.3 (2.11) |
+| Python source, 4096 tokens | 392 ms | 172.4 | 230.2 (2.42) |
+| Python source, 8192 tokens | 839 ms | 166.2 | 239.9 (2.66) |
+| Python source, 32768 tokens | 4.57 s | 136.3 | 176.1 (2.88) |
+| Python source, 131072 tokens | 37.0 s | 71.9 | 73.2 (2.51) |
 
 Sixteen short requests of each kind (`--suite code` / `--suite general`:
 19-41 prompt tokens, up to 512 new tokens or the end-of-generation token),
@@ -182,28 +191,31 @@ requests):
 
 | Requests | Generated tokens | Decode, tok/s | DSpark, tok/s (tokens / step) |
 |---|---:|---:|---:|
-| code (functions and classes in Python, C, C++, Rust, Go, SQL, ...) | 7369 | 181.5 | 275.6 (2.66; 2.26-3.07) |
-| general (explanations, summaries, arithmetic, letters, stories, ...) | 5516 | 180.3 | 218.6 (2.08; 1.72-2.55) |
+| code (functions and classes in Python, C, C++, Rust, Go, SQL, ...) | 7241 | 181.3 | 273.2 (2.62; 2.21-3.26) |
+| general (explanations, summaries, arithmetic, letters, stories, ...) | 5454 | 179.5 | 215.4 (2.05; 1.71-2.75) |
 
 Every DSpark run returned exactly the plain greedy tokens.
 
 - **Decode.** At 512 tokens of context a step reads about 5.6 GB: BF16
   attention, projections, gates and LM head 3.8 GB (the looped layers are read
   once per pass), the eight experts of each of the 48 layer visits 1.8 GB. At
-  the 5090's 1.79 TB/s that is 3.1 ms; a step takes 5.59 ms. With context the
+  the 5090's 1.79 TB/s that is 3.1 ms; a step takes 5.58 ms. With context the
   global layers' KV adds 32 KiB per token per step (4.3 GB at 128K, a 5.5 ms
   floor against the step's 13.9 ms).
-- **DSpark.** The accepted length depends on the text (2.1-3.1 tokens per step
-  above). A speculative step costs 1.8 plain steps at 512 tokens of context and
-  2.5 at 128K (34.4 ms against 13.9 ms), where it is slower than plain
-  decoding: the verification's attention reads the context's KV once per
-  verified row, and the drafter's full-attention layer once per block
-  position.
-- **Prefill.** 512 tokens: 19.4 ms in the expert MMAs, 9.9 ms in the cuBLAS
-  projections, 3.3 ms in the layer-visit boundaries, 2.9 ms in attention, 1.4
-  ms after attention (eager per-kernel times). Long prompts are bound by the
-  global layers' attention (12.3K prompt tokens/s at 512, 3.5K at 128K). The
-  exact path takes 0.71 s for 512 tokens, 12.6 s for 8192 and 61 s for 32768.
+- **DSpark.** The accepted length depends on the text, and on one prompt on the
+  continuation the prefill's rounding leads to: reordering only the prefill's
+  sums moved the 4096-token prompt from 3.14 to 2.42 tokens per step (the
+  suites average over sixteen requests). A speculative step costs 1.8 plain
+  steps at 512 tokens of context and 2.5 at 128K (34.3 ms against 13.9 ms),
+  where DSpark only matches plain decoding: the verification's attention reads
+  the context's KV once per verified row, and the drafter's full-attention
+  layer once per block position.
+- **Prefill.** 512 tokens: 19.9 ms in the expert MMAs, 10.2 ms in the GEMMs,
+  3.5 ms in attention, 3.3 ms in the layer-visit boundaries, 1.4 ms after
+  attention, 3.4 ms in the rest (eager per-kernel times). Long prompts are
+  bound by the global layers' attention (12.3K prompt tokens/s at 512, 3.5K at
+  128K). The exact path takes 0.71 s for 512 tokens, 12.6 s for 8192 and 61 s
+  for 32768.
 
 ## Memory
 
@@ -211,10 +223,10 @@ Every DSpark run returned exactly the plain greedy tokens.
 |---|---:|
 | Text decoder weights (non-expert BF16 / FP32 3.0 GiB, NVFP4 / MXFP8 experts 14.6 GiB) | 17.6 GiB |
 | DSpark drafter weights | 0.6 GiB |
-| Derived copies: FP32 router, E4M3 LM head and folded drafter correction | 0.6 GiB |
+| Derived copies: E4M3 LM head, folded drafter correction | 0.6 GiB |
 | KV per token of `max_seq`: global layers 32 KiB, drafter 12 KiB | 44 KiB |
 | Sliding-window rings (40 layer visits x 1024 slots), fixed | 160 MiB |
-| PyTorch peak allocation, `max_seq` 4096 / 36864 / 132096 | 20.3 / 21.6 / 25.7 GiB |
+| PyTorch peak allocation, `max_seq` 4096 / 36864 / 132096 | 20.3 / 21.5 / 25.7 GiB |
 
 ```bash
 python examples/inkling2_rtx_benchmark.py --checkpoint /path/to/Inkling-2-Mini --new 512 --reps 3

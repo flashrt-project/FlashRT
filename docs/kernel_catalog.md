@@ -327,7 +327,7 @@ outside `1..MAX_ROWS` (per-row programs) or `1..MAX_CHUNK` (prompt chunks). See
 
 | Group | Symbols | What it is |
 |---|---|---|
-| Products | `gemv_multi`, `norm_rows` | Several BF16 GEMVs per launch over 1-8 rows (RMSNorm / gate prologues, BF16 or FP32 out, per-row arithmetic independent of the row count); RMSNorm of up to 512 rows |
+| Products | `gemv_multi`, `norm_rows`, `gemm` | Several BF16 GEMVs per launch over 1-8 rows (RMSNorm / gate prologues, BF16 or FP32 out, per-row arithmetic independent of the row count); RMSNorm of up to 512 rows; `C = A B^T` for prompt chunks on a cuBLAS handle of the module (BF16 inputs, FP32 accumulation, reduced-precision reductions disallowed, caller's workspace), independent of PyTorch's matmul settings |
 | Layer visit | `visit_boundary`, `post_attention`, `gate_mix` | Depth attention over the block residuals with the previous visit's expert combine, message gates between passes of the looped layers (per-row kernel, MMA tiles above 8 rows), post-attention convolution and residual |
 | Attention | `kv_rows`, `attn_decode`, `attn_flash` | K / V convolutions, L2 clips, V norm and staged KV rows; split-key decode / verification attention with relative bias, sinks and the output gate; tensor-core prompt attention (BF16 Q K, bias from MMA tables, P V in two FP16 parts) |
 | Experts, per row | `expert_w13`, `expert_w2`, `expert_route`, `expert_w13_flat`, `expert_act_quant`, `expert_w2_flat` | Routing (sigmoid + bias top-8), NVFP4 (`fouroversix_mae`) / MXFP8 input quantization, exact FP4 / FP8 block products: fused for one row, flat passes over the distinct experts of up to 8 rows |
