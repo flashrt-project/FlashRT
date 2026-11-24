@@ -80,3 +80,82 @@ def test_row_limits_are_enforced():
         ik.attn_flash(dict(rows=ik.MAX_CHUNK + 1, sliding=1, q_pre=16, rel_t=16, stage_kv=16), s)
     with pytest.raises(ValueError, match="at most 8 rows"):
         ik.lm_head(dict(rows=ik.MAX_ROWS + 1, blocks=1), s)
+
+
+def _gemm(a, b, c, ws, s):
+    ik.gemm(dict(m=a.shape[0], n=b.shape[0], k=a.shape[1], a=P(a), lda=a.stride(0), b=P(b), ldb=b.stride(0), c=P(c),
+                 ldc=c.stride(0), out_f32=int(c.dtype == torch.float32), workspace=P(ws), workspace_bytes=ws.numel()),
+            s)
+
+
+def _torch_matmul_flags():
+    mm = torch.backends.cuda.matmul
+    return mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction
+
+
+@pytest.mark.parametrize("m,n,k,out", [(512, 3072, 2304, torch.float32), (512, 1024, 2304, torch.bfloat16),
+                                       (17, 128, 2304, torch.float32), (40, 64, 4608, torch.bfloat16)])
+def test_gemm_against_fp64(m, n, k, out):
+    """C = A B^T (BF16 inputs, FP32 sums), A as a row slice of a wider tensor (lda > k)."""
+    torch.manual_seed(0)
+    wide = torch.randn(m, k + 64, device="cuda").bfloat16()
+    a, b = wide[:, :k], (torch.randn(n, k, device="cuda") * 0.05).bfloat16()
+    c = torch.empty(m, n, device="cuda", dtype=out)
+    ws = torch.empty(ik.GEMM_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8)
+    _gemm(a, b, c, ws, torch.cuda.current_stream().cuda_stream)
+    ref = a.double() @ b.double().t()
+    scale = a.double().abs() @ b.double().abs().t()          # the FP32 sums' error bound scales with sum |a b|
+    bound = 1e-5 * scale + (2.0 ** -8 * ref.abs() if out == torch.bfloat16 else 0.0)
+    assert ((c.double() - ref).abs() <= bound).all()
+
+
+def test_gemm_does_not_read_or_change_torch_matmul_settings():
+    torch.manual_seed(0)
+    a, b = torch.randn(512, 2304, device="cuda").bfloat16(), torch.randn(3072, 2304, device="cuda").bfloat16()
+    ws = torch.empty(ik.GEMM_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8)
+    s, mm = torch.cuda.current_stream().cuda_stream, torch.backends.cuda.matmul
+    saved, out = _torch_matmul_flags(), []
+    try:
+        for fp32, reduced in (("ieee", False), ("tf32", True)):
+            mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction = fp32, reduced
+            for dt in (torch.float32, torch.bfloat16):
+                c = torch.empty(512, 3072, device="cuda", dtype=dt)
+                _gemm(a, b, c, ws, s)
+                out.append(c)
+            assert _torch_matmul_flags() == (fp32, reduced)
+    finally:
+        mm.fp32_precision, mm.allow_bf16_reduced_precision_reduction = saved
+    assert torch.equal(out[0], out[2]) and torch.equal(out[1], out[3])
+
+
+def test_gemm_from_concurrent_threads():
+    """Several threads on their own streams and workspaces: every result equals the sequential one bit for bit."""
+    import threading
+    torch.manual_seed(0)
+    a, b = torch.randn(256, 2304, device="cuda").bfloat16(), torch.randn(1024, 2304, device="cuda").bfloat16()
+    ws0 = torch.empty(ik.GEMM_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8)
+    ref = torch.empty(256, 1024, device="cuda")
+    _gemm(a, b, ref, ws0, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    flags, errors = _torch_matmul_flags(), []
+
+    def work():
+        try:
+            st = torch.cuda.Stream()
+            ws = torch.empty(ik.GEMM_WORKSPACE_BYTES, device="cuda", dtype=torch.uint8)
+            outs = [torch.empty(256, 1024, device="cuda") for _ in range(20)]
+            for c in outs:
+                _gemm(a, b, c, ws, st.cuda_stream)
+            st.synchronize()
+            if not all(torch.equal(c, ref) for c in outs):
+                errors.append("a result differs from the sequential one")
+        except Exception as e:  # pragma: no cover - reported below
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=work) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert _torch_matmul_flags() == flags

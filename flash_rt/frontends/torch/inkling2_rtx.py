@@ -23,11 +23,13 @@ Text only (the vision tower is not loaded), greedy, one sequence. Constructed di
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence
 
 import torch
 
-from flash_rt.frontends.torch._inkling2_rtx_runtime import Inkling2RtxRuntime, read_config, visit_count
+from flash_rt.frontends.torch._inkling2_rtx_runtime import (
+    Inkling2RtxRuntime, check_tensors, read_config, safetensors_header, visit_count)
 from flash_rt.models.flint.tokenizer import FlintTokenizer as _JsonTokenizer   # model-independent tokenizer.json
 
 __all__ = ["Inkling2TorchFrontendRtx", "compile_chat_template"]
@@ -79,10 +81,14 @@ class Inkling2TorchFrontendRtx:
             raise ValueError(f"prefill must be one of {PREFILL_MODES}")
         if check_block < 1 or check_rounds < 1:
             raise ValueError("check_block and check_rounds must be positive")
-        if speculative:   # the drafter's configuration, before any weight is loaded
-            from flash_rt.frontends.torch._inkling2_rtx_mtp import check_mtp_config
+        if speculative:   # the drafter's configuration and tensors, before any weight is loaded
+            from flash_rt.frontends.torch._inkling2_rtx_mtp import check_mtp_config, expected_mtp_tensors
             raw, text = read_config(checkpoint_dir)
             check_mtp_config(raw, visit_count(text))
+            mtp = Path(checkpoint_dir) / "mtp.safetensors"
+            if not mtp.is_file():
+                raise FileNotFoundError(f"{mtp} not found (the DSpark drafter)")
+            check_tensors(safetensors_header(mtp), expected_mtp_tensors(text["vocab_size"]), "drafter weights")
         self.rt = Inkling2RtxRuntime(checkpoint_dir, max_seq=max_seq, device=device)
         self.cfg = self.rt.c
         self.vocab = self.rt.vocab

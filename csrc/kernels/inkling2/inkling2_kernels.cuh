@@ -367,5 +367,22 @@ struct CommitParams {
 constexpr int kCommitRows = 16;
 void commit(const CommitParams& p, cudaStream_t stream);
 
+// ---- dense products (inkling2_gemm.cu): C [m][n] = A [m][k] B [n][k]^T, BF16 inputs, FP32 accumulation, BF16 or
+// FP32 output, on a cuBLAS handle of this module (precision fixed here); the caller owns the workspace.
+constexpr size_t kGemmWorkspaceBytes = size_t(32) << 20;
+struct GemmParams {
+  int m, n, k;
+  const void* a;
+  int lda;
+  const void* b;
+  int ldb;
+  void* c;
+  int ldc;
+  int out_f32;
+  void* workspace;
+  size_t workspace_bytes;
+};
+void gemm_bf16(const GemmParams& p, cudaStream_t stream);
+
 }  // namespace inkling2
 }  // namespace flash_rt

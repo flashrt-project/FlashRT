@@ -1918,7 +1918,8 @@ if(FLASHRT_ENABLE_INKLING2)
     csrc/kernels/inkling2/inkling2_moe_mma.cu
     csrc/kernels/inkling2/inkling2_lmhead.cu
     csrc/kernels/inkling2/inkling2_spec.cu
-    csrc/kernels/inkling2/inkling2_mtp.cu)
+    csrc/kernels/inkling2/inkling2_mtp.cu
+    csrc/kernels/inkling2/inkling2_gemm.cu)
   set_target_properties(flash_rt_inkling2 PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
@@ -1931,7 +1932,7 @@ if(FLASHRT_ENABLE_INKLING2)
       --expt-relaxed-constexpr -O3
       ${GPU_GENCODE}
     >)
-  target_link_libraries(flash_rt_inkling2 PRIVATE CUDA::cudart)
+  target_link_libraries(flash_rt_inkling2 PRIVATE CUDA::cudart CUDA::cublas)
   install(TARGETS flash_rt_inkling2 LIBRARY DESTINATION flash_rt)
   message(STATUS "Inkling-2-Mini kernels: ENABLED (separate module flash_rt_inkling2)")
 else()

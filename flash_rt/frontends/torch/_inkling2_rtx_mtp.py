@@ -23,8 +23,8 @@ from typing import Iterator, List
 import torch
 
 from flash_rt.frontends.torch._inkling2_rtx_runtime import (
-    BF16, F32, I32, D, HD, HKV, Inkling2ConfigError, Inkling2RtxRuntime, P, _require_module,
-    matmul_precision)
+    BF16, F32, I32, D, HD, HKV, Inkling2ConfigError, Inkling2RtxRuntime, P, _require_module, check_tensors,
+    gemm_call, safetensors_header)
 
 MTP_GEOMETRY = {
     "hidden_size": 2304, "num_hidden_layers": 3, "num_attention_heads": 24, "num_key_value_heads": 8,
@@ -49,6 +49,25 @@ def check_mtp_config(raw: dict, visits: int) -> dict:
     return m
 
 
+def expected_mtp_tensors(vocab_size: int) -> dict:
+    """The drafter tensors the kernels read (``mtp.safetensors``): (safetensors dtype, shape)."""
+    bf = "BF16"
+    t = {"fuse_weight": (bf, (4, 4)), "mask_embed": (bf, (D,)), "norm.weight": (bf, (D,)),
+         "markov_head.dflare_norm.weight": (bf, (D,)), "markov_head.hidden_out.weight": (bf, (D, RANK)),
+         "markov_head.hidden_out.bias": (bf, (D,)), "markov_head.markov_w1.weight": (bf, (vocab_size, RANK)),
+         "markov_head.rnn_proj.weight": (bf, (3 * RANK, 2 * RANK + 2 * D)), "markov_head.rnn_proj.bias": (bf, (3 * RANK,))}
+    for l in range(LAYERS):
+        p, a = f"layers.{l}.", f"layers.{l}.self_attn."
+        t.update({p + n: (bf, (D,)) for n in ("dflare_norm.weight", "input_layernorm.weight",
+                                              "post_attention_layernorm.weight")})
+        t.update({p + "mlp.gate_proj.weight": (bf, (INTER, D)), p + "mlp.up_proj.weight": (bf, (INTER, D)),
+                  p + "mlp.down_proj.weight": (bf, (D, INTER)), a + "q_proj.weight": (bf, (HQ * HD, D)),
+                  a + "o_proj.weight": (bf, (D, HQ * HD))})
+        t.update({a + f"{n}.weight": (bf, (HKV * HD, D)) for n in ("k_proj", "v_proj", "k_proj_ctx", "v_proj_ctx")})
+        t.update({a + f"{n}.weight": (bf, (HD,)) for n in ("q_norm", "k_norm", "k_norm_ctx")})
+    return t
+
+
 class Inkling2RtxDrafter:
     """DSpark speculative decoding over an :class:`Inkling2RtxRuntime` (greedy, one sequence).
 
@@ -71,9 +90,11 @@ class Inkling2RtxDrafter:
         path = Path(rt.dir) / "mtp.safetensors"
         if not path.is_file():
             raise FileNotFoundError(f"{path} not found (the DSpark drafter)")
+        expected = expected_mtp_tensors(rt.c["vocab_size"])
+        check_tensors(safetensors_header(path), expected, "drafter weights")
         from safetensors import safe_open
         with safe_open(str(path), "pt", device=str(dev)) as st:
-            w = {k: st.get_tensor(k) for k in st.keys()}
+            w = {k: st.get_tensor(k) for k in expected}
         for l in range(LAYERS):              # down projections split along k (two FP32 partial sums)
             dn = w.pop(f"layers.{l}.mlp.down_proj.weight")
             w[f"layers.{l}.down_a"] = dn[:, :INTER // 2].contiguous()
@@ -83,13 +104,18 @@ class Inkling2RtxDrafter:
         self.alpha = torch.softmax(w["fuse_weight"].float(), -1).to(BF16).float().reshape(-1).tolist()
         head = rt.w["unembed.weight"]
         V = head.shape[0]
-        hw, hb = w["markov_head.hidden_out.weight"].float(), w["markov_head.hidden_out.bias"].float()
+        # the folded correction W_lm @ hidden_out (and its bias) in FP32 sums of exact BF16 products, then BF16
+        hw_t = w["markov_head.hidden_out.weight"].t().contiguous()            # [RANK][D]
+        hb = w["markov_head.hidden_out.bias"].reshape(1, D)
         self.fold_w, self.fold_b = z(V, RANK), z(V)
-        with torch.no_grad(), matmul_precision("ieee"):
-            for s in range(0, V, 16384):
-                rows = head[s:s + 16384].float()
-                self.fold_w[s:s + 16384] = (rows @ hw).to(BF16)
-                self.fold_b[s:s + 16384] = (rows @ hb).to(BF16)
+        acc_w, acc_b = z(16384, RANK, dt=F32), z(16384, 1, dt=F32)
+        for s in range(0, V, 16384):
+            n = min(16384, V - s)
+            rt._run([gemm_call(head[s:s + n], hw_t, acc_w[:n], rt.gemm_ws),
+                     gemm_call(head[s:s + n], hb, acc_b[:n], rt.gemm_ws)])
+            self.fold_w[s:s + n] = acc_w[:n].to(BF16)
+            self.fold_b[s:s + n] = acc_b[:n, 0].to(BF16)
+        del acc_w, acc_b
         if fp8:
             self.head8, self.head_scale = self._e4m3_rows(head)
             self.fold8, self.fold_scale = self._e4m3_rows(self.fold_w)
@@ -157,7 +183,7 @@ class Inkling2RtxDrafter:
             a = f"layers.{l}.self_attn."
             for i, n in enumerate(("k", "v")):
                 if rows > BLOCK:
-                    calls.append(("mm", x[l], w[a + f"{n}_proj_ctx.weight"], kvc[l, i]))
+                    calls.append(gemm_call(x[l], w[a + f"{n}_proj_ctx.weight"], kvc[l, i], rt.gemm_ws))
                 else:
                     tasks.append((P(w[a + f"{n}_proj_ctx.weight"]), P(x[l]), P(kvc[l, i]), HKV * HD, D, 0, 0,
                                   ik.GEMV_PLAIN, 0, BLOCK))

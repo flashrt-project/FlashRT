@@ -350,6 +350,26 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
 #undef MTP_DEF
   m.attr("MTP_PICK_BLOCKS") = ik::mtp_pick_blocks();
 
+  // C [m][n] = A [m][k] B [n][k]^T: a, b BF16, c BF16 (out_f32 = 0) or FP32; lda / ldb / ldc row strides in elements
+  m.attr("GEMM_WORKSPACE_BYTES") = ik::kGemmWorkspaceBytes;
+  m.def("gemm", [](const py::dict& d, uintptr_t stream) {
+    ik::GemmParams p = {};
+    p.m = dint(d, "m");
+    p.n = dint(d, "n");
+    p.k = dint(d, "k");
+    p.a = dptr<const void>(d, "a");
+    p.lda = dint(d, "lda");
+    p.b = dptr<const void>(d, "b");
+    p.ldb = dint(d, "ldb");
+    p.c = dptr<void>(d, "c");
+    p.ldc = dint(d, "ldc");
+    p.out_f32 = dint(d, "out_f32");
+    p.workspace = dptr<void>(d, "workspace");
+    p.workspace_bytes = d.contains("workspace_bytes") ? d["workspace_bytes"].cast<size_t>() : 0;
+    py::gil_scoped_release release;   // the module's handle is locked inside; callers on other threads may proceed
+    ik::gemm_bf16(p, to_stream(stream));
+  });
+
   m.def("lm_head", [](const py::dict& d, uintptr_t stream) {
     ik::LmHeadParams p = {};
     p.rows = dint(d, "rows", 1);
