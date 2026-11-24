@@ -10,7 +10,10 @@ Per run: prefill seconds (every prompt to its first token, sequence by sequence:
 decode seconds / tokens per second after every sequence has its first token, aggregate and per sequence. Plain
 decoding: the resident decode step (C = 1, blocks of eight tokens) or the batched row program (one row per
 sequence per step). ``--mtp``: DSpark drafting with greedy verification (verify widths by C, see
-``Inkling2Runtime.mtp_widths``). Run 0 is a warm-up; the median of the others is printed per C.
+``Inkling2Runtime.mtp_widths``); ``--verify`` picks the verification of one sequence (fast: the resident step with
+its own summation order, exact: the resident step with the decode step's arithmetic, rows: the row programs).
+``--q8``: attention projections and LM head from Q8_0 copies (not the checkpoint's numerics). Run 0 is a warm-up;
+the median of the others is printed per C.
 """
 from __future__ import annotations
 
@@ -51,7 +54,12 @@ def main():
     ap.add_argument("--gen", type=int, default=1024)
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--mtp", action="store_true", help="DSpark speculative decoding")
+    ap.add_argument("--verify", choices=("fast", "exact", "rows"), default="fast",
+                    help="verification of one sequence with --mtp (C = 1)")
+    ap.add_argument("--q8", action="store_true", help="Q8_0 attention projections and LM head")
     args = ap.parse_args()
+    if args.q8 and args.verify == "exact":
+        ap.error("--verify exact repeats the BF16 decode step; not with --q8")
     if args.make_corpus:
         return make_corpus(args)
     if not args.corpus:
@@ -66,7 +74,8 @@ def main():
     chunks = [c for c in (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1) if c <= P]
     rt = Inkling2Runtime(args.model, max_seq=P + G + 16, sequences=max(concs), row_capacity=max(chunks[0], max(concs)),
                          row_shapes=[(1, 1)] if args.mtp else [(c, 1) for c in chunks] + [(c, c) for c in concs if c > 1],
-                         mtp_batches=concs if args.mtp else (), mtp_prefill=chunks if args.mtp else ())
+                         mtp_batches=concs if args.mtp else (), mtp_prefill=chunks if args.mtp else (), q8=args.q8)
+    rt.mtp_verify = {"fast": "fast", "exact": "resident", "rows": "rows"}[args.verify]
     results = {}
     for C in concs:
         rows = []
@@ -79,7 +88,9 @@ def main():
                 rt.mtp_generate(prompts, G, stats)
                 decode = stats["decode_s"]
                 prefill = time.perf_counter() - t0 - decode
-                extra = {"tokens_per_step": round(stats["tokens_per_step"], 3)}
+                extra = {"tokens_per_step": round(stats["tokens_per_step"], 3),
+                         "step_ms": round(1e3 * decode / stats["steps"], 2),
+                         "verify_ms": round(stats["verify_ms_per_step"], 2), "draft_ms": round(stats["draft_ms_per_step"], 2)}
             else:
                 t0 = time.perf_counter()
                 first = [rt.prefill(p, seq=s) for s, p in enumerate(prompts)]
@@ -97,7 +108,9 @@ def main():
                 decode, prefill, extra = time.perf_counter() - t1, t1 - t0, {}
             n_tok = (G - 1) * C
             row = dict(prefill_s=prefill, decode_s=decode, agg_tps=n_tok / decode, per_seq_tps=n_tok / decode / C)
-            print(json.dumps({"conc": C, "rep": rep, "mtp": args.mtp, **{k: round(v, 3) for k, v in row.items()},
+            verify = (args.verify if C == 1 else "rows") if args.mtp else None   # several sequences: row programs
+            print(json.dumps({"conc": C, "rep": rep, "mtp": args.mtp, "verify": verify,
+                              "q8": args.q8, **{k: round(v, 3) for k, v in row.items()},
                               **extra}), flush=True)
             if rep:
                 rows.append(row)

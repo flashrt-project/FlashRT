@@ -6,8 +6,11 @@ short convolutions and a 128-expert MoE. The released checkpoint is used as is: 
 NVFP4 experts in layers 0-19 and MXFP8 in 20-23, copied byte for byte into one Metal buffer and run by FlashRT's
 own Metal programs: chunked prefill row programs and a resident decode step that produces up to eight tokens per
 dispatch and reproduces mlx-lm's logits bit for bit. With ``speculative=True`` the checkpoint's DSpark drafter
-(``mtp.safetensors``) proposes blocks of tokens that the target verifies (greedy; the output is the target's
-greedy continuation up to near-ties in the verification's rounding).
+(``mtp.safetensors``) proposes blocks of tokens that the target verifies in one resident step over the 8 rows
+(greedy): ``verify="fast"`` (default) sums the products in its own order (half-precision code products, results
+within the rounding of the decode step's); ``verify="exact"`` repeats the decode step's arithmetic on every row, so
+the output is the greedy decode's continuation bit for bit; ``verify="rows"`` uses the row programs. ``q8=True``
+runs the attention projections and the LM head from Q8_0 copies made at load (faster, not the checkpoint's numerics).
 
     from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
     fe = Inkling2TorchFrontendMps("<path-to-Inkling-2-Mini>", max_seq=8192)
@@ -29,19 +32,26 @@ from flash_rt.models.flint.tokenizer import FlintTokenizer as _JsonTokenizer
 __all__ = ["Inkling2TorchFrontendMps"]
 
 PREFILL_CHUNKS = (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+VERIFY = {"fast": "fast", "exact": "resident", "rows": "rows"}     # speculative verification -> runtime program
 
 
 class Inkling2TorchFrontendMps:
     """Generation over the native inkling2_loop Metal runtime (one sequence)."""
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, speculative: bool = False,
-                 chat_template: Optional[str] = None, library: Optional[str] = None):
+                 chat_template: Optional[str] = None, library: Optional[str] = None, verify: str = "fast",
+                 q8: bool = False):
+        if verify not in VERIFY:
+            raise ValueError(f"verify must be one of {sorted(VERIFY)}")
+        if q8 and verify == "exact":
+            raise ValueError("verify='exact' repeats the BF16 decode step; it is not available with q8")
         shapes = [(c, 1) for c in PREFILL_CHUNKS]
         self.speculative = bool(speculative)
         self.rt = Inkling2Runtime(checkpoint_dir, max_seq=max_seq, library=library, row_capacity=PREFILL_CHUNKS[0],
                                   row_shapes=[(1, 1)] if self.speculative else shapes,
                                   mtp_batches=[1] if self.speculative else (),
-                                  mtp_prefill=PREFILL_CHUNKS if self.speculative else ())
+                                  mtp_prefill=PREFILL_CHUNKS if self.speculative else (), q8=q8)
+        self.rt.mtp_verify = VERIFY[verify]
         self.cfg = self.rt.cfg
         self.tokenizer = _JsonTokenizer.from_directory(checkpoint_dir, chat_template=chat_template)
         self.eog = set(self.cfg.eos_token_ids)
