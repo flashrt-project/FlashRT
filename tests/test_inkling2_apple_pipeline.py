@@ -79,14 +79,104 @@ def test_chunked_prefill_agrees_with_one_chunk(tokens):
 
 
 def test_speculative_decoding_follows_greedy(tokens):
+    """With the exact verification the speculative output is the greedy decode's (the prompt prefilled by the same
+    chunk programs). The fast verification follows it up to a near-tie: where they part, the greedy step's two
+    leading logits are within 0.5."""
     from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
-    plain = Inkling2TorchFrontendMps(CKPT, max_seq=256)
-    want = plain.generate(tokens, max_new_tokens=8, stop_ids=())
-    plain.rt.close()
-    spec = Inkling2TorchFrontendMps(CKPT, max_seq=256, speculative=True)
-    got = spec.generate(tokens, max_new_tokens=8, stop_ids=())
-    spec.rt.close()
-    assert got == want
+    spec = Inkling2TorchFrontendMps(CKPT, max_seq=256, speculative=True, verify="exact")
+    n = 24
+    try:
+        got = spec.generate(tokens, max_new_tokens=n, stop_ids=())
+        rt = spec.rt
+        tok = rt.prefill(list(tokens), features=True)
+        want, pos = [tok], len(tokens)
+        while len(want) < n:
+            out = rt.decode(want[-1], pos, min(8, n - len(want)))
+            want += out
+            pos += len(out)
+        assert got == want
+        rt.mtp_verify = "fast"
+        fast = spec.generate(tokens, max_new_tokens=n, stop_ids=())
+        part = next((i for i, (a, b) in enumerate(zip(fast, want)) if a != b), n)
+        assert part >= 4
+        if part < n:
+            rt.prefill(list(tokens), features=True)
+            for i in range(part):
+                rt.decode(want[i], len(tokens) + i, 1)
+            lg = rt.plan.read(rt.buf["logits"], 0, np.float32, rt.cfg.vocab_size)[:rt.cfg.unpadded_vocab_size]
+            top = np.sort(lg)[-2:]
+            assert top[1] - top[0] < 0.5
+    finally:
+        spec.rt.close()
+
+
+def test_resident_verification_matches_decode_steps(tokens):
+    """The exact resident verification of 8 rows repeats the decode step's arithmetic: its logits equal those of 8
+    one-row decode steps at the same positions bit for bit. The fast verification selects the same tokens here,
+    and its logits stay closer to the exact ones than the row program's (the shipped verification's) do, row by row
+    in the maximum and the mean KL (an evaluation side by side, no fixed threshold)."""
+    ids = (list(tokens) * 3)[:40]
+    rt = _runtime(max_seq=128, row_capacity=32, row_shapes=[(32, 1), (1, 1), (8, 8)], mtp_batches=[1])
+    try:
+        V, L, R = rt.cfg.vocab_size, 32, 8
+        t0 = rt.prefill(ids[:L])
+        rows = [t0] + ids[L:L + R - 1]
+        exact = rt.verify_resident(rows, L)
+        lg = rt.plan.read(rt.buf["r_logits"], 0, np.float32, R * V).reshape(R, V).copy()
+        fast = rt.verify_resident(rows, L, kind="fast")
+        lf = rt.plan.read(rt.buf["r_logits"], 0, np.float32, R * V).reshape(R, V).copy()
+        ref = []
+        for r in range(R):
+            rt.decode(rows[r], L + r, 1)
+            ref.append(rt.plan.read(rt.buf["logits"], 0, np.float32, V).copy())
+        ref = np.stack(ref)
+        assert np.array_equal(lg.view(np.uint32), ref.view(np.uint32))
+        assert exact.tolist() == [int(np.argmax(r[:rt.cfg.unpadded_vocab_size])) for r in ref]
+        assert fast.tolist() == exact.tolist()
+        # the row program on the same rows (after the decode steps: it reads the same caches below L)
+        rt.run_rows(rows, np.array([[0, L + j, L, L + R - 1] for j in range(R)], np.uint32), R)
+        lr = rt.plan.read(rt.buf["r_logits"], 0, np.float32, R * V).reshape(R, V).copy()
+        vu = rt.cfg.unpadded_vocab_size
+
+        def kl(a, b):
+            p = a[:, :vu].astype(np.float64); q = b[:, :vu].astype(np.float64)
+            p -= p.max(1, keepdims=True); q -= q.max(1, keepdims=True)
+            lp = p - np.log(np.exp(p).sum(1, keepdims=True)); lq = q - np.log(np.exp(q).sum(1, keepdims=True))
+            return (np.exp(lp) * (lp - lq)).sum(1)
+        kf, kr = kl(lg, lf), kl(lg, lr)
+        assert kf.max() <= kr.max() and kf.mean() <= kr.mean(), (kf, kr)
+    finally:
+        rt.close()
+
+
+def test_q8_decode_stays_close(tokens):
+    """The Q8_0 option (attention projections and LM head from Q8_0 copies) against the BF16 step, teacher forced on
+    the BF16 greedy continuation."""
+    ids = list(tokens)
+    rt = _runtime(max_seq=96, row_capacity=32, row_shapes=[(32, 1), (1, 1)])
+    try:
+        V, vu = rt.cfg.vocab_size, rt.cfg.unpadded_vocab_size
+        tok = rt.prefill(ids)
+        seq, ref = [tok], []
+        for i in range(8):
+            nxt = rt.decode(seq[-1], len(ids) + i, 1)[0]
+            ref.append(rt.plan.read(rt.buf["logits"], 0, np.float32, V)[:vu].copy())
+            seq.append(nxt)
+    finally:
+        rt.close()
+    rq = _runtime(max_seq=96, row_capacity=32, row_shapes=[(32, 1), (1, 1)], q8=True)
+    try:
+        assert rq.prefill(ids) == tok
+        kls = []
+        for i in range(8):
+            rq.decode(seq[i], len(ids) + i, 1)
+            q = rq.plan.read(rq.buf["logits"], 0, np.float32, V)[:vu].astype(np.float64)
+            p = ref[i].astype(np.float64)
+            lp = p - p.max(); lp -= np.log(np.exp(lp).sum()); lq = q - q.max(); lq -= np.log(np.exp(lq).sum())
+            kls.append(float((np.exp(lp) * (lp - lq)).sum()))
+        assert max(kls) < 0.05 and float(np.mean(kls)) < 0.01
+    finally:
+        rq.close()
 
 
 def test_chat_and_input_checks():
