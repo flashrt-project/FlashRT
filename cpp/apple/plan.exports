@@ -12,6 +12,7 @@ _frt_apple_plan_profile_program
 _frt_apple_plan_program
 _frt_apple_plan_read
 _frt_apple_plan_residency
+_frt_apple_plan_residency_shared
 _frt_apple_plan_run_program
 _frt_apple_plan_run_timed
 _frt_apple_plan_write

@@ -21,6 +21,7 @@ struct Plan {
     std::vector<std::vector<Operation>> programs;
     std::vector<Pipeline> program_pipelines;
     std::size_t recording = 0;                   // program receiving dispatch/copy operations
+    std::unique_ptr<Residency> residency;        // one set for every program (frt_apple_plan_residency_shared)
     std::vector<Operation>& current() { return recording ? programs.at(recording - 1) : operations; }
 };
 void require(bool c,const char* m) { if(!c) throw std::invalid_argument(m); }
@@ -105,6 +106,16 @@ int frt_apple_plan_residency(void* p,uint32_t enabled) {
         require(x.sealed && enabled<=1,"invalid residency request");
         if(x.pipeline) x.pipeline->set_resident(enabled);
         for(const auto& program:x.program_pipelines) program.set_resident(enabled);});
+}
+int frt_apple_plan_residency_shared(void* p,uint32_t enabled) {
+    return guard([&]{auto& x=checked(p);std::lock_guard<std::mutex> lock(x.mutex);
+        require(x.sealed && enabled<=1,"invalid residency request");
+        if(!enabled){x.residency.reset();return;}
+        if(x.residency)return;
+        std::vector<const Pipeline*> all;
+        if(x.pipeline) all.push_back(x.pipeline.get());
+        for(const auto& program:x.program_pipelines) all.push_back(&program);
+        x.residency=std::make_unique<Residency>(all);});
 }
 int frt_apple_plan_run_program(void* p,uint32_t program,uint32_t mode,frt_apple_plan_timing* timing) {
     return guard([&]{auto& x=checked(p);std::lock_guard<std::mutex> lock(x.mutex);

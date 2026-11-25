@@ -90,6 +90,21 @@ private:
     explicit Pipeline(std::shared_ptr<detail::Pipeline> impl);
     std::shared_ptr<detail::Pipeline> impl_;
     friend class Context;
+    friend class Residency;
+};
+
+// One residency set for the resources of several pipelines of one context (macOS 15+), resident from
+// construction until destruction. A command queue holds at most 32 residency sets: pipelines that each call
+// set_resident count one set apiece, a Residency counts one for all of them.
+class Residency {
+public:
+    explicit Residency(const std::vector<const Pipeline*>& pipelines);
+    ~Residency();
+    Residency(const Residency&) = delete;
+    Residency& operator=(const Residency&) = delete;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class Context {
