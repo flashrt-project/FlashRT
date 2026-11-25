@@ -369,7 +369,7 @@ DSpark the step drafts in about 5 ms (the drafter's three layers over the block
 from their Q8_0 copies 1.4 ms, the Q8_0 LM head for 7 positions 2.2 ms, the 256
 candidates per position 0.35 ms, the Markov walk, the drafter's attention and
 context about 1.2 ms). The fast verification takes 35 ms for 2 rows, 44 for 4,
-52 for 6, 59 for 8, 75 for 12 and 87 for 16 (Q8_0: 29, 38, 47, 55.6, 74 and 86),
+52 for 6, 59 for 8, 75 for 12 and 87 for 16 (Q8_0: 29, 38, 46.6, 54.9, 74 and 86),
 the exact step 83-88 ms for 8. In the fast 8-row Q8_0 step (fixed routing of 32
 distinct experts per visit, 36 threadgroups) the expert passes take 33.4 ms
 (gate / up 19.0 ms at the streaming rate, down 11.6 ms), the Q8_0 projections
