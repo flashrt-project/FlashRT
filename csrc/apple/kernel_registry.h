@@ -21,6 +21,7 @@
 #include "inkling2/inkling2_rows_gemm.h"
 #include "inkling2/inkling2_mtp_bf16.h"
 #include "inkling2/inkling2_verify_resident_bf16.h"
+#include "inkling2/inkling2_dflash2_bf16.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
 #include "kernels/gelu_bf16.h"
@@ -257,7 +258,21 @@ inline constexpr KernelSource kernel_registry[] = {
     // Q8_0 weights: quantization of BF16 matrices, products with up to 8 rows (FP32 out)
     {"q8_0_quantize_bf16", "q8_0_quantize_bf16", q8_0_rows_source},
     {"q8_0_rows_f32", "q8_0_rows_f32", q8_0_rows_source},
+    {"q8_0_rows_f32_staged", "q8_0_rows_f32_staged", q8_0_rows_source},
+    {"q8_0_prep_rows", "q8_0_prep_rows", q8_0_rows_source},
+    {"q8_0_rows8", "q8_0_rows8", q8_0_rows_source},
     {"ink_mtp_pick_cand", "ink_mtp_pick_cand", inkling2_mtp_bf16_source},
+    {"df_ctx_gather", "df_ctx_gather", inkling2_dflash2_bf16_source},
+    {"df_norm_rows", "df_norm_rows", inkling2_dflash2_bf16_source},
+    {"df_ctx_write", "df_ctx_write", inkling2_dflash2_bf16_source},
+    {"df_add_norm", "df_add_norm", inkling2_dflash2_bf16_source},
+    {"df_conv", "df_conv", inkling2_dflash2_bf16_source},
+    {"df_qk_rows", "df_qk_rows", inkling2_dflash2_bf16_source},
+    {"df_attn_rows", "df_attn_rows", inkling2_dflash2_bf16_source},
+    {"df_silu_rows", "df_silu_rows", inkling2_dflash2_bf16_source},
+    {"df_pick", "df_pick", inkling2_dflash2_bf16_source},
+    {"df_top16", "df_top16", inkling2_dflash2_bf16_source},
+    {"df_select", "df_select", inkling2_dflash2_bf16_source},
     {"ink_embed_rows", "ink_embed_rows", inkling2_rows_bf16_source},
     {"ink_attn_inputs_rows", "ink_attn_inputs_rows", inkling2_rows_bf16_source},
     {"ink_gate_rows", "ink_gate_rows", inkling2_rows_bf16_source},
