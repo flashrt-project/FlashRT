@@ -126,7 +126,8 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
         if self.dflash2 and self.mtp_batches != [1]:
             raise ValueError("the DFlash 2 drafter serves one sequence (mtp_batches=[1])")
         if self.mtp:
-            row_capacity = max(int(row_capacity), MTP_BLOCK * max(self.mtp_batches), *self.mtp_prefill)
+            row_capacity = max(int(row_capacity), MTP_BLOCK * max(self.mtp_batches), *self.mtp_prefill,
+                               *[self.mtp_width(c) * c for c in self.mtp_batches])
             if max(self.mtp_batches) > sequences:
                 raise ValueError("MTP batch sizes must not exceed sequences")
         self.sequences, self.row_capacity = int(sequences), int(row_capacity)
@@ -174,7 +175,7 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
             raise ValueError(f"recorded programs need {len(self._param_blob)} parameter bytes (> {ARGS_BYTES}): "
                              "fewer row shapes / MTP batch sizes")
         self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
-        self.plan.finish(resident=True)
+        self.plan.finish(resident=True, shared=True)    # one residency set: more than 32 programs
         if self._arranged is not None:
             self.plan.run(self.programs["arrange"])     # NVFP4 experts re-arranged per MMA fragment, once
         if self._q8:
@@ -380,7 +381,7 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
         sizes = {
             "kv": self.kv_elements * 2 * self.sequences, "rings": self.ring_elements * 2 * self.sequences,
             "params": 64,
-            "noise": BLOCK * v * 4, "logits": BLOCK * v * 4, "trace": BLOCK * visits * H * 2,
+            "noise": BLOCK * v * 4, "logits": BLOCK * v * 4, "trace": 2 * BLOCK * visits * H * 2,
             "packet": 17 * 4, "workspace": WORKSPACE, "debug": DEBUG_FLOATS * 4,
             "control": CONTROL * 4, "diagnostic": WORKERS * 4, "noise_params": 64,
         }
@@ -406,8 +407,9 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
             "r_resid": C * H * f32, "r_y": C * H * bf, "r_rlog": C * 128 * f32, "r_ids": C * 8 * 4, "r_rw": C * 8 * f32,
             "r_slot": C * 8 * 4, "r_counts": 128 * 4, "r_starts": 129 * 4, "r_cursors": 128 * 4, "r_tiles": 129 * 4,
             "r_xp": C * 8 * H * bf, "r_act": C * 8 * 1152 * bf, "r_ep": C * 8 * H * bf, "r_moe": C * H * bf,
-            "r_xf": C * H * bf, "r_logits": max([lr for _, lr in self._row_shapes()] +
-                                                [MTP_BLOCK * c for c in self.mtp_batches]) * self.cfg.vocab_size * f32,
+            "r_xf": C * H * bf,
+            "r_logits": max([lr for _, lr in self._row_shapes()] + [self.mtp_width(c) * c for c in self.mtp_batches])
+            * self.cfg.vocab_size * f32,
             "r_out": C * 4,
             "args": ARGS_BYTES, "r_trace": (48 * C * H * bf if self.trace_rows else 4),
         }

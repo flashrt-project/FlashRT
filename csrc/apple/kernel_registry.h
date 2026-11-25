@@ -238,7 +238,7 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { Inkling2VerifyOptions o; o.rows = R; o.fast = true; o.q8 = true; o.trace = true; \
           return inkling2_verify_resident_bf16_source(o); }},
     FRT_INK_VERIFY(2) FRT_INK_VERIFY(3) FRT_INK_VERIFY(4) FRT_INK_VERIFY(5) FRT_INK_VERIFY(6) FRT_INK_VERIFY(7)
-    FRT_INK_VERIFY(8)
+    FRT_INK_VERIFY(8) FRT_INK_VERIFY(10) FRT_INK_VERIFY(12) FRT_INK_VERIFY(14) FRT_INK_VERIFY(16)
 #undef FRT_INK_VERIFY
     // inkling2_loop row programs (prefill chunks and batched decode): per-row kernels and TensorOps products.
     // Inkling 2 Mini DSpark speculative decoding (verify staging / commit, drafter)
@@ -261,6 +261,7 @@ inline constexpr KernelSource kernel_registry[] = {
     {"q8_0_rows_f32_staged", "q8_0_rows_f32_staged", q8_0_rows_source},
     {"q8_0_prep_rows", "q8_0_prep_rows", q8_0_rows_source},
     {"q8_0_rows8", "q8_0_rows8", q8_0_rows_source},
+    {"q8_0_rows16", "q8_0_rows16", q8_0_rows_source},
     {"ink_mtp_pick_cand", "ink_mtp_pick_cand", inkling2_mtp_bf16_source},
     {"df_ctx_gather", "df_ctx_gather", inkling2_dflash2_bf16_source},
     {"df_norm_rows", "df_norm_rows", inkling2_dflash2_bf16_source},

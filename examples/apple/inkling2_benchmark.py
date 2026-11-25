@@ -57,7 +57,9 @@ def main():
     ap.add_argument("--verify", choices=("fast", "exact", "rows"), default="fast",
                     help="verification of one sequence with --mtp (C = 1)")
     ap.add_argument("--fixed-rows", action="store_true",
-                    help="fast verification of one sequence: always 8 rows (default: 2-8 chosen per step)")
+                    help="fast verification of one sequence: always 8 rows (default: 2-16 chosen per step)")
+    ap.add_argument("--no-lookup", action="store_true",
+                    help="fast verification of one sequence: no lookup drafts (at most the drafter's 8 rows)")
     ap.add_argument("--dflash2", default=None, help="DFlash 2 drafter directory (with --mtp, C = 1)")
     ap.add_argument("--q8", action="store_true", help="Q8_0 attention projections and LM head")
     args = ap.parse_args()
@@ -81,6 +83,7 @@ def main():
                          dflash2=args.dflash2 if args.mtp else None)
     rt.mtp_verify = {"fast": "fast", "exact": "resident", "rows": "rows"}[args.verify]
     rt.mtp_adaptive = not args.fixed_rows
+    rt.mtp_lookup = not args.no_lookup
     results = {}
     for C in concs:
         rows = []
@@ -95,6 +98,7 @@ def main():
                 prefill = time.perf_counter() - t0 - decode
                 extra = {"tokens_per_step": round(stats["tokens_per_step"], 3),
                          "rows_per_step": round(stats["rows_per_step"], 2),
+                         "lookup_steps": stats["lookup_steps"], "lookup_only_steps": stats["lookup_only_steps"],
                          "step_ms": round(1e3 * decode / stats["steps"], 2),
                          "verify_ms": round(stats["verify_ms_per_step"], 2), "draft_ms": round(stats["draft_ms_per_step"], 2)}
             else:
@@ -116,7 +120,9 @@ def main():
             row = dict(prefill_s=prefill, decode_s=decode, agg_tps=n_tok / decode, per_seq_tps=n_tok / decode / C)
             verify = (args.verify if C == 1 else "rows") if args.mtp else None   # several sequences: row programs
             adaptive = verify == "fast" and not args.fixed_rows
+            lookup = adaptive and C == 1 and not args.no_lookup
             print(json.dumps({"conc": C, "rep": rep, "mtp": args.mtp, "verify": verify, "adaptive": adaptive,
+                              "lookup": lookup,
                               "q8": args.q8, **{k: round(v, 3) for k, v in row.items()},
                               **extra}), flush=True)
             if rep:

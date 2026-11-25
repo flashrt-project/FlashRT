@@ -56,7 +56,8 @@ spec = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, specula
 exact = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="exact")
 # q8=True: attention projections and LM head from Q8_0 copies made at load (faster; not the checkpoint's numerics)
 q8 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, q8=True)
-# adaptive=False: the fast verification always checks 8 rows (default: 2-8 per step from the drafts' probabilities)
+# adaptive=False: the fast verification always checks 8 rows (default: 2-8 per step from the drafts' probabilities,
+# 12 or 16 with lookup drafts from the text; lookup=False: at most 8)
 fixed = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, adaptive=False)
 # dflash2=...: draft with the DFlash 2 drafter (block diffusion + candidate selector) instead of DSpark
 df2 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True,
@@ -154,11 +155,12 @@ accepts, never which, so for one sequence the drafter runs from Q8_0 copies of
 its layers and of the LM head (its base logits), and the Markov head ranks the
 256 largest base logits (with the fold bias) instead of the whole vocabulary.
 
-The model verifies the anchor and up to W - 1 drafts (W = 8 for 1-4
-sequences, 4 for up to 16, 3 beyond). One sequence is verified by a resident
-step: one dispatch over its rows (36 threadgroups, device-scope barriers), the
-weights read once for all rows, the experts of the rows deduplicated (32
-distinct experts per visit on average for 8 rows, 15-47) and taken by
+The model verifies the anchor and up to W - 1 drafts (W = 16 for one
+sequence, 8 for 2-4, 4 for up to 16, 3 beyond). One sequence is verified by a
+resident step: one dispatch over up to 16 rows (36 threadgroups, device-scope
+barriers), the weights read once for all rows, the experts of the rows
+deduplicated (32 distinct experts per visit on average for 8 rows, 15-47) and
+taken by
 threadgroups from a counter, heavy and light experts alternately, each expert's
 down rows as soon as its gate / up rows are done. Two variants share it:
 `exact` gives every row the decode step's arithmetic (its products, lane order
@@ -167,7 +169,7 @@ half precision (the codes decoded by shifts and masks into pairs of halves, the
 inputs scaled by a power of two per row so the products of BF16 inputs and
 E2M1 codes are exact halves, sums of 16 in half, FP32 beyond), coalesced
 16-byte code loads with two output rows per lane, and attention by blocks of
-key positions for half of the rows at once. With the fast step a step verifies
+key positions for up to four rows at once. With the fast step a step verifies
 2-8 rows: the rows that maximize the expected accepted tokens minus the
 measured tokens per millisecond times the step's cost by rows (the drafts'
 probabilities mapped to measured agreement rates; the cost table scaled by the
@@ -177,6 +179,21 @@ the accepted rows are committed, in the command buffer of the next draft. The
 agreement rates of the adaptive rows follow the text: per probability bin the
 share of reached drafted positions the target accepted, with the measured table
 as a prior and older steps decayed.
+
+**Lookup drafts** (one sequence, fast verification). Generated text repeats
+itself (code, lists, quoted passages, greedy loops), and the continuation of an
+earlier occurrence predicts it. After the drafter's 7 drafts the step can add
+the 8 tokens that followed the latest earlier occurrence of the last 4 drafted
+tokens in the committed text (a near occurrence repeats with its period) and
+verify 12 or 16 rows; their agreement rate is learned per bin of the match
+length (how many tokens before them equal the text before the occurrence).
+Where the committed text itself matches a long stretch, a step can skip the
+drafter: its context still runs, and the step verifies the text's own
+continuation as all 15 drafts. It does when its expected gain (agreement learned
+per match-length bin) beats the measured gain of the drafter's steps in the
+same bin. With DFlash 2 and Q8_0 on corpus slices 1 and 12, the steps after a
+committed match of 48 tokens or more accept 15.2-15.5 of 16 rows, 0.145 tokens
+per millisecond against 0.09-0.12 for the drafter's steps.
 
 **DFlash 2 drafter** (`dflash2=`, one sequence). The drafter follows SGLang's
 `DFlash2DraftModel` with the Inkling integration: each committed position's
@@ -251,6 +268,8 @@ chunked against one-chunk prefill, speculative (exact verification) against
 plain greedy decoding and the fast verification up to a near-tie, the exact
 resident verification of 8 rows against 8 decode steps (logits bit for bit)
 with the fast one (8, 5 and 2 rows) closer to it than the row program, the
+same for 16 rows, lookup steps on a repeated text (16-row steps, the fast
+verification following greedy up to a near-tie), the
 DFlash 2 drafter (exact verification still the greedy output), the Q8_0 decode step
 against the BF16 one, sampling (top-k 1 equals greedy, seeds reproduce), the
 input checks, the chat path, the re-ordered expert copy against its numpy
@@ -305,24 +324,34 @@ summation order and rows can change (with the exact verification, C = 1 runs
 the M4 Pro's matrix units, not its bandwidth, bound a step, so verifying more
 rows buys less. The DSpark columns are one measuring session (C = 1 and above);
 the row programs of C > 1 run as in the previous release, which reruns within
-0.5 % in the same session, while sessions differ by up to 5 %.
+0.5 % in the same session, while sessions differ by up to 5 %. C = 1 here is
+without lookup drafts (as `lookup=False` runs); the next table has both.
 
 With `q8=True` (C = 1): plain decoding 45.6 tokens/s, DSpark 98.2 (84.2-112.2;
 the accepted length follows the continuation, which differs from the BF16 one).
 
 ### DSpark and DFlash 2 at C = 1
 
-| Drafter | Attention / LM head | Slices 1-2: median (range) | Slices 1-12 | Tokens per step (1-12) | Step |
-|---|---|---:|---:|---:|---:|
-| DSpark | BF16 | 89.2 (87.5-90.9) | 90.5 | 5.57 | 60-61 ms |
-| DFlash 2 | BF16 | 90.7 (78.6-102.7) | **95.6** | 6.17 | 57-65 ms |
-| DSpark | Q8_0 | 98.2 (84.2-112.2) | 97.7 | 5.47 | 49-58 ms |
-| DFlash 2 | Q8_0 | 102.3 (93.5-111.0) | **101.8** | 5.90 | 53-59 ms |
+| Drafter | Attention / LM head | Lookup drafts | Slices 1-12 | Slices 1-2: median (range) | Tokens per step | Rows per step |
+|---|---|---|---:|---:|---:|---:|
+| DSpark | BF16 | off | 90.2 | 88.8 (87.2-90.5) | 5.51 | 6.39 |
+| DSpark | BF16 | on | **93.5** | 97.9 (94.4-101.5) | 6.18 | 7.26 |
+| DFlash 2 | BF16 | off | 94.8 | 89.8 (78.0-101.7) | 6.03 | 6.56 |
+| DFlash 2 | BF16 | on | **97.3** | 93.7 (80.5-106.8) | 6.73 | 7.43 |
+| DSpark | Q8_0 | off | 96.6 | 97.0 (83.4-110.5) | 5.34 | 6.05 |
+| DSpark | Q8_0 | on | **98.5** | 92.3 (82.7-102.0) | 5.86 | 6.87 |
+| DFlash 2 | Q8_0 | off | 99.9 | 100.1 (91.1-109.0) | 5.81 | 6.35 |
+| DFlash 2 | Q8_0 | on | **104.5** | 105.1 (92.4-117.9) | 6.63 | 7.37 |
 
-Tokens/s of decoding; slices 1-12 is all generated tokens over all decode time of
-twelve slices of the same protocol (1024-token prompts at 7919-token steps).
-Per slice the rate ranges from 76 to 112 tokens/s: the continuation, and with it
-the accepted length, changes with the verification's rows and summation order.
+Tokens/s of decoding, one measuring session; slices 1-12 is all generated
+tokens over all decode time of twelve slices of the same protocol (1024-token
+prompts at 7919-token steps), tokens and rows per step over the same steps.
+With lookup drafts 10-13 % of the steps verify 12 or 16 rows and 7-17 % skip
+the drafter. Per slice the rate ranges from 78 to 122 tokens/s: the
+continuation, and with it the accepted length, changes with the verification's
+rows and summation order, so two slices can move either way (DSpark Q8_0 slice 1:
+110.5 without lookup drafts, 102.0 with them); twelve slices are the
+comparison.
 
 
 ### A speculative step (one sequence)
@@ -334,8 +363,8 @@ in 5.2 ms (the drafter's three layers over the block from their
 Q8_0 copies 1.4 ms, the Q8_0 LM head for 7 positions 2.2 ms, the 256 candidates
 per position 0.35 ms, the Markov walk, the drafter's attention and context about
 1.2 ms) and verifies its rows: the fast step takes 35 ms for 2 rows, 45 for 4,
-54 for 6 and 60-62 for 8 (Q8_0: 29, 39, 49, 57-58), the exact step 83-88 ms for
-8; one sequence's DSpark step averages 60-61 ms on the first two slices
+54 for 6, 60-62 for 8, 95 for 12 and 120 for 16 (Q8_0: 29, 39, 49, 57-58, 85 and
+104), the exact step 83-88 ms for 8; one sequence's DSpark step averages 60-61 ms on the first two slices
 (verification 54-55 ms over 6.4-6.5 rows, the CPU's part 0.5 ms). In the fast 8-row step the
 expert passes take about 33 ms for 32 distinct experts per visit (6.9 GB: 210
 GB/s; the 268 GB/s streaming rate would be 26 ms), the BF16 projections, output
