@@ -519,10 +519,12 @@ inline void gemv_rows_mma(const device ushort* w,uint unit_row0,const device ush
 // times the block scale into FP32; the result divided by the row scale. Out BF16 (row stride RS) or (HEAD) FP32
 // softcapped logits. q8 table entry qt: (codes, scales) byte offsets in q8.
 enum : uint { Q8_WQ=0, Q8_WK=2, Q8_WV=4, Q8_WR=6, Q8_WG=8, Q8_WO=10, Q8_LAYER=12 };
-// staged input chunks of a K-wide product: the fewest that fit every row's chunk in XS_CAP halves (32-wide blocks)
+// staged input chunks of a K-wide product: the fewest that fit every row's chunk in XS_CAP halves and give the 8
+// lanes of a row pair whole 32-wide blocks each (K = 2304: 1 chunk up to 5 rows, 3 beyond; 2 would leave half the
+// lanes idle in a chunk's last block)
 constexpr uint q8_chunks(uint K) {
     uint n=(FRT_ROWS*K+XS_CAP-1u)/XS_CAP;
-    while(K%(32u*n)!=0u)++n;
+    while(K%(32u*n)!=0u || (K/(32u*n))%8u!=0u)++n;
     return n;
 }
 template<uint K,bool HEAD,uint TP=1u>
