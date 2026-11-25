@@ -65,6 +65,15 @@ constant constexpr uint G_EMASK=G_ELIST+512u;             // ulong [128]: the ex
 constant constexpr uint G_EROW=G_EMASK+1024u;             // uint [128]: the rows routed to it (a bit per row)
 constant constexpr uint G_SEL=G_EROW+512u;                // [VMAX][FRT_WORKERS] (FP32 max, uint index)
 constant constexpr uint FRT_DONE=256u;                    // control: per distinct expert, gate/up units done (fast)
+#ifndef FRT_EUNITS
+#define FRT_EUNITS 6u
+#endif
+#ifndef FRT_EUNITS_DOWN
+#define FRT_EUNITS_DOWN 6u
+#endif
+constant constexpr uint EUN=FRT_EUNITS;                   // fast: gate/up units per expert (FH / EUN rows each)
+constant constexpr uint EUD=FRT_EUNITS_DOWN;              // fast: down units per expert (FH / EUD rows each)
+static_assert((FH/64u)%EUN==0u && (FH/128u)%EUD==0u,"whole tiles per unit");
 struct VerifyParams {
     uint position;        // of row 0 (rows at position .. position + FRT_ROWS - 1, one sequence)
     uint zero;            // always 0 (keeps separately rounded MLX operations from being contracted)
@@ -336,8 +345,9 @@ inline void expert_fast(const device uchar* w,const device uchar* s,float gsc,ui
               d[2]=half2(half(f[4]),half(f[6]));d[3]=half2(half(f[5]),half(f[7]));}
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // lanes of a row pair: LPR lanes, lane jl takes the 32-input chunks c = LPR b + jl (b < 9) of both rows (coalesced
-    // 16-byte code loads; each staged input pair read once for the two rows)
+    // lanes of a row pair: LPR lanes, lane jl takes 9 of the 32-input chunks of both rows, in 3 runs of 3 consecutive
+    // chunks (c = 3 LPR (b / 3) + 3 jl + b % 3: the lanes' runs adjoin, 48-byte runs per lane beat 16-byte
+    // interleaving); each staged input pair read once for the two rows
     const uint rg=lane/LPR,jl=lane%LPR;
     for(uint t=0;t<ntiles;++t) {
         const uint rt0=unit_row0+t*TROWS+simd*RPS;
@@ -348,7 +358,7 @@ inline void expert_fast(const device uchar* w,const device uchar* s,float gsc,ui
             const device uint4* cw=(const device uint4*)(w+size_t(row)*(K/2u));
             const device ushort* sp=(const device ushort*)(s+size_t(row)*(K/16u));
             FRT_UNROLL for(uint b=0;b<9u;++b) {
-                const uint c=b*LPR+jl;
+                const uint c=(b/3u)*(3u*LPR)+jl*3u+b%3u;
                 half2 wv[2][16];
                 float S0[2],S1[2];
                 FRT_UNROLL for(uint r=0;r<2u;++r) {
@@ -384,7 +394,7 @@ inline void expert_fast(const device uchar* w,const device uchar* s,float gsc,ui
             const device uint4* cw=(const device uint4*)(w+size_t(row)*K);
             const device uchar* sp=s+size_t(row)*(K/32u);
             FRT_UNROLL for(uint b=0;b<9u;++b) {
-                const uint c=b*LPR+jl;
+                const uint c=(b/3u)*(3u*LPR)+jl*3u+b%3u;
                 FRT_UNROLL for(uint g=0;g<2u;++g) {
                     half2 wv[2][8];
                     float S[2];
@@ -414,19 +424,19 @@ inline void expert_fast(const device uchar* w,const device uchar* s,float gsc,ui
                 }
             }
         }
-        FRT_UNROLL for(uint r=0;r<2u;++r)FRT_UNROLL for(uint n=0;n<NSL;++n) {
+        // the lane's rows are a gate / up pair (rows 2 c, 2 c + 1) when act: the softcapped SwiGLU of the BF16-rounded
+        // pair straight from the sums (the values a store and reload of the rounded outputs would give)
+        FRT_UNROLL for(uint n=0;n<NSL;++n) {
             if(n>=ns)break;
-            float v=acc[r][n];
-            for(ushort off=LPR/2u;off>=1u;off>>=1)v+=simd_shuffle_xor(v,off);
-            if(jl==0u)ob[so[n]+row+r]=ubf(v*(gsc/xsc[n]));
-        }
-        if(act) {
-            simdgroup_barrier(mem_flags::mem_device);
-            if(lane<RPS/2u)FRT_UNROLL for(uint n=0;n<NSL;++n) {
-                if(n>=ns)break;
-                const float gg=bfu(ob[so[n]+rt0+lane*2u]),uu=bfu(ob[so[n]+rt0+lane*2u+1u]);
-                ob[sa[n]+rt0/2u+lane]=ubf(softcapped_swiglu(gg,uu));
+            float v[2];
+            FRT_UNROLL for(uint r=0;r<2u;++r) {
+                v[r]=acc[r][n];
+                for(ushort off=LPR/2u;off>=1u;off>>=1)v[r]+=simd_shuffle_xor(v[r],off);
+                v[r]=rb(v[r]*(gsc/xsc[n]));
             }
+            if(jl!=0u)continue;
+            if(act)ob[sa[n]+row/2u]=ubf(softcapped_swiglu(v[0],v[1]));
+            else{ob[so[n]+row]=ushort(as_type<uint>(v[0])>>16);ob[so[n]+row+1u]=ushort(as_type<uint>(v[1])>>16);}
         }
     }
 }
@@ -1512,10 +1522,10 @@ kernel void inkling2_verify_resident_bf16(
         // ---- experts: threadgroup units (distinct expert, 32 rows) for all of the expert's (row, rank) slots (one per
         // routed row), inputs staged; gate/up rows with the activation of their two channels, then down rows
 #if FRT_FAST
-        // fast: units (distinct expert, 256 rows) of the gate/up rows (9 per expert, heavy experts first), then of the
-        // down rows (9 per expert) from the same counter; a down unit waits for its expert's 9 gate/up units (a counter
-        // per distinct expert), so the passes overlap without a grid barrier. The expert's slots in groups whose
-        // whole inputs fit XS_CAP.
+        // fast: units (distinct expert, FH / EUN rows) of the gate/up rows (EUN per expert, heavy experts first), then
+        // of the down rows (EUD per expert, FH / EUD rows) from the same counter; a down unit waits for its expert's EUN gate/up units
+        // (a counter per distinct expert), so the passes overlap without a grid barrier. The expert's slots in groups
+        // whose whole inputs fit XS_CAP.
         {
             const uint n=ecount[0];
             const device uchar* w13=weights+d[D_W13];
@@ -1532,10 +1542,10 @@ kernel void inkling2_verify_resident_bf16(
                 if(tid==0)slot_n[0]=atomic_fetch_add_explicit(wctr,1u,memory_order_relaxed);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 const uint u=slot_n[0];
-                if(u>=n*18u)break;
-                const bool down=u>=n*9u;
-                const uint ud=down?u-n*9u:u;
-                const uint ei=ud/9u,rbase=(ud%9u)*256u;
+                if(u>=n*(EUN+EUD))break;
+                const bool down=u>=n*EUN;
+                const uint ud=down?u-n*EUN:u,eu=down?EUD:EUN;
+                const uint ei=ud/eu,rbase=(ud%eu)*(FH/eu);
                 const uint e=elist[ei];
                 uint sx[FRT_ROWS],so[FRT_ROWS],sa[FRT_ROWS],ns=0;
                 float xq[FRT_ROWS];
@@ -1556,9 +1566,9 @@ kernel void inkling2_verify_resident_bf16(
                         const uint gn=min(G,ns-g0);
                         if(!mxfp8)
                             expert_fast<FH,false>(w13+size_t(e)*FH*(FH/2u),s13+size_t(e)*FH*(FH/16u),fdiv(gs13[e],2688.0f),
-                                                  rbase,4u,wsu,sx+g0,wsu,so+g0,sa+g0,xq+g0,gn,true,(threadgroup half2*)xs,sct,tid,simd,lane);
+                                                  rbase,FH/EUN/64u,wsu,sx+g0,wsu,so+g0,sa+g0,xq+g0,gn,true,(threadgroup half2*)xs,sct,tid,simd,lane);
                         else
-                            expert_fast<FH,true>(w13+size_t(e)*FH*FH,s13+size_t(e)*FH*(FH/32u),1.0f,rbase,4u,wsu,sx+g0,wsu,
+                            expert_fast<FH,true>(w13+size_t(e)*FH*FH,s13+size_t(e)*FH*(FH/32u),1.0f,rbase,FH/EUN/64u,wsu,sx+g0,wsu,
                                                  so+g0,sa+g0,xq+g0,gn,true,(threadgroup half2*)xs,sct,tid,simd,lane);
                     }
                     // publish the unit's activations, then count it
@@ -1568,9 +1578,9 @@ kernel void inkling2_verify_resident_bf16(
                 } else {
                     if(tid==0) {
                         uint spins=0;
-                        while(atomic_load_explicit(done+ei,memory_order_relaxed)<9u &&
+                        while(atomic_load_explicit(done+ei,memory_order_relaxed)<EUN &&
                               atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<FRT_SPIN_LIMIT)++spins;
-                        if(atomic_load_explicit(done+ei,memory_order_relaxed)<9u)
+                        if(atomic_load_explicit(done+ei,memory_order_relaxed)<EUN)
                             atomic_store_explicit(control+2,phase+1u,memory_order_relaxed);
                     }
                     threadgroup_barrier(mem_flags::mem_device);
@@ -1580,9 +1590,9 @@ kernel void inkling2_verify_resident_bf16(
                         const uint gn=min(G,ns-g0);
                         if(!mxfp8)
                             expert_fast<FI,false>(w2+size_t(e)*FH*(FI/2u),s2+size_t(e)*FH*(FI/16u),fdiv(gs2[e],2688.0f),
-                                                  rbase,2u,wsu,sx+g0,wsu,so+g0,so+g0,xq+g0,gn,false,(threadgroup half2*)xs,sct,tid,simd,lane);
+                                                  rbase,FH/EUD/128u,wsu,sx+g0,wsu,so+g0,so+g0,xq+g0,gn,false,(threadgroup half2*)xs,sct,tid,simd,lane);
                         else
-                            expert_fast<FI,true>(w2+size_t(e)*FH*FI,s2+size_t(e)*FH*(FI/32u),1.0f,rbase,2u,wsu,sx+g0,wsu,so+g0,
+                            expert_fast<FI,true>(w2+size_t(e)*FH*FI,s2+size_t(e)*FH*(FI/32u),1.0f,rbase,FH/EUD/128u,wsu,sx+g0,wsu,so+g0,
                                                  so+g0,xq+g0,gn,false,(threadgroup half2*)xs,sct,tid,simd,lane);
                     }
                 }
