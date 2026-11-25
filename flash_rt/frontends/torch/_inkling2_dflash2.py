@@ -130,13 +130,14 @@ class _DFlash2Mixin:
         self.plan.dispatch("df_norm_rows", [(self.buf["weights"], 0, READ), (x, 0, READ), (out, 0, WRITE),
                                             (self.buf["args"], prm, READ)], (rows, 1, 1), 256, label=label)
 
-    def _df_context(self, R: int, q8: bool) -> None:
-        """Context K / V of the rows flagged in m_cinfo (features in m_feat, R rows) into the drafter cache."""
+    def _df_context(self, R: int, q8: bool, feat_stride: int = 0) -> None:
+        """Context K / V of the rows flagged in m_cinfo (features in m_feat, R rows of a layout of feat_stride rows,
+        0: R) into the drafter cache."""
         b, plan, w = self.buf, self.plan, self.df_w
         H = self.cfg.hidden_size
         A = b["args"]
-        nr = self._param(np.array([R, 0, 0, 0], np.uint32).tobytes())
-        plan.dispatch("df_ctx_gather", [(b["m_feat"], 0, READ), (b["df_cx"], 0, WRITE), (A, nr, READ)],
+        gp = self._param(np.array([R, feat_stride, 0, 0], np.uint32).tobytes())
+        plan.dispatch("df_ctx_gather", [(b["m_feat"], 0, READ), (b["df_cx"], 0, WRITE), (A, gp, READ)],
                       ((R * 4 * H + 255) // 256, 1, 1), 256, label="df_ctx_gather")
         if q8:
             self._q8_prep(b["df_cx"], 0, 4 * H, R, 4 * H, "df_fc")
@@ -163,7 +164,7 @@ class _DFlash2Mixin:
                                        (b["m_cinfo"], 0, READ), (A, ctx, READ)], (R, DF_LAYERS, 1), 256,
                       label="df_ctx_write")
 
-    def _df_record_draft(self, W: int, commit: int = 0) -> int:
+    def _df_record_draft(self, W: int, commit: int = 0, feat_stride: int = 0) -> int:
         """Draft program of one sequence: [the last step's commit], the drafter context of its accepted rows, the
         block of 8 through the 5 layers, the LM head of the 7 mask rows and their largest logits."""
         b, plan, w, cfg = self.buf, self.plan, self.df_w, self.cfg
@@ -173,7 +174,7 @@ class _DFlash2Mixin:
         program = plan.program()
         if commit:
             self._mtp_record_commit(commit, program)
-        self._df_context(W, q8=True)
+        self._df_context(W, q8=True, feat_stride=feat_stride)
         rv0 = self._visit_param(0, R, 0, [], 0)
         plan.dispatch("ink_embed_rows", [(b["weights"], 0, READ), (b["table"], 0, READ), (b["df_tok"], 0, READ),
                                          (b["df_x"], 0, WRITE), (A, rv0, READ)], (R, 1, 1), 256, label="df_embed")

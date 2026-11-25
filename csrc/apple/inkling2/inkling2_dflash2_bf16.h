@@ -59,12 +59,12 @@ inline void df_head_norm_rope(thread float* v,thread const float* w4,uint lane,u
 }
 
 // ---- context: x[r] = [feat0[r] | feat1[r] | feat2[r] | feat3[r]] (feat BF16 [4][R][DH]) -> out BF16 [R][4 DH]
-struct DfRows { uint rows, pad0, pad1, pad2; };
+struct DfRows { uint rows, feat_stride, pad1, pad2; };     // feat_stride: rows of the feature layout (0: rows)
 kernel void df_ctx_gather(const device ushort* feat [[buffer(0)]],device ushort* out [[buffer(1)]],
     constant DfRows& p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
     if(i>=p.rows*4u*DH)return;
-    const uint r=i/(4u*DH),t=(i/DH)%4u,c=i%DH;
-    out[i]=feat[(size_t(t)*p.rows+r)*DH+c];
+    const uint r=i/(4u*DH),t=(i/DH)%4u,c=i%DH,fs=p.feat_stride?p.feat_stride:p.rows;
+    out[i]=feat[(size_t(t)*fs+r)*DH+c];
 }
 // ---- RMSNorm of BF16 rows (eps 1e-6): out[r] = x[r] / rms(x[r]) * w (BF16), one threadgroup per row
 struct DfNorm { ulong w; uint rows, x_stride, out_stride, pad; };

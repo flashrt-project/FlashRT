@@ -246,14 +246,25 @@ class _MTPMixin:
             self.mtp_programs[("commit", C)] = self._mtp_record_commit(R)
             # the last step's commit and the next draft in one command buffer (independent: the draft reads the
             # drafter's own context, not the target caches)
+            # one sequence wider than the drafter's block: after a resident step of at most the block's rows
+            # "_block" (the context of those rows of the step's VMAX-row feature layout), after a row-program step
+            # "_rows" (the program's rows, their own layout)
+            WB = min(W, MTP_BLOCK)
             if self.dflash2:
-                self.mtp_programs[("draft", C)] = self._df_record_draft(W)
-                self.mtp_programs[("commit_draft", C)] = self._df_record_draft(W, commit=R)
+                record = self._df_record_draft
             else:
-                self.mtp_programs[("draft", C)] = self._mtp_record_draft(C, W)
-                self.mtp_programs[("commit_draft", C)] = self._mtp_record_draft(C, W, commit=R)
+                def record(w, commit=0, feat_stride=0):
+                    return self._mtp_record_draft(C, w, commit, feat_stride)
+            self.mtp_programs[("draft", C)] = record(WB)
+            self.mtp_programs[("commit_draft", C)] = record(W, commit=R)
+            if W > MTP_BLOCK:
+                self.mtp_programs[("commit_draft_block", C)] = record(WB, commit=R, feat_stride=W)
+                # the row programs stage and feature their own RR rows: commit and context in that layout
+                self.mtp_programs[("commit_rows", C)] = self._mtp_record_commit(RR)
+                self.mtp_programs[("commit_draft_rows", C)] = record(WB, commit=RR)
             if C == 1 and W > MTP_BLOCK:        # lookup steps: the commit and the context, no draft
                 self.mtp_programs[("commit_context", C)] = self._mtp_record_context(C, W, R)
+                self.mtp_programs[("commit_context_block", C)] = self._mtp_record_context(C, WB, R, feat_stride=W)
         for P in self.mtp_prefill:     # target rows with features, then the drafter context of the same rows
             context = (lambda P=P: self._df_context(P, q8=False)) if self.dflash2 else (lambda P=P: self._mtp_context(P))
             self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True, then=context)
@@ -312,14 +323,15 @@ class _MTPMixin:
                       (R, nv, 1), 256, label="commit")
         return program
 
-    def _mtp_context(self, R: int) -> None:
-        """Context K / V of rows flagged in m_cinfo (features of a prefill chunk or a verify step, R rows)."""
+    def _mtp_context(self, R: int, feat_stride: int = 0) -> None:
+        """Context K / V of rows flagged in m_cinfo (features of a prefill chunk or a verify step, R rows of a layout of
+        feat_stride rows, 0: R)."""
         b, plan, w = self.buf, self.plan, self.mtp_w
         H = self.cfg.hidden_size
         A = b["args"]
         a = self._mtp_alpha.reshape(-1)
         mix = self._param(np.array([w["0.dflare"], w["1.dflare"], w["2.dflare"], w["m.dflare"]], np.uint64).tobytes() +
-                          a.astype(np.float32).tobytes() + np.array([R, 0, 0, 0], np.uint32).tobytes())
+                          a.astype(np.float32).tobytes() + np.array([R, 0, feat_stride, 0], np.uint32).tobytes())
         plan.dispatch("ink_mtp_mix_rows", [(b["weights"], 0, READ), (b["m_feat"], 0, READ), (b["m_ctxx"], 0, WRITE),
                                            (b["m_frnn"], 0, READ_WRITE), (b["m_cinfo"], 0, READ), (A, mix, READ)],
                       (R, 1, 1), 256, label="mtp_mix")
@@ -336,17 +348,17 @@ class _MTPMixin:
                                                  (b["m_cinfo"], 0, READ), (A, ctx, READ)], (R, 1, 1), 256,
                       label="mtp_ctx_write")
 
-    def _mtp_record_context(self, C: int, W: int, commit: int) -> int:
+    def _mtp_record_context(self, C: int, W: int, commit: int, feat_stride: int = 0) -> int:
         """The last step's commit and the drafter context of its accepted rows, without a draft (a lookup step)."""
         program = self.plan.program()
         self._mtp_record_commit(commit, program)
         if self.dflash2:
-            self._df_context(W, q8=True)
+            self._df_context(W, q8=True, feat_stride=feat_stride)
         else:
-            self._mtp_context(W * C)
+            self._mtp_context(W * C, feat_stride)
         return program
 
-    def _mtp_record_draft(self, C: int, W: int, commit: int = 0) -> int:
+    def _mtp_record_draft(self, C: int, W: int, commit: int = 0, feat_stride: int = 0) -> int:
         b, plan, w, cfg = self.buf, self.plan, self.mtp_w, self.cfg
         H, V = cfg.hidden_size, cfg.vocab_size
         R = MTP_BLOCK * C
@@ -354,7 +366,7 @@ class _MTPMixin:
         program = plan.program()
         if commit:
             self._mtp_record_commit(commit, program)
-        self._mtp_context(W * C)                  # the last verify step's rows
+        self._mtp_context(W * C, feat_stride)     # the last verify step's rows
         # anchors' normalized embeddings (the target's embedding kernel), block rows
         rv0 = self._visit_param(0, C, 0, [], 0)
         plan.dispatch("ink_embed_rows", [(b["weights"], 0, READ), (b["table"], 0, READ), (b["m_anchor"], 0, READ),
@@ -517,6 +529,7 @@ class _MTPMixin:
         reach = np.full(len(mids), self.ADAPT_PRIOR)
         agreed = reach * np.interp(mids, cal_p, cal_a)
         pending = False                     # a commit written, run with the next draft (or when the loop ends)
+        last_v, resident_step = 0, False
         solo_ok = lookup and adaptive and ("commit_context", C) in self.mtp_programs
         s_reach = np.full(len(self.SOLO_A), self.SOLO_PRIOR)
         s_agreed = s_reach * np.asarray(self.SOLO_A)
@@ -543,7 +556,8 @@ class _MTPMixin:
                     ext: List[int] = []
                     for j in range(W - 1):  # a near occurrence repeats with its period
                         ext.append(hist[i + j] if i + j < len(hist) else ext[i + j - len(hist)])
-                    gpu["draft"] += plan.run(self.mtp_programs[("commit_context", C)])["gpu_us"]
+                    gpu["draft"] += plan.run(self.mtp_programs[("commit_context_block" if last_v <= MTP_BLOCK
+                                                                 else "commit_context", C)])["gpu_us"]
                     pending = False
                     drafts = np.array([ext], np.uint32)
                     V = Vs
@@ -558,7 +572,15 @@ class _MTPMixin:
                     plan.view(b["m_state"], np.uint16, C * MTP_RANK)[:] = 0
                     if self.dflash2:            # the block: the anchor and 7 mask tokens
                         plan.write(b["df_tok"], 0, np.array([anchor[0]] + [DF_MASK] * 7, np.uint32))
-                    gpu["draft"] += plan.run(self.mtp_programs[("commit_draft" if pending else "draft", C)])["gpu_us"]
+                    if not pending:
+                        prog = "draft"
+                    elif ("commit_draft_rows", C) not in self.mtp_programs:
+                        prog = "commit_draft"
+                    elif not resident_step:     # the row programs' features: their own rows
+                        prog = "commit_draft_rows"
+                    else:
+                        prog = "commit_draft_block" if last_v <= MTP_BLOCK else "commit_draft"
+                    gpu["draft"] += plan.run(self.mtp_programs[(prog, C)])["gpu_us"]
                     pending = False
                     drafted = plan.read(b["m_drafts"], 0, np.uint32, C * 7).reshape(C, 7)
                     drafts = np.zeros((C, W - 1), np.uint32)
@@ -645,6 +667,8 @@ class _MTPMixin:
                             agreed_l[lbin] = agreed_l[lbin] * self.ADAPT_DECAY + (n - 7)
                 plan.write(b["m_commit"], 0, commit)
                 pending = True
+                last_v = V                          # the next program's context: the rows of this step
+                resident_step = resident in self.mtp_programs and self.mtp_verify in ("resident", "fast") and C == 1
                 steps += 1
                 rows_total += V
                 lookup_steps += V > MTP_BLOCK
@@ -666,7 +690,8 @@ class _MTPMixin:
                 yield new_tokens
         finally:
             if pending:
-                plan.run(self.mtp_programs[("commit", C)])
+                rows_commit = not resident_step and ("commit_rows", C) in self.mtp_programs
+                plan.run(self.mtp_programs[("commit_rows" if rows_commit else "commit", C)])
 
     def mtp_generate(self, prompts: Sequence[Sequence[int]], new_tokens: int, stats: dict | None = None
                      ) -> List[List[int]]:
