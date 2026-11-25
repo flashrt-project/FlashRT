@@ -162,9 +162,20 @@ class NativePlan:
             self._dispatch_flags_fn = fn
         return fn
 
-    def finish(self, resident: bool = True) -> None:
+    def finish(self, resident: bool = True, shared: bool = False) -> None:
+        """Seal the plan; ``resident``: keep the programs' resources resident, ``shared``: through one residency
+        set for all programs (a command queue holds at most 32 sets; otherwise each program counts one)."""
         self._check(self.lib.frt_apple_plan_finish(self.handle))
-        if resident:
+        if resident and shared:
+            try:
+                fn = self.lib.frt_apple_plan_residency_shared
+            except AttributeError as exc:
+                raise RuntimeError("the Apple plan library lacks frt_apple_plan_residency_shared; rebuild it with "
+                                   "scripts/apple/build_native.sh") from exc
+            fn.argtypes = self._SIGNATURES["residency"][0]
+            fn.restype = C.c_int
+            self._check(fn(self.handle, 1))
+        elif resident:
             self._check(self.lib.frt_apple_plan_residency(self.handle, 1))
 
     def profile(self, program: int) -> List[Tuple[str, Dict[str, float]]]:

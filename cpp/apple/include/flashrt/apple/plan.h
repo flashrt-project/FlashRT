@@ -31,6 +31,9 @@ FRT_APPLE_PLAN_API int frt_apple_plan_dispatch_flags(void*, const char* kernel, 
 FRT_APPLE_PLAN_API int64_t frt_apple_plan_program(void*);
 FRT_APPLE_PLAN_API int frt_apple_plan_finish(void*);
 FRT_APPLE_PLAN_API int frt_apple_plan_residency(void*, uint32_t enabled);
+// Residency of every program through one residency set (a command queue holds at most 32; with
+// frt_apple_plan_residency each program counts one).
+FRT_APPLE_PLAN_API int frt_apple_plan_residency_shared(void*, uint32_t enabled);
 typedef struct frt_apple_plan_timing {
     double encode_us, gpu_us, wall_us, commit_us, wait_us;
     double commit_to_gpu_us, gpu_to_return_us, kernel_us;

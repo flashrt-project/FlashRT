@@ -111,6 +111,48 @@ void Pipeline::set_resident(bool enabled) const {
         }
     }
 }
+struct Residency::Impl {
+    std::shared_ptr<detail::Context> context;
+    id<MTLResidencySet> set API_AVAILABLE(macos(15.0)) = nil;
+};
+Residency::Residency(const std::vector<const Pipeline*>& pipelines) : impl_(std::make_unique<Impl>()) {
+    require(!pipelines.empty() && pipelines.front(), "residency needs pipelines");
+    impl_->context = pipelines.front()->impl_->context;
+    for (const Pipeline* pipeline : pipelines)
+        require(pipeline && pipeline->impl_->context == impl_->context, "residency pipelines must share a context");
+    std::lock_guard<std::mutex> lock(impl_->context->mutex);
+    @autoreleasepool {
+        if (@available(macOS 15.0, *)) {
+            std::map<id<MTLAllocation>, bool> allocations;
+            for (const Pipeline* pipeline : pipelines) {
+                for (const auto& resource : pipeline->impl_->resources) allocations[resource.first] = true;
+                if (pipeline->impl_->icb) allocations[pipeline->impl_->icb] = true;
+            }
+            MTLResidencySetDescriptor* descriptor = [MTLResidencySetDescriptor new];
+            descriptor.label = @"FlashRT pipelines";
+            descriptor.initialCapacity = allocations.size() + 1;
+            NSError* error = nil;
+            id<MTLResidencySet> set = [impl_->context->device newResidencySetWithDescriptor:descriptor error:&error];
+            if (!set) throw failure("create residency set", error);
+            for (const auto& allocation : allocations) [set addAllocation:allocation.first];
+            [set commit];
+            [set requestResidency];
+            [impl_->context->queue addResidencySet:set];
+            impl_->set = set;
+        } else {
+            throw std::runtime_error("Explicit residency requires macOS 15 or newer");
+        }
+    }
+}
+Residency::~Residency() {
+    if (@available(macOS 15.0, *)) {
+        if (impl_ && impl_->set) {
+            std::lock_guard<std::mutex> lock(impl_->context->mutex);
+            [impl_->context->queue removeResidencySet:impl_->set];
+            [impl_->set endResidency];
+        }
+    }
+}
 std::size_t Buffer::size() const { return impl_->value.length; }
 void* Buffer::host_data() const { return impl_->value.contents; }
 void Buffer::write(const void* source, std::size_t bytes, std::size_t offset) const {
