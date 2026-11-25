@@ -78,10 +78,25 @@ def test_chunked_prefill_agrees_with_one_chunk(tokens):
         rt.close()
 
 
+def _follows_greedy_to_a_near_tie(rt, tokens, got, want):
+    """``got`` equals ``want`` (greedy decoding) up to a near-tie: where they part, the greedy step's two leading
+    logits are within 0.5 (at least 4 tokens agree)."""
+    n = len(want)
+    part = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), n)
+    assert part >= 4
+    if part < n:
+        rt.prefill(list(tokens), features=True)
+        for i in range(part):
+            rt.decode(want[i], len(tokens) + i, 1)
+        lg = rt.plan.read(rt.buf["logits"], 0, np.float32, rt.cfg.vocab_size)[:rt.cfg.unpadded_vocab_size]
+        top = np.sort(lg)[-2:]
+        assert top[1] - top[0] < 0.5
+
+
 def test_speculative_decoding_follows_greedy(tokens):
     """With the exact verification the speculative output is the greedy decode's (the prompt prefilled by the same
-    chunk programs). The fast verification follows it up to a near-tie: where they part, the greedy step's two
-    leading logits are within 0.5."""
+    chunk programs). The fast verification and the row programs follow it up to a near-tie: where they part, the
+    greedy step's two leading logits are within 0.5."""
     from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
     spec = Inkling2TorchFrontendMps(CKPT, max_seq=256, speculative=True, verify="exact")
     n = 24
@@ -95,17 +110,9 @@ def test_speculative_decoding_follows_greedy(tokens):
             want += out
             pos += len(out)
         assert got == want
-        rt.mtp_verify = "fast"
-        fast = spec.generate(tokens, max_new_tokens=n, stop_ids=())
-        part = next((i for i, (a, b) in enumerate(zip(fast, want)) if a != b), n)
-        assert part >= 4
-        if part < n:
-            rt.prefill(list(tokens), features=True)
-            for i in range(part):
-                rt.decode(want[i], len(tokens) + i, 1)
-            lg = rt.plan.read(rt.buf["logits"], 0, np.float32, rt.cfg.vocab_size)[:rt.cfg.unpadded_vocab_size]
-            top = np.sort(lg)[-2:]
-            assert top[1] - top[0] < 0.5
+        for mode in ("fast", "rows"):
+            rt.mtp_verify = mode
+            _follows_greedy_to_a_near_tie(rt, tokens, spec.generate(tokens, max_new_tokens=n, stop_ids=()), want)
     finally:
         spec.rt.close()
 
@@ -172,10 +179,9 @@ def test_dflash2_drafts_keep_the_greedy_output(tokens):
             pos += len(out)
         assert got == want
         assert stats["tokens_per_step"] > 1.0
-        rt.mtp_verify = "fast"
-        fast = spec.generate(tokens, max_new_tokens=n, stop_ids=())
-        part = next((i for i, (a, b) in enumerate(zip(fast, want)) if a != b), n)
-        assert part >= 4
+        for mode in ("fast", "rows"):
+            rt.mtp_verify = mode
+            _follows_greedy_to_a_near_tie(rt, tokens, spec.generate(tokens, max_new_tokens=n, stop_ids=()), want)
     finally:
         spec.rt.close()
 

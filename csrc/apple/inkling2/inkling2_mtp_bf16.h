@@ -88,14 +88,14 @@ kernel void ink_commit_rows(const device ushort* stage [[buffer(0)]],device usho
 }
 
 // ------------------------------------------------------------------------------------------------ drafter
-struct MtpMix { ulong norm[4]; float alpha[16]; uint rows, first_mix, pad0, pad1; };
+struct MtpMix { ulong norm[4]; float alpha[16]; uint rows, first_mix, feat_stride, pad1; };   // feat_stride 0: rows
 // out[m][r] = RMSNorm(sum_t feat[t][r] * alpha[m][t]) * norm_m, m = first_mix..3 (3 drafter layers, the Markov head);
 // the Markov mix only for a sequence's last committed row, into frnn[sequence]
 kernel void ink_mtp_mix_rows(const device uchar* weights [[buffer(0)]],const device ushort* feat [[buffer(1)]],
     device ushort* out [[buffer(2)]],device ushort* frnn [[buffer(3)]],const device uint* cinfo [[buffer(4)]],
     constant MtpMix& p [[buffer(5)]],uint row [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) {
-    const uint R=p.rows;
+    const uint R=p.rows,FS=p.feat_stride?p.feat_stride:R;
     if(row>=R)return;
     const uint4 ci=rinfo4(cinfo,row);
     if(ci.z==0u)return;
@@ -106,7 +106,7 @@ kernel void ink_mtp_mix_rows(const device uchar* weights [[buffer(0)]],const dev
         float ss=0.0f;
         for(uint i=tid;i<FH;i+=256u) {
             float v=0.0f;
-            for(uint t=0;t<4u;++t)v+=bfu(feat[(size_t(t)*R+row)*FH+i])*p.alpha[m*4u+t];
+            for(uint t=0;t<4u;++t)v+=bfu(feat[(size_t(t)*FS+row)*FH+i])*p.alpha[m*4u+t];
             mixed[i]=v;ss+=v*v;
         }
         const float inv=metal::precise::rsqrt(tg_sum(ss,red,lane,simd)/float(FH)+1e-6f);
