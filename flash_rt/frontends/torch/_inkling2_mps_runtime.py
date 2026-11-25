@@ -24,6 +24,7 @@ from flash_rt.frontends.torch._inkling2_dflash2 import _DFlash2Mixin
 from flash_rt.frontends.torch._inkling2_mtp import MTP_BLOCK, _MTPMixin
 
 WORKERS = 36
+DIAGNOSTIC_SLOTS = 64             # per threadgroup of a resident dispatch (decode: WORKERS, verification: up to 40)
 THREADS = 256
 BLOCK = 8
 DESCRIPTOR = 64
@@ -182,7 +183,7 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
             self.plan.run(self.programs["q8_quantize"])  # Q8_0 copies of BF16 matrices, once
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
         self._packet = self.plan.view(self.buf["packet"], np.uint32, 17)
-        self._diagnostic = self.plan.view(self.buf["diagnostic"], np.uint32, WORKERS)
+        self._diagnostic = self.plan.view(self.buf["diagnostic"], np.uint32, DIAGNOSTIC_SLOTS)
         self._control = self.plan.view(self.buf["control"], np.uint32, CONTROL)
         if self.mtp:
             self._verify_params = self.plan.view(self.buf["v_params"], np.uint32, 4)
@@ -383,7 +384,7 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
             "params": 64,
             "noise": BLOCK * v * 4, "logits": BLOCK * v * 4, "trace": 2 * BLOCK * visits * H * 2,
             "packet": 17 * 4, "workspace": WORKSPACE, "debug": DEBUG_FLOATS * 4,
-            "control": CONTROL * 4, "diagnostic": WORKERS * 4, "noise_params": 64,
+            "control": CONTROL * 4, "diagnostic": DIAGNOSTIC_SLOTS * 4, "noise_params": 64,
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
