@@ -110,11 +110,45 @@ def test_speculative_decoding_follows_greedy(tokens):
         spec.rt.close()
 
 
+DFLASH2 = os.environ.get("FLASHRT_INKLING2_DFLASH2_DIR", "")
+
+
+@pytest.mark.skipif(not DFLASH2 or not Path(DFLASH2).is_dir(), reason="needs FLASHRT_INKLING2_DFLASH2_DIR")
+def test_dflash2_drafts_keep_the_greedy_output(tokens):
+    """With the DFlash 2 drafter the exact verification still gives the greedy decode's output (drafts only decide
+    how many tokens a step accepts), the fast one follows it up to a near-tie, and the drafter's tokens are accepted
+    (more than one token per step on the test text)."""
+    from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
+    spec = Inkling2TorchFrontendMps(CKPT, max_seq=256, speculative=True, verify="exact", dflash2=DFLASH2)
+    n = 24
+    try:
+        rt = spec.rt
+        stats = {}
+        got = []
+        for step in rt.mtp_steps([list(tokens)], n, stats):
+            got.extend(step[0])
+        got = got[:n]
+        tok = rt.prefill(list(tokens), features=True)
+        want, pos = [tok], len(tokens)
+        while len(want) < n:
+            out = rt.decode(want[-1], pos, min(8, n - len(want)))
+            want += out
+            pos += len(out)
+        assert got == want
+        assert stats["tokens_per_step"] > 1.0
+        rt.mtp_verify = "fast"
+        fast = spec.generate(tokens, max_new_tokens=n, stop_ids=())
+        part = next((i for i, (a, b) in enumerate(zip(fast, want)) if a != b), n)
+        assert part >= 4
+    finally:
+        spec.rt.close()
+
+
 def test_resident_verification_matches_decode_steps(tokens):
     """The exact resident verification of 8 rows repeats the decode step's arithmetic: its logits equal those of 8
-    one-row decode steps at the same positions bit for bit. The fast verification selects the same tokens here,
-    and its logits stay closer to the exact ones than the row program's (the shipped verification's) do, row by row
-    in the maximum and the mean KL (an evaluation side by side, no fixed threshold)."""
+    one-row decode steps at the same positions bit for bit. The fast verification (8 rows, and 2 or 5 rows as the
+    adaptive steps run it) selects the same tokens here, and its logits stay closer to the exact ones than the row
+    program's do, in the maximum and the mean KL over the rows (an evaluation side by side, no fixed threshold)."""
     ids = (list(tokens) * 3)[:40]
     rt = _runtime(max_seq=128, row_capacity=32, row_shapes=[(32, 1), (1, 1), (8, 8)], mtp_batches=[1])
     try:
@@ -125,6 +159,11 @@ def test_resident_verification_matches_decode_steps(tokens):
         lg = rt.plan.read(rt.buf["r_logits"], 0, np.float32, R * V).reshape(R, V).copy()
         fast = rt.verify_resident(rows, L, kind="fast")
         lf = rt.plan.read(rt.buf["r_logits"], 0, np.float32, R * V).reshape(R, V).copy()
+        # fewer rows (adaptive verification), before the decode steps below advance the caches
+        parts = {}
+        for n in (2, 5):
+            out = rt.verify_resident(rows[:n], L, kind="fast")
+            parts[n] = (out, rt.plan.read(rt.buf["r_logits"], 0, np.float32, n * V).reshape(n, V).copy())
         ref = []
         for r in range(R):
             rt.decode(rows[r], L + r, 1)
@@ -145,6 +184,11 @@ def test_resident_verification_matches_decode_steps(tokens):
             return (np.exp(lp) * (lp - lq)).sum(1)
         kf, kr = kl(lg, lf), kl(lg, lr)
         assert kf.max() <= kr.max() and kf.mean() <= kr.mean(), (kf, kr)
+        # fewer rows: the first rows' tokens, and logits as close to the exact step's as the row program's
+        for n, (part, lp) in parts.items():
+            assert part.tolist() == exact.tolist()[:n]
+            kp = kl(lg[:n], lp)
+            assert kp.max() <= kr[:n].max() and kp.mean() <= kr[:n].mean(), (n, kp, kr)
     finally:
         rt.close()
 
