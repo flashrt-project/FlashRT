@@ -4,15 +4,15 @@
 #include <string>
 
 // Resident verification step for the inkling2_loop text decoder (Inkling 2 Mini): one dispatch of 36 co-resident
-// threadgroups runs R (1..8) consecutive rows of one sequence (positions p .. p + R - 1: a speculative block, the
+// threadgroups runs R (1..16) consecutive rows of one sequence (positions p .. p + R - 1: a speculative block, the
 // anchor and its drafts) through the 48 layer visits and the LM head, with device-scope barriers between phases.
 //
 // Exact build: every row repeats the one-token resident step's arithmetic (inkling2_decode_resident_bf16) operation
 // for operation, so each row's logits equal those of a decode step at its position, bit for bit, and the greedy
 // targets are the tokens R decode steps would produce. Fast build (FRT_FAST): the same phases with the products in
 // their own order: experts in half precision on power-of-two scaled inputs (exact half products, 16-term half
-// sums, FP32 beyond), attention by blocks of key positions for all rows; with FRT_Q8 the attention projections and
-// LM head from Q8_0 copies. Per-row state lives in device memory (the one-token step's workspace layout, once per
+// sums, FP32 beyond), attention by blocks of key positions for all rows, beyond 8 rows the BF16 products by 8x8
+// MMAs; with FRT_Q8 the attention projections (up to 12 rows) and LM head from Q8_0 copies. Per-row state lives in device memory (the one-token step's workspace layout, once per
 // row, plus the row's hidden state, residual and projection inputs); weights are read once per step for all rows;
 // the routed experts of the rows are deduplicated and handed out to threadgroups from a counter, heavy experts first.
 //
@@ -22,13 +22,13 @@
 // frame and sliding K / V go to `stage` ([visit][row], the layout ink_commit_rows reads), committed after the
 // accepted prefix is known; global-layer K / V are written by position (never read past a query). The drafter
 // features of every row (the hidden state entering visits 5, 23, 41 and the final normalized state) go to `feat`.
-// `stage` and `feat` keep the row stride of 8 rows whatever the step's rows (the commit and the drafter context
-// read the layout of an 8-row step).
+// `stage` and `feat` keep the row stride of VMAX rows whatever the step's rows (the commit and the drafter context
+// read the layout of a VMAX-row step).
 
 namespace flashrt::apple::shaders {
 
 struct Inkling2VerifyOptions {
-    int rows = 8;           // rows of the step (2..8), a compile-time constant (loops over rows unrolled)
+    int rows = 8;           // rows of the step (1..16), a compile-time constant (loops over rows unrolled)
     bool trace = false;     // write every row's hidden state after every visit
     int workers = 36;
     bool fast = false;      // fast verification: own summation order in the products (not the decode step's bits)
@@ -431,17 +431,90 @@ inline void expert_fast(const device uchar* w,const device uchar* s,float gsc,ui
     }
 }
 
+#if FRT_FAST && FRT_ROWS>8u
+// Fast build, more than 8 rows: BF16 products by 8x8 MMAs (FP32 sums in their own order). A threadgroup unit of
+// 64 NB output rows, NB blocks of 8 per SIMD group, the rows in tiles of 8 (rows >= FRT_ROWS zero); inputs staged
+// XCH at a time ([16][XCH] BF16, the 16-byte groups XOR-swizzled by row against bank conflicts). Inside a 64-wide
+// chunk the k order is permuted (MMA step j, fragment position m -> k = 8 m + j): a lane's B elements are 8
+// consecutive weights of each of its two output rows (one 16-byte load each), its A elements 16 consecutive staged
+// inputs of its row. Out BF16 (row stride RS) or (HEAD) FP32 softcapped logits, vocabulary rows >= FVOCAB skipped.
+template<uint K,bool HEAD,uint NB>
+inline void gemv_rows_mma(const device ushort* w,uint unit_row0,const device ushort* x,device ushort* out,
+                          device float* logits,threadgroup ushort* xs,uint tid,uint simd,uint lane) {
+    constexpr uint T=(FRT_ROWS+7u)/8u,RP=8u*T,XG=XCH/8u;
+    static_assert(RP*XCH<=XS_CAP && K%XCH==0u && XG%8u==0u,"staged inputs");
+    const ushort fm=((lane/4u)&4u)+(lane/2u)%4u,fn=((lane/4u)&2u)*2u+(lane%2u)*2u;
+    const uint n0=unit_row0+simd*8u*NB;
+    bool live[NB];
+    FRT_UNROLL for(uint b=0;b<NB;++b)live[b]=!HEAD || n0+b*8u<FVOCAB;
+    simdgroup_float8x8 C[T][NB];
+    FRT_UNROLL for(uint t=0;t<T;++t)FRT_UNROLL for(uint b=0;b<NB;++b)C[t][b]=simdgroup_float8x8(0.0f);
+    threadgroup uint4* xg=(threadgroup uint4*)xs;
+    for(uint c0=0;c0<K;c0+=XCH) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<RP*XG;i+=256u) {
+            const uint n=i/XG,j=i%XG;
+            xg[n*XG+(j^(n&7u))]=n<FRT_ROWS?*((const device uint4*)(x+size_t(n)*RS+c0+j*8u)):uint4(0u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint kc=0;kc<XCH;kc+=64u) {
+            uint4 w0[NB],w1[NB];
+            FRT_UNROLL for(uint b=0;b<NB;++b) {
+                const uint n=n0+b*8u+fn;
+                w0[b]=live[b]?*((const device uint4*)(w+size_t(n)*K+c0+kc+fm*8u)):uint4(0u);
+                w1[b]=live[b]?*((const device uint4*)(w+size_t(n+1u)*K+c0+kc+fm*8u)):uint4(0u);
+            }
+            uint4 a0[T],a1[T];
+            FRT_UNROLL for(uint t=0;t<T;++t) {
+                const uint row=t*8u+fm,j0=kc/8u+fn;
+                a0[t]=xg[row*XG+(j0^(row&7u))];a1[t]=xg[row*XG+((j0+1u)^(row&7u))];
+            }
+            FRT_UNROLL for(uint j=0;j<8u;++j) {
+                simdgroup_float8x8 A[T];
+                FRT_UNROLL for(uint t=0;t<T;++t) {
+                    A[t].thread_elements()[0]=j%2u?hi_f(a0[t][j/2u]):lo_f(a0[t][j/2u]);
+                    A[t].thread_elements()[1]=j%2u?hi_f(a1[t][j/2u]):lo_f(a1[t][j/2u]);
+                }
+                FRT_UNROLL for(uint b=0;b<NB;++b) {
+                    if(!live[b])continue;
+                    simdgroup_float8x8 B;
+                    B.thread_elements()[0]=j%2u?hi_f(w0[b][j/2u]):lo_f(w0[b][j/2u]);
+                    B.thread_elements()[1]=j%2u?hi_f(w1[b][j/2u]):lo_f(w1[b][j/2u]);
+                    FRT_UNROLL for(uint t=0;t<T;++t)simdgroup_multiply_accumulate(C[t][b],A[t],B,C[t][b]);
+                }
+            }
+        }
+    }
+    FRT_UNROLL for(uint t=0;t<T;++t)FRT_UNROLL for(uint b=0;b<NB;++b) {
+        const uint r=t*8u+fm,col=n0+b*8u+fn;
+        if(r>=FRT_ROWS || !live[b])continue;
+        const float v0=C[t][b].thread_elements()[0],v1=C[t][b].thread_elements()[1];
+        if(HEAD) {
+            logits[size_t(r)*FVOCAB+col]=metal::precise::tanh(fdiv(rb(v0),30.0f))*30.0f;
+            logits[size_t(r)*FVOCAB+col+1u]=metal::precise::tanh(fdiv(rb(v1),30.0f))*30.0f;
+        } else {
+            *((device uint*)(out+size_t(r)*RS+col))=uint(ubf(v0))|(uint(ubf(v1))<<16);
+        }
+    }
+}
+#endif
 // Q8_0 threadgroup unit (fast, FRT_Q8): 64 output rows, a SIMD group 8 (lanes 8 rg .. 8 rg + 7: rows row0 + 2 rg,
 // + 1; lane jl the 32-input chunks c = 8 b + jl of a half of K); x [rows][K] (row stride RS) times the row's
 // power-of-two scale staged as half (max |x| 2^e below 16: 16-term half2 sums below 2^15); per chunk the half2 sums
 // times the block scale into FP32; the result divided by the row scale. Out BF16 (row stride RS) or (HEAD) FP32
 // softcapped logits. q8 table entry qt: (codes, scales) byte offsets in q8.
 enum : uint { Q8_WQ=0, Q8_WK=2, Q8_WV=4, Q8_WR=6, Q8_WG=8, Q8_WO=10, Q8_LAYER=12 };
+// staged input chunks of a K-wide product: the fewest that fit every row's chunk in XS_CAP halves (32-wide blocks)
+constexpr uint q8_chunks(uint K) {
+    uint n=(FRT_ROWS*K+XS_CAP-1u)/XS_CAP;
+    while(K%(32u*n)!=0u)++n;
+    return n;
+}
 template<uint K,bool HEAD,uint TP=1u>
 inline void q8_rows_tg(const device uchar* q8,const device ulong* qt,uint unit_row0,const device ushort* x,
                        const device float* xsc,uint xsc_stride,device ushort* out,device float* logits,
                        threadgroup half* xh,uint tid,uint simd,uint lane) {
-    constexpr uint NCH=FRT_ROWS>8u?4u:2u,KH=K/NCH,NC=KH/32u;   // staged inputs: K / NCH per row
+    constexpr uint NCH=q8_chunks(K),KH=K/NCH,NC=KH/32u;          // staged inputs: K / NCH per row
     const device char* codes=(const device char*)(q8+qt[0]);
     const device half* scl=(const device half*)(q8+qt[1]);
     const uint rg=lane/8u,jl=lane%8u;
@@ -729,11 +802,12 @@ kernel void inkling2_verify_resident_bf16(
             const device ushort* xk=xq+FH;
             const device ushort* xv=xq+2u*FH;
             device ushort* proj=RU(0,WS_PROJ);
-#if FRT_Q8
+// Q8_0 up to 12 rows; beyond, the BF16 weights by MMAs (the Q8_0 multi-row product is ALU-bound there)
+#if FRT_Q8 && FRT_ROWS<=12u
             const device ulong* qt=q8t+layer*Q8_LAYER;
             const device float* xsc=(const device float*)(RW(0)+E_XSC);
-            // units of QR rows (up to 8 rows two 64-row tiles per staged input): q, r, gate, k, v
-            constexpr uint QTP=FRT_ROWS>8u?1u:2u,QR=64u*QTP;
+            // units of QR rows (two 64-row tiles per staged input): q, r, gate, k, v
+            constexpr uint QTP=2u,QR=64u*QTP;
             constexpr uint U1=3072u/QR,U2=U1+384u/QR,U3=U2+3072u/QR,U4=U3+1024u/QR,U5=U4+1024u/QR;
             const uint units8=U5+3u+(full?8u:0u);
             for(uint u=group;u<units8;u+=FRT_WORKERS) {
@@ -758,15 +832,27 @@ kernel void inkling2_verify_resident_bf16(
             if(false)
 #endif
             {
+#if FRT_FAST && FRT_ROWS>8u
+            constexpr uint TU=128u;                          // rows of a threadgroup unit (MMA products)
+#else
             constexpr uint TU=8u*PTM;                        // rows of a threadgroup unit
+#endif
             constexpr uint UQ=3072u/TU,UR=UQ+384u/TU,UG=UR+3072u/TU,UK=UG+1024u/TU,UV=UK+1024u/TU;
             const uint units=UV+3u+(full?8u:0u);
             for(uint u=group;u<units;u+=FRT_WORKERS) {
+#if FRT_FAST && FRT_ROWS>8u
+                if(u<UQ)gemv_rows_mma<FH,false,2u>(wq,u*TU,xq,proj+P_Q,logits,xs,tid,simd,lane);
+                else if(u<UR)gemv_rows_mma<FH,false,2u>(wr,(u-UQ)*TU,xq,proj+P_R,logits,xs,tid,simd,lane);
+                else if(u<UG)gemv_rows_mma<FH,false,2u>(wg,(u-UR)*TU,xq,proj+P_G,logits,xs,tid,simd,lane);
+                else if(u<UK)gemv_rows_mma<FH,false,2u>(wk,(u-UG)*TU,xk,proj+P_K,logits,xs,tid,simd,lane);
+                else if(u<UV)gemv_rows_mma<FH,false,2u>(wv,(u-UK)*TU,xv,proj+P_V,logits,xs,tid,simd,lane);
+#else
                 if(u<UQ)gemv_rows_tg<FH,false>(wq,u*TU+simd*PTM,xq,proj+P_Q,logits,xs,tid,lane);
                 else if(u<UR)gemv_rows_tg<FH,false>(wr,(u-UQ)*TU+simd*PTM,xq,proj+P_R,logits,xs,tid,lane);
                 else if(u<UG)gemv_rows_tg<FH,false>(wg,(u-UR)*TU+simd*PTM,xq,proj+P_G,logits,xs,tid,lane);
                 else if(u<UK)gemv_rows_tg<FH,false>(wk,(u-UG)*TU+simd*PTM,xk,proj+P_K,logits,xs,tid,lane);
                 else if(u<UV)gemv_rows_tg<FH,false>(wv,(u-UK)*TU+simd*PTM,xv,proj+P_V,logits,xs,tid,lane);
+#endif
                 else if(u<UV+3u) {
                     const uint rr=(u-UV)*8u+simd;
                     float res[FRT_ROWS];
@@ -1261,7 +1347,11 @@ kernel void inkling2_verify_resident_bf16(
         // ---- output projection
         {
             const device ushort* wo=(const device ushort*)(weights+d[D_WO]);
-#if FRT_Q8
+#if FRT_ROWS>8u && (FRT_FAST || FRT_Q8)
+            // more than 8 rows: BF16 weights by MMAs (36 units of 64 rows; Q8_0 too: its multi-row product is ALU-bound)
+            for(uint u=group;u<2304u/64u;u+=FRT_WORKERS)
+                gemv_rows_mma<FQ,false,1u>(wo,u*64u,(const device ushort*)RU(0,WS_A),RU(0,WS_O),logits,xs,tid,simd,lane);
+#elif FRT_Q8
             // attention outputs |a| <= sqrt(128) (values RMS-normalized per head, the gate a sigmoid): scale 1
             for(uint u=group;u<36u;u+=FRT_WORKERS)
                 q8_rows_tg<FQ,false>(q8,q8t+layer*Q8_LAYER+Q8_WO,u*64u,(const device ushort*)RU(0,WS_A),(const device float*)nullptr,0u,
@@ -1654,10 +1744,13 @@ kernel void inkling2_verify_resident_bf16(
     {
         const device ushort* head=(const device ushort*)(weights+final[D_HEAD]);
 #if FRT_Q8
-        constexpr uint HTP=FRT_ROWS>8u?1u:2u;
+        constexpr uint HTP=2u;
         for(uint u=group;u<(FVOCAB+64u*HTP-1u)/(64u*HTP);u+=FRT_WORKERS)
             q8_rows_tg<FH,true,HTP>(q8,q8t+FLAYERS*Q8_LAYER,u*64u*HTP,(const device ushort*)RU(0,E_X),
                                 (const device float*)(RW(0)+E_XSC)+4,RSF,RU(0,E_X),logits,(threadgroup half*)xs,tid,simd,lane);
+#elif FRT_FAST && FRT_ROWS>8u
+        for(uint u=group;u<(FVOCAB+127u)/128u;u+=FRT_WORKERS)
+            gemv_rows_mma<FH,true,2u>(head,u*128u,(const device ushort*)RU(0,E_X),RU(0,E_X),logits,xs,tid,simd,lane);
 #else
         for(uint u=group;u<FVOCAB/(8u*PTM);u+=FRT_WORKERS)
             gemv_rows_tg<FH,true>(head,u*8u*PTM+simd*PTM,(const device ushort*)RU(0,E_X),RU(0,E_X),logits,xs,tid,lane);

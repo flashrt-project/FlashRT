@@ -197,8 +197,8 @@ class _MTPMixin:
     ADAPT_P_DF = (0.0, 0.336, 0.464, 0.646, 0.752, 0.855, 0.929, 0.967, 0.985, 0.993, 1.0)
     ADAPT_A_DF = (0.0, 0.06, 0.34, 0.37, 0.56, 0.56, 0.63, 0.71, 0.76, 0.82, 0.983)
     # fast verification GPU ms by rows (M4 Pro 20-core): BF16, Q8_0 attention / head
-    ADAPT_COST = {2: 35.3, 3: 40.3, 4: 44.6, 5: 49.2, 6: 53.8, 7: 58.1, 8: 61.8, 12: 94.6, 16: 119.7}
-    ADAPT_COST_Q8 = {2: 29.4, 3: 35.0, 4: 39.3, 5: 44.2, 6: 49.2, 7: 54.1, 8: 58.5, 12: 84.5, 16: 103.9}
+    ADAPT_COST = {2: 35.1, 3: 40.4, 4: 44.5, 5: 49.0, 6: 53.5, 7: 58.0, 8: 61.7, 12: 79.3, 16: 92.3}
+    ADAPT_COST_Q8 = {2: 29.4, 3: 34.7, 4: 39.5, 5: 45.4, 6: 48.6, 7: 53.6, 8: 58.0, 12: 78.5, 16: 92.1}
     # lookup drafts (one sequence, fast verification): after the drafter's 7, the 8 tokens that followed the latest
     # earlier occurrence of the last LOOKUP_N drafted tokens in the committed text (rows 12 or 16; an occurrence
     # closer than 8 tokens repeats with its period). Their agreement rate by the match length (how many tokens of the
