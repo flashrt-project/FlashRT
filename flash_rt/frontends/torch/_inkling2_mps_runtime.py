@@ -20,6 +20,7 @@ import numpy as np
 
 from flash_rt.hardware.apple_native.native import READ, READ_WRITE, WRITE, NativePlan
 from flash_rt.models.inkling2.checkpoint import Inkling2Checkpoint, Inkling2ConfigError, check_geometry
+from flash_rt.frontends.torch._inkling2_dflash2 import _DFlash2Mixin
 from flash_rt.frontends.torch._inkling2_mtp import MTP_BLOCK, _MTPMixin
 
 WORKERS = 36
@@ -103,21 +104,27 @@ def chunk_plan(n: int, sizes: Sequence[int]) -> List[int]:
     return out
 
 
-class Inkling2Runtime(_MTPMixin):
+class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
     """Owns the Metal plan, the buffers and the decode programs (batch 1)."""
     _workers, _threads = WORKERS, THREADS
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, library: Optional[str] = None,
                  sequences: int = 1, row_capacity: int = 1024, row_shapes=None, trace_rows: bool = False,
-                 mtp_batches: Sequence[int] = (), mtp_prefill: Sequence[int] = (), q8: bool = False):
+                 mtp_batches: Sequence[int] = (), mtp_prefill: Sequence[int] = (), q8: bool = False,
+                 dflash2: Optional[str] = None):
         """``sequences``: KV / conv-state slots (batched decode); ``row_capacity``: rows of a prefill chunk or a
         batched decode step. ``mtp_batches`` / ``mtp_prefill``: batch sizes and prompt lengths of DSpark
-        speculative decoding programs (mtp.safetensors; see _inkling2_mtp)."""
+        speculative decoding programs (mtp.safetensors; see _inkling2_mtp). ``dflash2``: the directory of the
+        DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2) to draft with instead of DSpark (one sequence:
+        ``mtp_batches=[1]``; see _inkling2_dflash2)."""
         if max_seq < 1 or sequences < 1 or row_capacity < 1:
             raise ValueError("max_seq, sequences and row_capacity must be positive")
         self.q8 = bool(q8)
         self.mtp_batches, self.mtp_prefill = [int(c) for c in mtp_batches], [int(p) for p in mtp_prefill]
         self.mtp = bool(self.mtp_batches)
+        self.dflash2 = str(dflash2) if dflash2 else None
+        if self.dflash2 and self.mtp_batches != [1]:
+            raise ValueError("the DFlash 2 drafter serves one sequence (mtp_batches=[1])")
         if self.mtp:
             row_capacity = max(int(row_capacity), MTP_BLOCK * max(self.mtp_batches), *self.mtp_prefill)
             if max(self.mtp_batches) > sequences:
@@ -142,11 +149,15 @@ class Inkling2Runtime(_MTPMixin):
         self.ckpt.close()
         if self.mtp:
             self._mtp_file.close()
+        if self.dflash2:
+            self._df_file.close()
         self._allocate_state()
         self._allocate_rows()
         self._arranged: Optional[Dict[int, tuple]] = None   # allocated by the first row program with MMA experts
         if self.mtp:
             self._mtp_allocate()
+        if self.dflash2:
+            self._df_allocate()
         self._q8_allocate()
         self.programs = {name: self._record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
         self.programs["noise"] = self._record_noise(self.plan.program())
@@ -181,11 +192,14 @@ class Inkling2Runtime(_MTPMixin):
         self.reset()
 
     # ------------------------------------------------------------------ Q8_0 copies
-    # The drafter's base logits use a Q8_0 copy of the LM head (drafts only decide how many tokens a step accepts).
+    # The drafter's base logits use a Q8_0 copy of the LM head and its layers Q8_0 copies of their matrices (drafts
+    # only decide how many tokens a step accepts).
     q8_draft_head = True
+    q8_drafter = True
 
     def _q8_matrices(self):
-        """(name, byte offset in the weight buffer, rows, inputs) of the BF16 matrices that get a Q8_0 copy."""
+        """(name, byte offset in the weight buffer, rows, inputs) of the BF16 matrices that get a Q8_0 copy; the byte
+        offset may be a list of (offset, rows) parts stacked into one Q8_0 matrix."""
         cfg = self.cfg
         H = cfg.hidden_size
         out = []
@@ -197,6 +211,10 @@ class Inkling2Runtime(_MTPMixin):
                     out.append((f"{i}.{slot}", int(d[slot]), rows, k))
         if self.q8 or (self.mtp and self.q8_draft_head):
             out.append(("head", int(self.table[cfg.num_layers][D_HEAD]), cfg.vocab_size, H))
+        if self.mtp and self.q8_drafter:
+            out += self._mtp_q8_matrices()
+        if self.dflash2:
+            out += self._df_q8_matrices()
         return out
 
     def _q8_allocate(self):
@@ -209,7 +227,7 @@ class Inkling2Runtime(_MTPMixin):
             scales = size
             size += rows * (k // 32) * 2
             size += (-size) % ALIGN
-            self._q8[name] = (src, rows, k, codes, scales)
+            self._q8[name] = (src if isinstance(src, list) else [(src, rows)], rows, k, codes, scales)
         if self._q8:
             self.buf["q8"] = self.plan.buffer(size)
         if self.q8:
@@ -223,21 +241,30 @@ class Inkling2Runtime(_MTPMixin):
 
     def _record_q8_quantize(self) -> int:
         program = self.plan.program()
-        for name, (src, rows, k, codes, scales) in self._q8.items():
-            prm = self._param(np.array([src], np.uint64).tobytes() + np.array([rows, k, 0, 0], np.uint32).tobytes())
-            n = rows * (k // 32)
-            self.plan.dispatch("q8_0_quantize_bf16", [(self.buf["weights"], 0, READ), (self.buf["q8"], codes, WRITE),
-                                                      (self.buf["q8"], scales, WRITE), (self.buf["args"], prm, READ)],
-                               ((n + 255) // 256, 1, 1), 256, label=f"q8_quantize_{name}")
+        for name, (parts, rows, k, codes, scales) in self._q8.items():
+            r0 = 0
+            for src, pr in parts:
+                prm = self._param(np.array([src], np.uint64).tobytes() + np.array([pr, k, 0, 0], np.uint32).tobytes())
+                n = pr * (k // 32)
+                self.plan.dispatch("q8_0_quantize_bf16", [(self.buf["weights"], 0, READ),
+                                                          (self.buf["q8"], codes + r0 * k, WRITE),
+                                                          (self.buf["q8"], scales + r0 * (k // 32) * 2, WRITE),
+                                                          (self.buf["args"], prm, READ)],
+                                   ((n + 255) // 256, 1, 1), 256, label=f"q8_quantize_{name}")
+                r0 += pr
         return program
+
+    q8_groups = 80                       # threadgroups of the staged Q8_0 product
 
     def _q8_rows(self, name, x, x_off, x_stride, rows, y, y_off, y_stride, label):
         """y[r] = Q8_0 matrix `name` x x[r] (FP32 out) for rows <= 8."""
         _, n, k, codes, scales = self._q8[name]
         prm = self._param(np.array([rows, n, k, x_stride, y_stride, 0, 0, 0], np.uint32).tobytes())
-        self.plan.dispatch("q8_0_rows_f32", [(x, x_off, READ), (self.buf["q8"], codes, READ), (self.buf["q8"], scales, READ),
-                                             (y, y_off, WRITE), (self.buf["args"], prm, READ)], ((n + 63) // 64, 1, 1), 256,
-                           label=label)
+        staged = rows * k <= 16128           # whole input in threadgroup memory: a fixed grid, the input staged once
+        self.plan.dispatch("q8_0_rows_f32_staged" if staged else "q8_0_rows_f32",
+                           [(x, x_off, READ), (self.buf["q8"], codes, READ), (self.buf["q8"], scales, READ),
+                            (y, y_off, WRITE), (self.buf["args"], prm, READ)],
+                           (min(self.q8_groups, (n + 63) // 64) if staged else (n + 63) // 64, 1, 1), 256, label=label)
 
     # ------------------------------------------------------------------ weights
     def _upload_weights(self):
@@ -333,6 +360,8 @@ class Inkling2Runtime(_MTPMixin):
             ring_offset += 4 * RING_FRAME
         if self.mtp:
             self._mtp_upload(layout)
+        if self.dflash2:
+            self._df_upload(layout)
         self.weight_bytes = layout.size
         self.buf["weights"] = self.plan.buffer(layout.size)
         dst = self.plan.view(self.buf["weights"], np.uint8, layout.size)

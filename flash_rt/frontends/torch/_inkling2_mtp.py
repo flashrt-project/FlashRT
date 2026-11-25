@@ -10,8 +10,10 @@ size, ``mtp_widths``), and the longest agreeing prefix plus the target's next to
 one sequence (``mtp_verify``): "fast" (default), a resident step over the rows with its own summation order (half
 code products, position-block attention; within the rounding of the decode step); "resident", a resident step with
 every row the decode step's arithmetic (the output is the greedy decode's bit for bit); "rows", the row programs (also
-for several sequences). The Markov walk ranks the 256 largest base logits of a drafted position (from a Q8_0 copy of
-the LM head): drafts only decide how many tokens a step accepts.
+for several sequences). With the fast verification of one sequence a step verifies 2-8 rows, chosen from the walk's
+probabilities of the drafts (``mtp_adaptive``); its drafter layers and the LM head of its base logits run from Q8_0
+copies. The Markov walk ranks the 256 largest base logits of a drafted position: drafts only decide how many tokens
+a step accepts. A step's commit runs in the next step's draft command buffer.
 
 Mixed into ``Inkling2Runtime`` (programs must be recorded before the plan is sealed).
 """
@@ -25,6 +27,7 @@ from typing import Dict, Iterator, List, Sequence
 
 import numpy as np
 
+from flash_rt.frontends.torch._inkling2_dflash2 import DF_MASK
 from flash_rt.hardware.apple_native.native import READ, READ_WRITE, WRITE
 from flash_rt.models.inkling2.checkpoint import SafetensorsFile, check_mtp_config
 
@@ -103,6 +106,41 @@ class _MTPMixin:
         self._mtp_file = st              # closed once the layout has been copied (its arrays view the file)
         self.mtp_w = w
 
+    def _mtp_q8_matrices(self):
+        """Drafter layer matrices with a Q8_0 copy: (name, byte offset, rows, inputs)."""
+        H, w = self.cfg.hidden_size, self.mtp_w
+        out = []
+        for l in range(MTP_LAYERS):      # q | k | v and gate | up stacked: one product each, outputs in that layout
+            out.append((f"mtp{l}.qkv", [(int(w[f"{l}.q"]), 3072), (int(w[f"{l}.k"]), 1024), (int(w[f"{l}.v"]), 1024)],
+                        5120, H))
+            out.append((f"mtp{l}.o", int(w[f"{l}.o"]), H, 3072))
+            out.append((f"mtp{l}.gate_up", [(int(w[f"{l}.gate"]), MTP_INTER), (int(w[f"{l}.up"]), MTP_INTER)],
+                        2 * MTP_INTER, H))
+            out.append((f"mtp{l}.down", int(w[f"{l}.down"]), H, MTP_INTER))
+        return out
+
+    def _q8_prep(self, x, x_off, x_stride, rows, k, label):
+        """Inputs of q8_0_rows8: rows x k BF16 -> half times a power of two per row (m_xh, m_xsc)."""
+        prm = self._param(np.array([rows, 0, k, x_stride, 0, 0, 0, 0], np.uint32).tobytes())
+        self.plan.dispatch("q8_0_prep_rows", [(x, x_off, READ), (self.buf["m_xh"], 0, WRITE),
+                                              (self.buf["m_xsc"], 0, WRITE), (self.buf["args"], prm, READ)],
+                           (rows, 1, 1), 256, label=label + "_prep")
+
+    def _q8_rows8(self, name, rows, y, y_stride, y_col, label, row0=0, nrows=None):
+        """y[r][y_col + n] (BF16) = Q8_0 matrix `name` (its rows row0 .. row0 + nrows) x the prepared inputs,
+        rows <= 8."""
+        _, n, k, codes, scales = self._q8[name]
+        codes, scales = codes + row0 * k, scales + row0 * (k // 32) * 2
+        n = n - row0 if nrows is None else nrows
+        kc = next(c for c in (1536, 1024, 768, 512, 256) if k % c == 0)
+        tiles = 2 if (n + 127) // 128 >= self.q8_groups else 1      # 64-row tiles per work item
+        prm = self._param(np.array([rows, n, k, 0, y_stride, y_col, kc, 1 | (2 if tiles == 1 else 0)],
+                                   np.uint32).tobytes())
+        self.plan.dispatch("q8_0_rows8", [(self.buf["m_xh"], 0, READ), (self.buf["m_xsc"], 0, READ),
+                                          (self.buf["q8"], codes, READ), (self.buf["q8"], scales, READ),
+                                          (y, 0, WRITE), (self.buf["args"], prm, READ)],
+                           (min(self.q8_groups, (n + 64 * tiles - 1) // (64 * tiles)), 1, 1), 256, label=label)
+
     # ------------------------------------------------------------------ buffers
     def _mtp_allocate(self) -> None:
         H, V = self.cfg.hidden_size, self.cfg.vocab_size
@@ -123,7 +161,8 @@ class _MTPMixin:
             "m_state": S * MTP_RANK * bf, "m_rnnin": S * (2 * MTP_RANK + 2 * H) * bf, "m_proj": S * 3 * MTP_RANK * f32,
             "m_latent": S * MTP_RANK * bf, "m_bias": S * V * f32, "m_prev": S * 4, "m_drafts": S * 7 * 4,
             "v_ws": VERIFY_WORKSPACE, "v_params": 16,
-            "m_cidx": S * 7 * MTP_CAND * 4, "m_cval": S * 7 * MTP_CAND * f32,
+            "m_cidx": S * 7 * MTP_CAND * 4, "m_cval": S * 7 * MTP_CAND * f32, "m_dtop": S * 7 * 16 * f32,
+            "m_xh": 8 * MTP_INTER * 2, "m_xsc": 8 * f32,
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
@@ -138,6 +177,25 @@ class _MTPMixin:
     # verified rows per sequence and step (the anchor + W - 1 drafts) by batch size: verification grows with the
     # rows while the accepted length saturates, so larger batches verify fewer drafts
     mtp_widths = {1: 8, 4: 8, 16: 4, 64: 3}
+
+    # one sequence, fast verification: rows per step chosen from the drafts' walk probabilities, maximizing expected
+    # tokens - rate x verification time (rate: measured tokens per ms; time: a relative cost by rows, scaled by the
+    # measured times). Agreement probability of a drafted token by its walk probability (measured on the corpus):
+    mtp_adaptive = True
+    ADAPT_P = (0.0, 0.308, 0.503, 0.707, 0.852, 0.927, 0.976, 0.999, 1.0)
+    ADAPT_A = (0.0, 0.19, 0.37, 0.585, 0.62, 0.744, 0.82, 0.981, 0.99)
+    # the agreement rates follow the text: per probability bin, accepted / reached drafted positions of the
+    # verified steps, the table above as a prior of ADAPT_PRIOR positions, decayed by ADAPT_DECAY per step
+    ADAPT_EDGES = (0.0, 0.4, 0.6, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 1.01)
+    ADAPT_PRIOR, ADAPT_DECAY = 10.0, 0.99
+    # every ADAPT_EXPLORE-th step verifies all rows (the positions a shorter step leaves out are observed too)
+    ADAPT_EXPLORE = 0
+    # DFlash 2: a mask row's largest softmax probability of the LM head
+    ADAPT_P_DF = (0.0, 0.336, 0.464, 0.646, 0.752, 0.855, 0.929, 0.967, 0.985, 0.993, 1.0)
+    ADAPT_A_DF = (0.0, 0.06, 0.34, 0.37, 0.56, 0.56, 0.63, 0.71, 0.76, 0.82, 0.983)
+    # fast verification GPU ms by rows (M4 Pro 20-core): BF16, Q8_0 attention / head
+    ADAPT_COST = {2: 35.3, 3: 40.3, 4: 44.6, 5: 49.2, 6: 53.8, 7: 58.1, 8: 61.8}
+    ADAPT_COST_Q8 = {2: 29.4, 3: 35.0, 4: 39.3, 5: 44.2, 6: 49.2, 7: 54.1, 8: 58.5}
 
     def mtp_width(self, C: int) -> int:
         for limit in sorted(self.mtp_widths):
@@ -157,14 +215,23 @@ class _MTPMixin:
             self.mtp_programs[("verify", C)] = self._record_rows(R, R, stage=True, features=True)
             if C == 1 and R in VERIFY_ROWS:     # one sequence: the resident steps (exact / fast; Q8_0: fast only)
                 for kind in (("fast",) if self.q8 else ("resident", "fast")):
-                    self.mtp_programs[(f"verify_{kind}", R)] = self._record_verify(R, kind, reference=False)
+                    # fast: every row count (adaptive rows); exact: the full width
+                    for rows in (VERIFY_ROWS if kind == "fast" else (R,)):
+                        self.mtp_programs[(f"verify_{kind}", rows)] = self._record_verify(rows, kind, reference=False)
                     if self.trace_rows:
                         self.mtp_programs[(f"verify_{kind}_reference", R)] = self._record_verify(R, kind, reference=True)
             self.mtp_programs[("commit", C)] = self._mtp_record_commit(R)
-            self.mtp_programs[("draft", C)] = self._mtp_record_draft(C, W)
+            # the last step's commit and the next draft in one command buffer (independent: the draft reads the
+            # drafter's own context, not the target caches)
+            if self.dflash2:
+                self.mtp_programs[("draft", C)] = self._df_record_draft(W)
+                self.mtp_programs[("commit_draft", C)] = self._df_record_draft(W, commit=R)
+            else:
+                self.mtp_programs[("draft", C)] = self._mtp_record_draft(C, W)
+                self.mtp_programs[("commit_draft", C)] = self._mtp_record_draft(C, W, commit=R)
         for P in self.mtp_prefill:     # target rows with features, then the drafter context of the same rows
-            self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True,
-                                                                  then=lambda P=P: self._mtp_context(P))
+            context = (lambda P=P: self._df_context(P, q8=False)) if self.dflash2 else (lambda P=P: self._mtp_context(P))
+            self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True, then=context)
 
     def _record_verify(self, R: int, kind: str = "resident", reference: bool = False) -> int:
         b, plan = self.buf, self.plan
@@ -201,9 +268,9 @@ class _MTPMixin:
             raise RuntimeError(f"resident verification barrier timed out (diagnostic {self._diagnostic.tolist()})")
         return self.plan.read(self.buf["r_out"], 0, np.uint32, R).copy()
 
-    def _mtp_record_commit(self, R: int) -> int:
+    def _mtp_record_commit(self, R: int, program: int | None = None) -> int:
         b, plan = self.buf, self.plan
-        program = plan.program()
+        program = plan.program() if program is None else program
         nv = len(self.cfg.visits())
         kv_off = np.zeros(48, np.uint64)
         ring_off = np.zeros(48, np.uint64)
@@ -244,12 +311,14 @@ class _MTPMixin:
                                                  (b["m_cinfo"], 0, READ), (A, ctx, READ)], (R, 1, 1), 256,
                       label="mtp_ctx_write")
 
-    def _mtp_record_draft(self, C: int, W: int) -> int:
+    def _mtp_record_draft(self, C: int, W: int, commit: int = 0) -> int:
         b, plan, w, cfg = self.buf, self.plan, self.mtp_w, self.cfg
         H, V = cfg.hidden_size, cfg.vocab_size
         R = MTP_BLOCK * C
         A = b["args"]
         program = plan.program()
+        if commit:
+            self._mtp_record_commit(commit, program)
         self._mtp_context(W * C)                  # the last verify step's rows
         # anchors' normalized embeddings (the target's embedding kernel), block rows
         rv0 = self._visit_param(0, C, 0, [], 0)
@@ -268,12 +337,17 @@ class _MTPMixin:
                                                 (b["m_dinfo"], 0, READ)], (R, 1, 1), 256, label="mtp_norm")
 
         layer_elems = 2 * 8 * self.mtp_cap * 128
+        q8 = self.q8_drafter and R <= 8          # drafter layers from their Q8_0 copies (one sequence)
         for l in range(MTP_LAYERS):
             norm(w[f"{l}.in_norm"], "m_mlp" if l else None)
-            self._gemm_multi("ink_gemm_bf16_multi", R, [(w[f"{l}.q"], 3072, H, 0, H, 0, 0, 5120),
-                                                        (w[f"{l}.k"], 1024, H, 0, H, 0, 3072, 5120),
-                                                        (w[f"{l}.v"], 1024, H, 0, H, 0, 4096, 5120)],
-                             [(b["m_x"], 0)], [(b["m_qkv"], 0)], "mtp_qkv")
+            if q8:
+                self._q8_prep(b["m_x"], 0, H, R, H, "mtp_qkv")
+                self._q8_rows8(f"mtp{l}.qkv", R, b["m_qkv"], 5120, 0, "mtp_qkv")
+            else:
+                self._gemm_multi("ink_gemm_bf16_multi", R, [(w[f"{l}.q"], 3072, H, 0, H, 0, 0, 5120),
+                                                            (w[f"{l}.k"], 1024, H, 0, H, 0, 3072, 5120),
+                                                            (w[f"{l}.v"], 1024, H, 0, H, 0, 4096, 5120)],
+                                 [(b["m_x"], 0)], [(b["m_qkv"], 0)], "mtp_qkv")
             qk = self._param(np.array([w[f"{l}.qn"], w[f"{l}.kn"], self.mtp_seq_kv, l * layer_elems], np.uint64).tobytes() +
                              np.array([R, self.mtp_cap], np.uint32).tobytes() +
                              np.array([MTP_THETA], np.float32).tobytes() + np.zeros(1, np.uint32).tobytes())
@@ -284,16 +358,28 @@ class _MTPMixin:
                              np.array([R, self.mtp_cap, MTP_WINDOW if l in (0, 2) else 0, 0], np.uint32).tobytes())
             plan.dispatch("ink_mtp_attn_rows", [(b["m_q"], 0, READ), (b["m_kv"], 0, READ), (b["m_attn"], 0, WRITE),
                                                 (b["m_dinfo"], 0, READ), (A, at, READ)], (8, R, 1), 256, label="mtp_attn")
-            self._gemm("ink_gemm_bf16_rows", b["m_attn"], 0, 3072, w[f"{l}.o"], H, 3072, b["m_o"], 0, H, 0, R, True)
+            if q8:
+                self._q8_prep(b["m_attn"], 0, 3072, R, 3072, "mtp_o")
+                self._q8_rows8(f"mtp{l}.o", R, b["m_o"], H, 0, "mtp_o")
+            else:
+                self._gemm("ink_gemm_bf16_rows", b["m_attn"], 0, 3072, w[f"{l}.o"], H, 3072, b["m_o"], 0, H, 0, R, True)
             norm(w[f"{l}.post_norm"], "m_o")
-            self._gemm_multi("ink_gemm_bf16_multi", R, [(w[f"{l}.gate"], MTP_INTER, H, 0, H, 0, 0, 2 * MTP_INTER),
-                                                        (w[f"{l}.up"], MTP_INTER, H, 0, H, 0, MTP_INTER, 2 * MTP_INTER)],
-                             [(b["m_x"], 0)], [(b["m_gu"], 0)], "mtp_gate_up")
+            if q8:
+                self._q8_prep(b["m_x"], 0, H, R, H, "mtp_gate_up")
+                self._q8_rows8(f"mtp{l}.gate_up", R, b["m_gu"], 2 * MTP_INTER, 0, "mtp_gate_up")
+            else:
+                self._gemm_multi("ink_gemm_bf16_multi", R, [(w[f"{l}.gate"], MTP_INTER, H, 0, H, 0, 0, 2 * MTP_INTER),
+                                                            (w[f"{l}.up"], MTP_INTER, H, 0, H, 0, MTP_INTER, 2 * MTP_INTER)],
+                                 [(b["m_x"], 0)], [(b["m_gu"], 0)], "mtp_gate_up")
             nr = self._param(np.array([R], np.uint32).tobytes())
             plan.dispatch("ink_mtp_silu_rows", [(b["m_gu"], 0, READ), (b["m_act"], 0, WRITE), (A, nr, READ)],
                           ((R * MTP_INTER + 255) // 256, 1, 1), 256, label="mtp_silu")
-            self._gemm("ink_gemm_bf16_rows", b["m_act"], 0, MTP_INTER, w[f"{l}.down"], H, MTP_INTER, b["m_mlp"], 0, H, 0,
-                       R, True)
+            if q8:
+                self._q8_prep(b["m_act"], 0, MTP_INTER, R, MTP_INTER, "mtp_down")
+                self._q8_rows8(f"mtp{l}.down", R, b["m_mlp"], H, 0, "mtp_down")
+            else:
+                self._gemm("ink_gemm_bf16_rows", b["m_act"], 0, MTP_INTER, w[f"{l}.down"], H, MTP_INTER, b["m_mlp"], 0,
+                           H, 0, R, True)
         norm(w["norm"], "m_mlp", final=True)
         f = self.table[cfg.num_layers]
         nd = W - 1                                 # drafted positions verified per step
@@ -315,8 +401,12 @@ class _MTPMixin:
                                              (b["m_state"], 0, READ), (b["m_prev"], 0, READ), (b["m_rnnin"], 0, WRITE),
                                              (A, rnn, READ)], (C, 1, 1), 256, label="mtp_rnn_in")
             K = 2 * MTP_RANK + 2 * H
-            self._gemm("ink_gemm_f32_rows", b["m_rnnin"], 0, K, w["m.rnn"], 3 * MTP_RANK, K, b["m_proj"], 0,
-                       3 * MTP_RANK, 0, C, True)
+            if C == 1:      # one row: a SIMD group per output (the TensorOps tiles stream the matrix for 8 rows)
+                self._gemv_rows(C, [(w["m.rnn"], 3 * MTP_RANK, K, 0, 0, 3 * MTP_RANK, 2)], [(b["m_rnnin"], 0)],
+                                (b["m_proj"], 0), yf=(b["m_proj"], 0), label="mtp_rnn")
+            else:
+                self._gemm("ink_gemm_f32_rows", b["m_rnnin"], 0, K, w["m.rnn"], 3 * MTP_RANK, K, b["m_proj"], 0,
+                           3 * MTP_RANK, 0, C, True)
             gt = self._param(np.array([w["m.rnn_b"]], np.uint64).tobytes() + np.array([C, 0], np.uint32).tobytes())
             plan.dispatch("ink_mtp_gates", [(b["weights"], 0, READ), (b["m_proj"], 0, READ), (b["m_state"], 0, READ_WRITE),
                                             (b["m_latent"], 0, WRITE), (A, gt, READ)], ((C * MTP_RANK + 255) // 256, 1, 1),
@@ -325,7 +415,8 @@ class _MTPMixin:
                 pc = self._param(np.array([w["fold_w"]], np.uint64).tobytes() + np.array([C, step, 0, 0], np.uint32).tobytes())
                 plan.dispatch("ink_mtp_pick_cand", [(b["weights"], 0, READ), (b["m_cidx"], 0, READ), (b["m_cval"], 0, READ),
                                                     (b["m_latent"], 0, READ), (b["m_prev"], 0, READ_WRITE),
-                                                    (b["m_drafts"], 0, WRITE), (A, pc, READ)], (C, 1, 1), 256,
+                                                    (b["m_drafts"], 0, WRITE), (A, pc, READ), (b["m_dtop"], 0, WRITE)],
+                              (C, 1, 1), 256,
                               label="mtp_pick_cand")
                 continue
             self._gemm("ink_gemm_f32_rows", b["m_latent"], 0, MTP_RANK, w["fold_w"], V, MTP_RANK, b["m_bias"], 0, V, 0,
@@ -363,64 +454,106 @@ class _MTPMixin:
         count = [1] * C
         yield [[int(t)] for t in anchor]
         cinfo = np.zeros((R, 4), np.uint32)            # first draft step: no new context rows
-        steps = accepted = active = 0
-        gpu = {"draft": 0.0, "verify": 0.0, "commit": 0.0}
+        steps = accepted = active = rows_total = 0
+        gpu = {"draft": 0.0, "verify": 0.0}
+        adaptive = (self.mtp_adaptive and C == 1 and self.mtp_verify == "fast"
+                    and all(("verify_fast", r) in self.mtp_programs for r in self.ADAPT_COST))
+        rate, scale = 0.075, 1.0            # tokens per ms of a step; measured / relative verification time
+        cost = self.ADAPT_COST_Q8 if self.q8 else self.ADAPT_COST
+        cal_p, cal_a = (self.ADAPT_P_DF, self.ADAPT_A_DF) if self.dflash2 else (self.ADAPT_P, self.ADAPT_A)
+        edges = np.asarray(self.ADAPT_EDGES)
+        mids = np.minimum((edges[:-1] + edges[1:]) / 2, 1.0)
+        reach = np.full(len(mids), self.ADAPT_PRIOR)
+        agreed = reach * np.interp(mids, cal_p, cal_a)
+        pending = False                     # a commit written, run with the next draft (or when the loop ends)
         t_start = time.perf_counter()
-        while min(count) < limit:
-            # draft
-            dinfo = np.zeros((RB, 4), np.uint32)
-            for s in range(C):
-                dinfo[s * 8:(s + 1) * 8] = [[s, pos[s] + j, pos[s], j] for j in range(8)]
-            plan.write(b["m_cinfo"], 0, cinfo)
-            plan.write(b["m_dinfo"], 0, dinfo)
-            plan.write(b["m_anchor"], 0, anchor)
-            plan.write(b["m_prev"], 0, anchor)
-            plan.view(b["m_state"], np.uint16, C * MTP_RANK)[:] = 0
-            gpu["draft"] += plan.run(self.mtp_programs[("draft", C)])["gpu_us"]
-            drafts = plan.read(b["m_drafts"], 0, np.uint32, C * 7).reshape(C, 7)[:, :W - 1]
-            # verify
-            toks = np.concatenate([anchor[:, None], drafts], axis=1).reshape(-1)
-            vinfo = np.zeros((R, 4), np.uint32)
-            for s in range(C):
-                vinfo[s * W:(s + 1) * W] = [[s, pos[s] + j, pos[s], pos[s] + W - 1] for j in range(W)]
-            plan.write(b["r_tokens"], 0, toks.astype(np.uint32))
-            plan.write(b["r_info"], 0, vinfo)
-            if self.mtp_verify in ("resident", "fast") and C == 1 and (f"verify_{self.mtp_verify}", R) in self.mtp_programs:
-                self._verify_params[:] = [pos[0], 0, 0, 0]
-                self._control[:] = 0
-                self._diagnostic[:] = 0
-                gpu["verify"] += plan.run(self.mtp_programs[(f"verify_{self.mtp_verify}", R)])["gpu_us"]
-                if self._diagnostic.any():
-                    raise RuntimeError(f"resident verification barrier timed out ({self._diagnostic.tolist()})")
-            else:
-                gpu["verify"] += plan.run(self.mtp_programs[("verify", C)])["gpu_us"]
-            target = plan.read(b["r_out"], 0, np.uint32, R).reshape(C, W)
-            commit = np.zeros((R, 2), np.uint32)
-            cinfo = np.zeros((R, 4), np.uint32)
-            new_tokens: List[List[int]] = [[] for _ in range(C)]
-            for s in range(C):
-                if count[s] >= limit:
-                    continue                    # finished: frozen (rows recomputed, nothing committed)
-                n = 0
-                while n < W - 1 and drafts[s, n] == target[s, n]:
-                    n += 1
-                new_tokens[s] = [int(t) for t in drafts[s, :n]] + [int(target[s, n])]
-                count[s] += n + 1
-                commit[s * W:s * W + n + 1, 0] = 1
-                commit[s * W:(s + 1) * W, 1] = pos[s] + n
-                cinfo[s * W:s * W + n + 1] = [[s, pos[s] + j, 1, 1 if j == n else 0] for j in range(n + 1)]
-                anchor[s] = target[s, n]
-                pos[s] += n + 1
-                accepted += n + 1
-                active += 1
-            plan.write(b["m_commit"], 0, commit)
-            gpu["commit"] += plan.run(self.mtp_programs[("commit", C)])["gpu_us"]
-            steps += 1
-            if stats is not None:
-                stats.update(steps=steps, tokens_per_step=accepted / max(1, active),
-                             decode_s=time.perf_counter() - t_start,
-                             **{k + "_ms_per_step": v / 1000 / steps for k, v in gpu.items()})
-            yield new_tokens
+        try:
+            while min(count) < limit:
+                t_step = time.perf_counter()
+                # draft
+                dinfo = np.zeros((RB, 4), np.uint32)
+                for s in range(C):
+                    dinfo[s * 8:(s + 1) * 8] = [[s, pos[s] + j, pos[s], j] for j in range(8)]
+                plan.write(b["m_cinfo"], 0, cinfo)
+                plan.write(b["m_dinfo"], 0, dinfo)
+                plan.write(b["m_anchor"], 0, anchor)
+                plan.write(b["m_prev"], 0, anchor)
+                plan.view(b["m_state"], np.uint16, C * MTP_RANK)[:] = 0
+                if self.dflash2:            # the block: the anchor and 7 mask tokens
+                    plan.write(b["df_tok"], 0, np.array([anchor[0]] + [DF_MASK] * 7, np.uint32))
+                gpu["draft"] += plan.run(self.mtp_programs[("commit_draft" if pending else "draft", C)])["gpu_us"]
+                pending = False
+                drafts = plan.read(b["m_drafts"], 0, np.uint32, C * 7).reshape(C, 7)[:, :W - 1]
+                V = W                                  # verified rows per sequence this step
+                if adaptive:
+                    top = plan.read(b["m_dtop"], 0, np.float32, 7 * 16).reshape(7, 16)
+                    bins = np.clip(np.searchsorted(edges, np.exp(top[:W - 1, 4] - top[:W - 1, 8]), "right") - 1,
+                                   0, len(mids) - 1)
+                    agree = np.cumprod((agreed / reach)[bins])
+                    expect = np.concatenate([[1.0], 1.0 + np.cumsum(agree)])     # expected tokens of V rows: [V - 1]
+                    V = max(cost, key=lambda r: expect[r - 1] - rate * scale * cost[r])
+                    if self.ADAPT_EXPLORE and steps % self.ADAPT_EXPLORE == self.ADAPT_EXPLORE - 1:
+                        V = W
+                # verify
+                toks = np.concatenate([anchor[:, None], drafts[:, :V - 1]], axis=1).reshape(-1)
+                vinfo = np.zeros((R, 4), np.uint32)
+                for s in range(C):
+                    vinfo[s * W:s * W + V] = [[s, pos[s] + j, pos[s], pos[s] + V - 1] for j in range(V)]
+                plan.write(b["r_tokens"], 0, toks.astype(np.uint32))
+                plan.write(b["r_info"], 0, vinfo)
+                resident = (f"verify_{self.mtp_verify}", V)
+                if self.mtp_verify in ("resident", "fast") and C == 1 and resident in self.mtp_programs:
+                    self._verify_params[:] = [pos[0], 0, 0, 0]
+                    self._control[:] = 0
+                    self._diagnostic[:] = 0
+                    us = plan.run(self.mtp_programs[resident])["gpu_us"]
+                    gpu["verify"] += us
+                    if self._diagnostic.any():
+                        raise RuntimeError(f"resident verification barrier timed out ({self._diagnostic.tolist()})")
+                    if adaptive:
+                        scale = 0.9 * scale + 0.1 * (us / 1000 / cost[V])
+                else:
+                    gpu["verify"] += plan.run(self.mtp_programs[("verify", C)])["gpu_us"]
+                target = plan.read(b["r_out"], 0, np.uint32, C * V).reshape(C, V)
+                commit = np.zeros((R, 2), np.uint32)
+                cinfo = np.zeros((R, 4), np.uint32)
+                new_tokens: List[List[int]] = [[] for _ in range(C)]
+                for s in range(C):
+                    if count[s] >= limit:
+                        continue                    # finished: frozen (rows recomputed, nothing committed)
+                    n = 0
+                    while n < V - 1 and drafts[s, n] == target[s, n]:
+                        n += 1
+                    new_tokens[s] = [int(t) for t in drafts[s, :n]] + [int(target[s, n])]
+                    count[s] += n + 1
+                    commit[s * W:s * W + n + 1, 0] = 1
+                    commit[s * W:(s + 1) * W, 1] = pos[s] + n
+                    cinfo[s * W:s * W + n + 1] = [[s, pos[s] + j, 1, 1 if j == n else 0] for j in range(n + 1)]
+                    anchor[s] = target[s, n]
+                    pos[s] += n + 1
+                    accepted += n + 1
+                    active += 1
+                    if adaptive:            # drafted positions 0 .. min(n, V - 2) were reached, n of them agreed
+                        reach *= self.ADAPT_DECAY
+                        agreed *= self.ADAPT_DECAY
+                        k = np.arange(min(n, V - 2) + 1)
+                        np.add.at(reach, bins[k], 1.0)
+                        np.add.at(agreed, bins[k], (k < n).astype(np.float64))
+                plan.write(b["m_commit"], 0, commit)
+                pending = True
+                steps += 1
+                rows_total += V
+                now = time.perf_counter()
+                if adaptive:
+                    rate = 0.9 * rate + 0.1 * (sum(len(t) for t in new_tokens) / max(1e-3, 1e3 * (now - t_step)))
+                if stats is not None:
+                    stats.update(steps=steps, tokens_per_step=accepted / max(1, active),
+                                 rows_per_step=rows_total / steps, decode_s=now - t_start,
+                                 **{k + "_ms_per_step": v / 1000 / steps for k, v in gpu.items()})
+                yield new_tokens
+        finally:
+            if pending:
+                plan.run(self.mtp_programs[("commit", C)])
 
     def mtp_generate(self, prompts: Sequence[Sequence[int]], new_tokens: int, stats: dict | None = None
                      ) -> List[List[int]]:

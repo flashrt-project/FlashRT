@@ -56,6 +56,9 @@ def main():
     ap.add_argument("--mtp", action="store_true", help="DSpark speculative decoding")
     ap.add_argument("--verify", choices=("fast", "exact", "rows"), default="fast",
                     help="verification of one sequence with --mtp (C = 1)")
+    ap.add_argument("--fixed-rows", action="store_true",
+                    help="fast verification of one sequence: always 8 rows (default: 2-8 chosen per step)")
+    ap.add_argument("--dflash2", default=None, help="DFlash 2 drafter directory (with --mtp, C = 1)")
     ap.add_argument("--q8", action="store_true", help="Q8_0 attention projections and LM head")
     args = ap.parse_args()
     if args.q8 and args.verify == "exact":
@@ -74,8 +77,10 @@ def main():
     chunks = [c for c in (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1) if c <= P]
     rt = Inkling2Runtime(args.model, max_seq=P + G + 16, sequences=max(concs), row_capacity=max(chunks[0], max(concs)),
                          row_shapes=[(1, 1)] if args.mtp else [(c, 1) for c in chunks] + [(c, c) for c in concs if c > 1],
-                         mtp_batches=concs if args.mtp else (), mtp_prefill=chunks if args.mtp else (), q8=args.q8)
+                         mtp_batches=concs if args.mtp else (), mtp_prefill=chunks if args.mtp else (), q8=args.q8,
+                         dflash2=args.dflash2 if args.mtp else None)
     rt.mtp_verify = {"fast": "fast", "exact": "resident", "rows": "rows"}[args.verify]
+    rt.mtp_adaptive = not args.fixed_rows
     results = {}
     for C in concs:
         rows = []
@@ -89,6 +94,7 @@ def main():
                 decode = stats["decode_s"]
                 prefill = time.perf_counter() - t0 - decode
                 extra = {"tokens_per_step": round(stats["tokens_per_step"], 3),
+                         "rows_per_step": round(stats["rows_per_step"], 2),
                          "step_ms": round(1e3 * decode / stats["steps"], 2),
                          "verify_ms": round(stats["verify_ms_per_step"], 2), "draft_ms": round(stats["draft_ms_per_step"], 2)}
             else:
@@ -109,7 +115,8 @@ def main():
             n_tok = (G - 1) * C
             row = dict(prefill_s=prefill, decode_s=decode, agg_tps=n_tok / decode, per_seq_tps=n_tok / decode / C)
             verify = (args.verify if C == 1 else "rows") if args.mtp else None   # several sequences: row programs
-            print(json.dumps({"conc": C, "rep": rep, "mtp": args.mtp, "verify": verify,
+            adaptive = verify == "fast" and not args.fixed_rows
+            print(json.dumps({"conc": C, "rep": rep, "mtp": args.mtp, "verify": verify, "adaptive": adaptive,
                               "q8": args.q8, **{k: round(v, 3) for k, v in row.items()},
                               **extra}), flush=True)
             if rep:
