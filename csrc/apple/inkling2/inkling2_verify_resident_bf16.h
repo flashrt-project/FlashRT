@@ -30,13 +30,18 @@ namespace flashrt::apple::shaders {
 struct Inkling2VerifyOptions {
     int rows = 8;           // rows of the step (1..16), a compile-time constant (loops over rows unrolled)
     bool trace = false;     // write every row's hidden state after every visit
-    int workers = 36;
+    int workers = 0;        // threadgroups (0: inkling2_verify_workers(rows))
     bool fast = false;      // fast verification: own summation order in the products (not the decode step's bits)
     bool q8 = false;        // fast only: attention projections and LM head from Q8_0 copies (buffers 14, 15)
 };
 
+// Threadgroups of a step: two per GPU core of the M4 Pro from 4 rows (the expert and product passes balance
+// better), 36 below (the barriers of a short step cost more than the balance gains)
+inline int inkling2_verify_workers(int rows) { return rows >= 4 ? 40 : 36; }
+
 inline std::string inkling2_verify_resident_bf16_source(const Inkling2VerifyOptions& o = {}) {
-    std::string defines = std::string("\n#define FRT_WORKERS ") + std::to_string(o.workers) + "u" +
+    const int workers = o.workers ? o.workers : inkling2_verify_workers(o.rows);
+    std::string defines = std::string("\n#define FRT_WORKERS ") + std::to_string(workers) + "u" +
         "\n#define FRT_ROWS " + std::to_string(o.rows) + "u" +
         "\n#define FRT_TRACE " + std::to_string(o.trace ? 1 : 0) +
         "\n#define FRT_FAST " + std::to_string(o.fast ? 1 : 0) +

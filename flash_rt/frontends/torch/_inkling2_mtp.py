@@ -47,6 +47,11 @@ VERIFY_WORKSPACE = VERIFY_MAX * VERIFY_ROW_BYTES + 8192
 VERIFY_ROWS = (2, 3, 4, 5, 6, 7, 8, 12, 16)
 
 
+def verify_workers(rows: int) -> int:
+    """Threadgroups of a resident verification step (inkling2_verify_workers)."""
+    return 40 if rows >= 4 else 36
+
+
 class _MTPMixin:
     # ------------------------------------------------------------------ weights
     def _mtp_upload(self, layout) -> None:
@@ -197,8 +202,8 @@ class _MTPMixin:
     ADAPT_P_DF = (0.0, 0.336, 0.464, 0.646, 0.752, 0.855, 0.929, 0.967, 0.985, 0.993, 1.0)
     ADAPT_A_DF = (0.0, 0.06, 0.34, 0.37, 0.56, 0.56, 0.63, 0.71, 0.76, 0.82, 0.983)
     # fast verification GPU ms by rows (M4 Pro 20-core): BF16, Q8_0 attention / head
-    ADAPT_COST = {2: 34.8, 3: 39.7, 4: 43.4, 5: 47.6, 6: 51.9, 7: 56.0, 8: 59.8, 12: 76.4, 16: 88.9}
-    ADAPT_COST_Q8 = {2: 28.9, 3: 34.0, 4: 38.0, 5: 43.1, 6: 47.4, 7: 51.9, 8: 56.3, 12: 75.1, 16: 87.8}
+    ADAPT_COST = {2: 34.8, 3: 39.9, 4: 44.0, 5: 47.8, 6: 52.1, 7: 56.2, 8: 59.3, 12: 74.8, 16: 86.6}
+    ADAPT_COST_Q8 = {2: 29.0, 3: 34.2, 4: 38.1, 5: 42.9, 6: 47.1, 7: 51.8, 8: 55.6, 12: 73.9, 16: 85.8}
     # lookup drafts (one sequence, fast verification): after the drafter's 7, the 8 tokens that followed the latest
     # earlier occurrence of the last LOOKUP_N drafted tokens in the committed text (rows 12 or 16; an occurrence
     # closer than 8 tokens repeats with its period). Their agreement rate by the match length (how many tokens of the
@@ -279,7 +284,7 @@ class _MTPMixin:
             (b["v_params"], 0, READ), (b["r_tokens"], 0, READ), (b["m_stage"], 0, WRITE), (b["m_feat"], 0, WRITE),
             (b["r_logits"], 0, WRITE), (b["r_out"], 0, WRITE), (b["v_ws"], 0, READ_WRITE), (b["trace"], 0, WRITE),
             (b["control"], 0, READ_WRITE), (b["diagnostic"], 0, WRITE),
-        ] + extra, (self._workers, 1, 1), self._threads, label="verify_resident")
+        ] + extra, (verify_workers(R), 1, 1), self._threads, label="verify_resident")
         return program
 
     def verify_resident(self, tokens: Sequence[int], position: int, reference: bool = False,
