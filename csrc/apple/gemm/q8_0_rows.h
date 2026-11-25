@@ -174,20 +174,18 @@ kernel void q8_0_prep_rows(const device ushort* x [[buffer(0)]],device half* xh 
     if(tid==0)xsc[r]=sc;
     for(uint i=tid;i<p.k;i+=256u)xh[size_t(r)*p.k+i]=half(as_type<float>(uint(xr[i])<<16)*sc);
 }
-kernel void q8_0_rows8(const device half* xh [[buffer(0)]],const device float* xsc [[buffer(1)]],
-    const device char* codes [[buffer(2)]],const device half* scales [[buffer(3)]],device uchar* y [[buffer(4)]],
-    constant Q8Rows8& p [[buffer(5)]],uint g [[threadgroup_position_in_grid]],uint groups [[threadgroups_per_grid]],
-    uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) {
-    threadgroup half xs[8*1536];
+template<uint MAXR>
+inline void q8_rows_body(const device half* xh,const device float* xsc,const device char* codes,const device half* scales,
+    device uchar* y,constant Q8Rows8& p,uint g,uint groups,uint tid,uint lane,uint simd,threadgroup half* xs) {
     const uint R=p.rows,K=p.k,KC=p.kc,NCC=KC/32u;
     const uint rg=lane/8u,jl=lane%8u;
-    const uint TP=(p.flags&2u)?1u:2u;
+    const uint TP=((p.flags&2u) || MAXR>8u)?1u:2u;
     const uint npairs=(p.n+64u*TP-1u)/(64u*TP);
-    float inv[8];
-    for(uint r=0;r<8u;++r)inv[r]=r<R?1.0f/xsc[r]:0.0f;
+    float inv[MAXR];
+    for(uint r=0;r<MAXR;++r)inv[r]=r<R?1.0f/xsc[r]:0.0f;
     for(uint pr=g;pr<npairs;pr+=groups) {
-        float acc[2][2][8];
-        for(uint t=0;t<2u;++t)for(uint q=0;q<2u;++q)for(uint r=0;r<8u;++r)acc[t][q][r]=0.0f;
+        float acc[MAXR>8u?1u:2u][2][MAXR];
+        for(uint t=0;t<TP;++t)for(uint q=0;q<2u;++q)for(uint r=0;r<MAXR;++r)acc[t][q][r]=0.0f;
         for(uint k0=0;k0<K;k0+=KC) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for(uint i=tid;i<R*(KC/8u);i+=256u){const uint r=i/(KC/8u),j=i%(KC/8u);
@@ -208,7 +206,7 @@ kernel void q8_0_rows8(const device half* xh [[buffer(0)]],const device float* x
                         const uint w8[8]={a.x,a.y,a.z,a.w,bb.x,bb.y,bb.z,bb.w};
                         for(uint i=0;i<8u;++i){const half4 h=half4(as_type<char4>(w8[i]));wv[q][2u*i]=h.xy;wv[q][2u*i+1u]=h.zw;}
                     }
-                    for(uint r=0;r<8u;++r) {
+                    for(uint r=0;r<MAXR;++r) {
                         if(r>=R)break;
                         const threadgroup half2* xp=(const threadgroup half2*)(xs+r*KC+32u*cl);
                         for(uint q=0;q<2u;++q) {
@@ -223,7 +221,7 @@ kernel void q8_0_rows8(const device half* xh [[buffer(0)]],const device float* x
         }
         for(uint t=0;t<TP;++t) {
             const uint row=(pr*TP+t)*64u+simd*8u+rg*2u;
-            for(uint q=0;q<2u;++q)for(uint r=0;r<8u;++r) {
+            for(uint q=0;q<2u;++q)for(uint r=0;r<MAXR;++r) {
                 if(r>=R)break;
                 float v=acc[t][q][r];
                 v+=simd_shuffle_xor(v,4);v+=simd_shuffle_xor(v,2);v+=simd_shuffle_xor(v,1);
@@ -237,6 +235,21 @@ kernel void q8_0_rows8(const device half* xh [[buffer(0)]],const device float* x
             }
         }
     }
+}
+kernel void q8_0_rows8(const device half* xh [[buffer(0)]],const device float* xsc [[buffer(1)]],
+    const device char* codes [[buffer(2)]],const device half* scales [[buffer(3)]],device uchar* y [[buffer(4)]],
+    constant Q8Rows8& p [[buffer(5)]],uint g [[threadgroup_position_in_grid]],uint groups [[threadgroups_per_grid]],
+    uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half xs[8*1536];
+    q8_rows_body<8u>(xh,xsc,codes,scales,y,p,g,groups,tid,lane,simd,xs);
+}
+// up to 16 rows: one tile per work item, KC <= 768
+kernel void q8_0_rows16(const device half* xh [[buffer(0)]],const device float* xsc [[buffer(1)]],
+    const device char* codes [[buffer(2)]],const device half* scales [[buffer(3)]],device uchar* y [[buffer(4)]],
+    constant Q8Rows8& p [[buffer(5)]],uint g [[threadgroup_position_in_grid]],uint groups [[threadgroups_per_grid]],
+    uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half xs[16*768];
+    q8_rows_body<16u>(xh,xsc,codes,scales,y,p,g,groups,tid,lane,simd,xs);
 }
 )MSL";
 }

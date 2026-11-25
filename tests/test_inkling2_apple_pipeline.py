@@ -110,6 +110,42 @@ def test_speculative_decoding_follows_greedy(tokens):
         spec.rt.close()
 
 
+def test_lookup_drafts_follow_greedy(tokens):
+    """Lookup drafts (an earlier occurrence's continuation) after the drafter's block and lookup steps without the
+    drafter (its context still advanced), both forced through the policy's priors on a text that partly repeats its
+    prompt: the fast verification still follows the greedy decode up to a near-tie."""
+    from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
+    spec = Inkling2TorchFrontendMps(CKPT, max_seq=384, speculative=True, verify="fast")
+    prompt, n = list(tokens) * 2, 64
+    try:
+        rt = spec.rt
+        rt.LOOKUP_A = (0.99,) * len(rt.LOOKUP_EDGES)       # 16-row steps after confident drafts
+        rt.SOLO_DRAFT = (-1e3,) * len(rt.SOLO_EDGES)       # a lookup step wherever the committed text matches
+        stats = {}
+        fast = []
+        for step in rt.mtp_steps([prompt], n, stats):
+            fast.extend(step[0])
+        fast = fast[:n]
+        assert stats["lookup_only_steps"] > 0 and stats["lookup_steps"] > 0
+        assert stats["steps"] > stats["lookup_only_steps"]         # drafter steps after lookup steps
+        tok = rt.prefill(prompt, features=True)
+        want, pos = [tok], len(prompt)
+        while len(want) < n:
+            out = rt.decode(want[-1], pos, min(8, n - len(want)))
+            want += out
+            pos += len(out)
+        part = next((i for i, (a, b) in enumerate(zip(fast, want)) if a != b), n)
+        if part < n:
+            rt.prefill(prompt, features=True)
+            for i in range(part):
+                rt.decode(want[i], len(prompt) + i, 1)
+            lg = rt.plan.read(rt.buf["logits"], 0, np.float32, rt.cfg.vocab_size)[:rt.cfg.unpadded_vocab_size]
+            top = np.sort(lg)[-2:]
+            assert top[1] - top[0] < 0.5
+    finally:
+        spec.rt.close()
+
+
 DFLASH2 = os.environ.get("FLASHRT_INKLING2_DFLASH2_DIR", "")
 
 
@@ -189,6 +225,38 @@ def test_resident_verification_matches_decode_steps(tokens):
             assert part.tolist() == exact.tolist()[:n]
             kp = kl(lg[:n], lp)
             assert kp.max() <= kr[:n].max() and kp.mean() <= kr[:n].mean(), (n, kp, kr)
+    finally:
+        rt.close()
+
+
+def test_sixteen_row_verification_matches_decode_steps(tokens):
+    """16 rows (the drafter's block and lookup drafts after it): the exact resident verification's logits equal those
+    of 16 one-row decode steps bit for bit, and the fast one selects the same tokens (on a repeated text, where
+    the lookup drafts run)."""
+    from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
+    from flash_rt.frontends.torch._inkling2_mtp import VERIFY_MAX
+
+    class Runtime(Inkling2Runtime):
+        def _mtp_record(self):
+            super()._mtp_record()
+            self.mtp_programs[("verify_resident", VERIFY_MAX)] = self._record_verify(VERIFY_MAX, "resident")
+
+    ids = (list(tokens) * 4)[:56]
+    rt = Runtime(CKPT, max_seq=128, row_capacity=32, row_shapes=[(32, 1), (1, 1)], mtp_batches=[1])
+    try:
+        V, L, R = rt.cfg.vocab_size, 32, VERIFY_MAX
+        t0 = rt.prefill(ids[:L])
+        rows = [t0] + ids[L:L + R - 1]
+        exact = rt.verify_resident(rows, L)
+        lg = rt.plan.read(rt.buf["r_logits"], 0, np.float32, R * V).reshape(R, V).copy()
+        fast = rt.verify_resident(rows, L, kind="fast")
+        ref = []
+        for r in range(R):
+            rt.decode(rows[r], L + r, 1)
+            ref.append(rt.plan.read(rt.buf["logits"], 0, np.float32, V).copy())
+        ref = np.stack(ref)
+        assert np.array_equal(lg.view(np.uint32), ref.view(np.uint32))
+        assert fast.tolist() == exact.tolist()
     finally:
         rt.close()
 

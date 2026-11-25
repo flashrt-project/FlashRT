@@ -42,8 +42,9 @@ STAGE_ELEMS = 6656 + 2 * 8 * 128
 MTP_CAND = 256                    # Markov walk candidates per drafted position (ink_mtp_topk)
 # resident verification step (inkling2_verify_resident_bf16.h): per-row workspace and the step's shared tail
 VERIFY_ROW_BYTES = 1177792 + 83072
-VERIFY_WORKSPACE = 8 * VERIFY_ROW_BYTES + 4096
-VERIFY_ROWS = range(2, 9)
+VERIFY_MAX = 16                   # rows of a resident step at most (the drafts and lookup drafts after them)
+VERIFY_WORKSPACE = VERIFY_MAX * VERIFY_ROW_BYTES + 8192
+VERIFY_ROWS = (2, 3, 4, 5, 6, 7, 8, 12, 16)
 
 
 class _MTPMixin:
@@ -128,15 +129,16 @@ class _MTPMixin:
 
     def _q8_rows8(self, name, rows, y, y_stride, y_col, label, row0=0, nrows=None):
         """y[r][y_col + n] (BF16) = Q8_0 matrix `name` (its rows row0 .. row0 + nrows) x the prepared inputs,
-        rows <= 8."""
+        rows <= 16."""
         _, n, k, codes, scales = self._q8[name]
         codes, scales = codes + row0 * k, scales + row0 * (k // 32) * 2
         n = n - row0 if nrows is None else nrows
-        kc = next(c for c in (1536, 1024, 768, 512, 256) if k % c == 0)
-        tiles = 2 if (n + 127) // 128 >= self.q8_groups else 1      # 64-row tiles per work item
+        kc = next(c for c in (1536, 1024, 768, 512, 256) if k % c == 0 and c * max(rows, 8) <= 12288)
+        tiles = 2 if (n + 127) // 128 >= self.q8_groups and rows <= 8 else 1      # 64-row tiles per work item
         prm = self._param(np.array([rows, n, k, 0, y_stride, y_col, kc, 1 | (2 if tiles == 1 else 0)],
                                    np.uint32).tobytes())
-        self.plan.dispatch("q8_0_rows8", [(self.buf["m_xh"], 0, READ), (self.buf["m_xsc"], 0, READ),
+        self.plan.dispatch("q8_0_rows8" if rows <= 8 else "q8_0_rows16", [(self.buf["m_xh"], 0, READ),
+                                                                       (self.buf["m_xsc"], 0, READ),
                                           (self.buf["q8"], codes, READ), (self.buf["q8"], scales, READ),
                                           (y, 0, WRITE), (self.buf["args"], prm, READ)],
                            (min(self.q8_groups, (n + 64 * tiles - 1) // (64 * tiles)), 1, 1), 256, label=label)
@@ -145,15 +147,16 @@ class _MTPMixin:
     def _mtp_allocate(self) -> None:
         H, V = self.cfg.hidden_size, self.cfg.vocab_size
         S = self.sequences
-        RV = MTP_BLOCK * S                       # verify / draft rows
-        RC = max(self.row_capacity, RV)          # context rows (a prefill chunk or a verify step)
+        RV = MTP_BLOCK * S                       # draft rows
+        RW = max([RV] + [self.mtp_width(c) * c for c in self.mtp_batches])   # verify rows
+        RC = max(self.row_capacity, RW)          # context rows (a prefill chunk or a verify step)
         self.mtp_cap = self.max_seq + MTP_BLOCK
         self.mtp_seq_kv = MTP_LAYERS * 2 * 8 * self.mtp_cap * 128
         f32, bf = 4, 2
         sizes = {
             "m_kv": self.mtp_seq_kv * S * bf, "m_feat": 4 * RC * H * bf,
-            "m_stage": len(self.cfg.visits()) * RV * STAGE_ELEMS * bf,
-            "m_commit": RV * 2 * 4, "m_cinfo": RC * 16, "m_dinfo": RV * 16, "m_anchor": S * 4,
+            "m_stage": len(self.cfg.visits()) * RW * STAGE_ELEMS * bf,
+            "m_commit": RW * 2 * 4, "m_cinfo": RC * 16, "m_dinfo": RV * 16, "m_anchor": S * 4,
             "m_emb": S * H * bf, "m_ctxx": 3 * RC * H * bf, "m_kvc": RC * 3 * 2048 * bf,
             "m_frnn": S * H * bf, "m_h": RV * H * f32, "m_x": RV * H * bf, "m_qkv": RV * 5120 * bf,
             "m_q": RV * 3072 * bf, "m_attn": RV * 3072 * bf, "m_o": RV * H * bf, "m_gu": RV * 2 * MTP_INTER * bf,
@@ -162,7 +165,7 @@ class _MTPMixin:
             "m_latent": S * MTP_RANK * bf, "m_bias": S * V * f32, "m_prev": S * 4, "m_drafts": S * 7 * 4,
             "v_ws": VERIFY_WORKSPACE, "v_params": 16,
             "m_cidx": S * 7 * MTP_CAND * 4, "m_cval": S * 7 * MTP_CAND * f32, "m_dtop": S * 7 * 16 * f32,
-            "m_xh": 8 * MTP_INTER * 2, "m_xsc": 8 * f32,
+            "m_xh": VERIFY_MAX * MTP_INTER * 2, "m_xsc": VERIFY_MAX * f32,
         }
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
@@ -176,7 +179,7 @@ class _MTPMixin:
 
     # verified rows per sequence and step (the anchor + W - 1 drafts) by batch size: verification grows with the
     # rows while the accepted length saturates, so larger batches verify fewer drafts
-    mtp_widths = {1: 8, 4: 8, 16: 4, 64: 3}
+    mtp_widths = {1: VERIFY_MAX, 4: 8, 16: 4, 64: 3}
 
     # one sequence, fast verification: rows per step chosen from the drafts' walk probabilities, maximizing expected
     # tokens - rate x verification time (rate: measured tokens per ms; time: a relative cost by rows, scaled by the
@@ -194,8 +197,26 @@ class _MTPMixin:
     ADAPT_P_DF = (0.0, 0.336, 0.464, 0.646, 0.752, 0.855, 0.929, 0.967, 0.985, 0.993, 1.0)
     ADAPT_A_DF = (0.0, 0.06, 0.34, 0.37, 0.56, 0.56, 0.63, 0.71, 0.76, 0.82, 0.983)
     # fast verification GPU ms by rows (M4 Pro 20-core): BF16, Q8_0 attention / head
-    ADAPT_COST = {2: 35.3, 3: 40.3, 4: 44.6, 5: 49.2, 6: 53.8, 7: 58.1, 8: 61.8}
-    ADAPT_COST_Q8 = {2: 29.4, 3: 35.0, 4: 39.3, 5: 44.2, 6: 49.2, 7: 54.1, 8: 58.5}
+    ADAPT_COST = {2: 35.3, 3: 40.3, 4: 44.6, 5: 49.2, 6: 53.8, 7: 58.1, 8: 61.8, 12: 94.6, 16: 119.7}
+    ADAPT_COST_Q8 = {2: 29.4, 3: 35.0, 4: 39.3, 5: 44.2, 6: 49.2, 7: 54.1, 8: 58.5, 12: 84.5, 16: 103.9}
+    # lookup drafts (one sequence, fast verification): after the drafter's 7, the 8 tokens that followed the latest
+    # earlier occurrence of the last LOOKUP_N drafted tokens in the committed text (rows 12 or 16; an occurrence
+    # closer than 8 tokens repeats with its period). Their agreement rate by the match length (how many tokens of the
+    # committed text + drafts before them equal the text before the occurrence, bins from LOOKUP_EDGES) learned like
+    # the drafter's, LOOKUP_A as the prior (measured on the corpus)
+    mtp_lookup = True
+    LOOKUP_N = 4
+    LOOKUP_EDGES = (0, 8, 16, 32)
+    LOOKUP_A = (0.6, 0.85, 0.93, 0.99)
+    # lookup steps: the committed text's own continuation (after the latest earlier occurrence of its last LOOKUP_N
+    # tokens) as all W - 1 drafts, the drafter skipped (only its context runs), when the step's expected gain beats
+    # that of the drafter steps in the same bin of the committed match length (SOLO_EDGES). Priors: the agreement per
+    # position SOLO_A (SOLO_PRIOR positions), the drafter steps' tokens SOLO_DRAFT (ADAPT_PRIOR steps of the 8-row
+    # cost + 7 ms)
+    SOLO_EDGES = (0, 16, 32, 48)
+    SOLO_A = (0.86, 0.94, 0.95, 0.993)
+    SOLO_DRAFT = (6.9, 7.4, 7.1, 7.1)
+    SOLO_PRIOR = 60.0
 
     def mtp_width(self, C: int) -> int:
         for limit in sorted(self.mtp_widths):
@@ -212,14 +233,16 @@ class _MTPMixin:
         for C in self.mtp_batches:
             W = self.mtp_width(C)
             R = W * C
-            self.mtp_programs[("verify", C)] = self._record_rows(R, R, stage=True, features=True)
+            RR = min(W, MTP_BLOCK) * C          # the row programs verify the drafter's block (no lookup drafts)
+            self.mtp_programs[("verify", C)] = self._record_rows(RR, RR, stage=True, features=True)
             if C == 1 and R in VERIFY_ROWS:     # one sequence: the resident steps (exact / fast; Q8_0: fast only)
                 for kind in (("fast",) if self.q8 else ("resident", "fast")):
-                    # fast: every row count (adaptive rows); exact: the full width
-                    for rows in (VERIFY_ROWS if kind == "fast" else (R,)):
+                    # fast: every row count (adaptive rows, lookup drafts); exact: the drafter's block
+                    for rows in (VERIFY_ROWS if kind == "fast" else (MTP_BLOCK,)):
                         self.mtp_programs[(f"verify_{kind}", rows)] = self._record_verify(rows, kind, reference=False)
                     if self.trace_rows:
-                        self.mtp_programs[(f"verify_{kind}_reference", R)] = self._record_verify(R, kind, reference=True)
+                        self.mtp_programs[(f"verify_{kind}_reference", MTP_BLOCK)] = self._record_verify(
+                            MTP_BLOCK, kind, reference=True)
             self.mtp_programs[("commit", C)] = self._mtp_record_commit(R)
             # the last step's commit and the next draft in one command buffer (independent: the draft reads the
             # drafter's own context, not the target caches)
@@ -229,6 +252,8 @@ class _MTPMixin:
             else:
                 self.mtp_programs[("draft", C)] = self._mtp_record_draft(C, W)
                 self.mtp_programs[("commit_draft", C)] = self._mtp_record_draft(C, W, commit=R)
+            if C == 1 and W > MTP_BLOCK:        # lookup steps: the commit and the context, no draft
+                self.mtp_programs[("commit_context", C)] = self._mtp_record_context(C, W, R)
         for P in self.mtp_prefill:     # target rows with features, then the drafter context of the same rows
             context = (lambda P=P: self._df_context(P, q8=False)) if self.dflash2 else (lambda P=P: self._mtp_context(P))
             self.mtp_programs[("prefill", P)] = self._record_rows(P, 1, features=True, then=context)
@@ -311,6 +336,16 @@ class _MTPMixin:
                                                  (b["m_cinfo"], 0, READ), (A, ctx, READ)], (R, 1, 1), 256,
                       label="mtp_ctx_write")
 
+    def _mtp_record_context(self, C: int, W: int, commit: int) -> int:
+        """The last step's commit and the drafter context of its accepted rows, without a draft (a lookup step)."""
+        program = self.plan.program()
+        self._mtp_record_commit(commit, program)
+        if self.dflash2:
+            self._df_context(W, q8=True)
+        else:
+            self._mtp_context(W * C)
+        return program
+
     def _mtp_record_draft(self, C: int, W: int, commit: int = 0) -> int:
         b, plan, w, cfg = self.buf, self.plan, self.mtp_w, self.cfg
         H, V = cfg.hidden_size, cfg.vocab_size
@@ -382,7 +417,7 @@ class _MTPMixin:
                            H, 0, R, True)
         norm(w["norm"], "m_mlp", final=True)
         f = self.table[cfg.num_layers]
-        nd = W - 1                                 # drafted positions verified per step
+        nd = min(W, MTP_BLOCK) - 1                 # drafted positions of the block
         if "head" in self._q8 and nd * C <= 8:
             self._q8_rows("head", b["m_hn"], 0, H, nd * C, b["m_logits"], 0, V, "mtp_logits_q8")
         else:
@@ -454,7 +489,23 @@ class _MTPMixin:
         count = [1] * C
         yield [[int(t)] for t in anchor]
         cinfo = np.zeros((R, 4), np.uint32)            # first draft step: no new context rows
-        steps = accepted = active = rows_total = 0
+        lookup = self.mtp_lookup and C == 1 and self.mtp_verify == "fast" and W > MTP_BLOCK
+        N = self.LOOKUP_N
+        hist = [int(t) for t in prompts[0]] + [int(anchor[0])]
+        grams: Dict[tuple, int] = {}                   # n-gram -> index of the token after its latest occurrence
+        for i in range(N, len(hist)):
+            grams[tuple(hist[i - N:i])] = i
+        reach_l = np.full(len(self.LOOKUP_A), self.ADAPT_PRIOR)
+        agreed_l = reach_l * np.asarray(self.LOOKUP_A)
+        lbin = 0
+
+        def match(text: List[int], i: int) -> int:
+            """How many tokens before index i equal the last tokens of text (at most 64)."""
+            L, end = 0, len(text)
+            while L < 64 and i - 1 - L >= 0 and text[i - 1 - L] == text[end - 1 - L]:
+                L += 1
+            return L
+        steps = accepted = active = rows_total = lookup_steps = solo_steps = 0
         gpu = {"draft": 0.0, "verify": 0.0}
         adaptive = (self.mtp_adaptive and C == 1 and self.mtp_verify == "fast"
                     and all(("verify_fast", r) in self.mtp_programs for r in self.ADAPT_COST))
@@ -466,34 +517,76 @@ class _MTPMixin:
         reach = np.full(len(mids), self.ADAPT_PRIOR)
         agreed = reach * np.interp(mids, cal_p, cal_a)
         pending = False                     # a commit written, run with the next draft (or when the loop ends)
+        solo_ok = lookup and adaptive and ("commit_context", C) in self.mtp_programs
+        s_reach = np.full(len(self.SOLO_A), self.SOLO_PRIOR)
+        s_agreed = s_reach * np.asarray(self.SOLO_A)
+        d_n = np.full(len(self.SOLO_DRAFT), self.ADAPT_PRIOR)
+        d_tok = d_n * np.asarray(self.SOLO_DRAFT)
+        d_ms = d_n * (cost[MTP_BLOCK] + 7.0)
+        solo_ms = 2.0                       # a lookup step's time beyond its verification (context, host)
         t_start = time.perf_counter()
         try:
             while min(count) < limit:
                 t_step = time.perf_counter()
-                # draft
-                dinfo = np.zeros((RB, 4), np.uint32)
-                for s in range(C):
-                    dinfo[s * 8:(s + 1) * 8] = [[s, pos[s] + j, pos[s], j] for j in range(8)]
                 plan.write(b["m_cinfo"], 0, cinfo)
-                plan.write(b["m_dinfo"], 0, dinfo)
-                plan.write(b["m_anchor"], 0, anchor)
-                plan.write(b["m_prev"], 0, anchor)
-                plan.view(b["m_state"], np.uint16, C * MTP_RANK)[:] = 0
-                if self.dflash2:            # the block: the anchor and 7 mask tokens
-                    plan.write(b["df_tok"], 0, np.array([anchor[0]] + [DF_MASK] * 7, np.uint32))
-                gpu["draft"] += plan.run(self.mtp_programs[("commit_draft" if pending else "draft", C)])["gpu_us"]
-                pending = False
-                drafts = plan.read(b["m_drafts"], 0, np.uint32, C * 7).reshape(C, 7)[:, :W - 1]
-                V = W                                  # verified rows per sequence this step
-                if adaptive:
-                    top = plan.read(b["m_dtop"], 0, np.float32, 7 * 16).reshape(7, 16)
-                    bins = np.clip(np.searchsorted(edges, np.exp(top[:W - 1, 4] - top[:W - 1, 8]), "right") - 1,
-                                   0, len(mids) - 1)
-                    agree = np.cumprod((agreed / reach)[bins])
-                    expect = np.concatenate([[1.0], 1.0 + np.cumsum(agree)])     # expected tokens of V rows: [V - 1]
-                    V = max(cost, key=lambda r: expect[r - 1] - rate * scale * cost[r])
-                    if self.ADAPT_EXPLORE and steps % self.ADAPT_EXPLORE == self.ADAPT_EXPLORE - 1:
-                        V = W
+                solo, sbin = False, -1
+                if solo_ok and pending:     # a lookup step instead of a draft?
+                    i = grams.get(tuple(hist[-N:]))
+                    if i is not None:
+                        sbin = int(np.searchsorted(self.SOLO_EDGES, match(hist, i), "right")) - 1
+                        rho = s_agreed[sbin] / s_reach[sbin]
+                        e = np.concatenate([[1.0], 1.0 + np.cumsum(rho ** np.arange(1, W))])
+                        Vs = max(cost, key=lambda r: e[r - 1] - rate * (scale * cost[r] + solo_ms))
+                        gain = e[Vs - 1] - rate * (scale * cost[Vs] + solo_ms)
+                        solo = bool(gain > (d_tok[sbin] - rate * d_ms[sbin]) / d_n[sbin])
+                if solo:
+                    ext: List[int] = []
+                    for j in range(W - 1):  # a near occurrence repeats with its period
+                        ext.append(hist[i + j] if i + j < len(hist) else ext[i + j - len(hist)])
+                    gpu["draft"] += plan.run(self.mtp_programs[("commit_context", C)])["gpu_us"]
+                    pending = False
+                    drafts = np.array([ext], np.uint32)
+                    V = Vs
+                else:
+                    # draft
+                    dinfo = np.zeros((RB, 4), np.uint32)
+                    for s in range(C):
+                        dinfo[s * 8:(s + 1) * 8] = [[s, pos[s] + j, pos[s], j] for j in range(8)]
+                    plan.write(b["m_dinfo"], 0, dinfo)
+                    plan.write(b["m_anchor"], 0, anchor)
+                    plan.write(b["m_prev"], 0, anchor)
+                    plan.view(b["m_state"], np.uint16, C * MTP_RANK)[:] = 0
+                    if self.dflash2:            # the block: the anchor and 7 mask tokens
+                        plan.write(b["df_tok"], 0, np.array([anchor[0]] + [DF_MASK] * 7, np.uint32))
+                    gpu["draft"] += plan.run(self.mtp_programs[("commit_draft" if pending else "draft", C)])["gpu_us"]
+                    pending = False
+                    drafted = plan.read(b["m_drafts"], 0, np.uint32, C * 7).reshape(C, 7)
+                    drafts = np.zeros((C, W - 1), np.uint32)
+                    drafts[:, :min(7, W - 1)] = drafted[:, :min(7, W - 1)]
+                    n_lk = 0
+                    if lookup:                  # the tokens after the latest earlier occurrence of the last N drafts
+                        i = grams.get(tuple(int(t) for t in drafted[0, 7 - N:7]))
+                        if i is not None:
+                            text = hist + [int(t) for t in drafted[0]]
+                            lbin = int(np.searchsorted(self.LOOKUP_EDGES, match(text, i), "right")) - 1
+                            n_lk = W - 8
+                            for j in range(n_lk):
+                                text.append(text[i + j])        # i + j < len(text): a near occurrence repeats
+                            drafts[0, 7:] = text[-n_lk:]
+                    if W - 1 > 7 + n_lk:        # rows without a draft: the last draft repeated
+                        drafts[:, 7 + n_lk:] = drafts[:, 6 + n_lk:7 + n_lk]
+                    V = min(W, MTP_BLOCK)
+                    if adaptive:
+                        top = plan.read(b["m_dtop"], 0, np.float32, 7 * 16).reshape(7, 16)
+                        bins = np.clip(np.searchsorted(edges, np.exp(top[:W - 1, 4] - top[:W - 1, 8]), "right") - 1,
+                                       0, len(mids) - 1)
+                        agree = np.cumprod((agreed / reach)[bins])
+                        expect = np.concatenate([[1.0], 1.0 + np.cumsum(agree)])     # expected tokens of V rows: [V - 1]
+                        lk = agree[-1] * np.cumprod(np.full(W - 8, agreed_l[lbin] / reach_l[lbin]))  # after the 7
+                        expect = np.concatenate([expect, expect[-1] + np.cumsum(lk)])
+                        V = max((r for r in cost if r <= 8 + n_lk), key=lambda r: expect[r - 1] - rate * scale * cost[r])
+                        if self.ADAPT_EXPLORE and steps % self.ADAPT_EXPLORE == self.ADAPT_EXPLORE - 1:
+                            V = MTP_BLOCK + n_lk
                 # verify
                 toks = np.concatenate([anchor[:, None], drafts[:, :V - 1]], axis=1).reshape(-1)
                 vinfo = np.zeros((R, 4), np.uint32)
@@ -531,24 +624,44 @@ class _MTPMixin:
                     cinfo[s * W:s * W + n + 1] = [[s, pos[s] + j, 1, 1 if j == n else 0] for j in range(n + 1)]
                     anchor[s] = target[s, n]
                     pos[s] += n + 1
+                    if C == 1:                  # the committed text and its n-grams
+                        for t in new_tokens[s]:
+                            if len(hist) >= N:
+                                grams[tuple(hist[-N:])] = len(hist)
+                            hist.append(t)
                     accepted += n + 1
                     active += 1
-                    if adaptive:            # drafted positions 0 .. min(n, V - 2) were reached, n of them agreed
+                    if adaptive and solo:   # lookup positions 0 .. min(n, V - 2) reached, n of them agreed
+                        s_reach[sbin] = s_reach[sbin] * self.ADAPT_DECAY + min(n + 1, V - 1)
+                        s_agreed[sbin] = s_agreed[sbin] * self.ADAPT_DECAY + n
+                    elif adaptive:          # drafted positions 0 .. min(n, V - 2) were reached, n of them agreed
                         reach *= self.ADAPT_DECAY
                         agreed *= self.ADAPT_DECAY
-                        k = np.arange(min(n, V - 2) + 1)
+                        k = np.arange(min(n, V - 2, 6) + 1)
                         np.add.at(reach, bins[k], 1.0)
                         np.add.at(agreed, bins[k], (k < n).astype(np.float64))
+                        if V > 8 and n >= 7:            # lookup positions 7 .. min(n, V - 2) reached
+                            reach_l[lbin] = reach_l[lbin] * self.ADAPT_DECAY + (min(n, V - 2) - 6)
+                            agreed_l[lbin] = agreed_l[lbin] * self.ADAPT_DECAY + (n - 7)
                 plan.write(b["m_commit"], 0, commit)
                 pending = True
                 steps += 1
                 rows_total += V
+                lookup_steps += V > MTP_BLOCK
+                solo_steps += solo
                 now = time.perf_counter()
                 if adaptive:
-                    rate = 0.9 * rate + 0.1 * (sum(len(t) for t in new_tokens) / max(1e-3, 1e3 * (now - t_step)))
+                    ms, got = 1e3 * (now - t_step), sum(len(t) for t in new_tokens)
+                    rate = 0.9 * rate + 0.1 * (got / max(1e-3, ms))
+                    if solo:
+                        solo_ms = 0.9 * solo_ms + 0.1 * max(0.0, ms - us / 1000)
+                    elif sbin >= 0:         # a drafter step that had a lookup step to compare with
+                        d_n[sbin] = d_n[sbin] * self.ADAPT_DECAY + 1.0
+                        d_tok[sbin] = d_tok[sbin] * self.ADAPT_DECAY + got
+                        d_ms[sbin] = d_ms[sbin] * self.ADAPT_DECAY + ms
                 if stats is not None:
-                    stats.update(steps=steps, tokens_per_step=accepted / max(1, active),
-                                 rows_per_step=rows_total / steps, decode_s=now - t_start,
+                    stats.update(steps=steps, tokens_per_step=accepted / max(1, active), rows_per_step=rows_total / steps,
+                                 lookup_steps=lookup_steps, lookup_only_steps=solo_steps, decode_s=now - t_start,
                                  **{k + "_ms_per_step": v / 1000 / steps for k, v in gpu.items()})
                 yield new_tokens
         finally:

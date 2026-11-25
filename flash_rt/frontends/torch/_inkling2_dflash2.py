@@ -221,7 +221,7 @@ class _DFlash2Mixin:
             conv("df_mlp", w[f"{l}.mc_base"], 1, "df_hl", "df_conv")
         add_norm("df_hl", w["norm"], 1, "df_hf", "df_final_norm")
         # the mask rows' LM head (the drafter's Q8_0 copy of the target head)
-        E = W - 1
+        E = min(W, 8) - 1                  # the block's mask rows
         self._q8_rows("head", b["df_hf"], H * 2, H, E, b["m_logits"], 0, V, "df_logits")
         pk = self._param(np.array([E, cfg.unpadded_vocab_size, V, 0], np.uint32).tobytes())
         if not self.dflash2_selector:      # each row's largest logit

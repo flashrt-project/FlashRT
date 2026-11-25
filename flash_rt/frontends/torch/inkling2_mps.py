@@ -10,7 +10,9 @@ dispatch and reproduces mlx-lm's logits bit for bit. With ``speculative=True`` t
 (greedy): ``verify="fast"`` (default) sums the products in its own order (half-precision code products, results
 within the rounding of the decode step's); ``verify="exact"`` repeats the decode step's arithmetic on every row, so
 the output is the greedy decode's continuation bit for bit; ``verify="rows"`` uses the row programs. With the fast
-verification a step verifies 2-8 rows chosen from the drafts' probabilities (``adaptive=False``: always 8).
+verification a step verifies 2-8 rows chosen from the drafts' probabilities, or 12 / 16 with lookup drafts (the
+continuation of an earlier occurrence in the text: after the drafter's block, or alone where the text repeats;
+``lookup=False``: none; ``adaptive=False``: always 8 rows).
 ``dflash2=<directory>`` drafts with the DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2) instead of DSpark.
 ``q8=True`` runs the attention projections and the LM head from Q8_0 copies made at load (faster, not the
 checkpoint's numerics).
@@ -43,7 +45,7 @@ class Inkling2TorchFrontendMps:
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, speculative: bool = False,
                  chat_template: Optional[str] = None, library: Optional[str] = None, verify: str = "fast",
-                 q8: bool = False, adaptive: bool = True, dflash2: Optional[str] = None):
+                 q8: bool = False, adaptive: bool = True, dflash2: Optional[str] = None, lookup: bool = True):
         if verify not in VERIFY:
             raise ValueError(f"verify must be one of {sorted(VERIFY)}")
         if q8 and verify == "exact":
@@ -57,6 +59,7 @@ class Inkling2TorchFrontendMps:
                                   dflash2=dflash2 if self.speculative else None)
         self.rt.mtp_verify = VERIFY[verify]
         self.rt.mtp_adaptive = bool(adaptive)
+        self.rt.mtp_lookup = bool(lookup)
         self.cfg = self.rt.cfg
         self.tokenizer = _JsonTokenizer.from_directory(checkpoint_dir, chat_template=chat_template)
         self.eog = set(self.cfg.eos_token_ids)

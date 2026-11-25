@@ -155,14 +155,27 @@ def test_chunk_plan():
 def test_mtp_width_by_batch():
     from flash_rt.frontends.torch._inkling2_mtp import _MTPMixin
     m = _MTPMixin()
-    assert [m.mtp_width(c) for c in (1, 2, 4, 8, 16, 32, 64, 128)] == [8, 8, 8, 4, 4, 3, 3, 3]
+    assert [m.mtp_width(c) for c in (1, 2, 4, 8, 16, 32, 64, 128)] == [16, 8, 8, 4, 4, 3, 3, 3]
     m.mtp_widths = {1 << 20: 5}
     assert m.mtp_width(17) == 5
 
 
-def test_mtp_widths_fit_the_drafter_block():
-    from flash_rt.frontends.torch._inkling2_mtp import MTP_BLOCK, _MTPMixin
-    assert all(2 <= w <= MTP_BLOCK for w in _MTPMixin.mtp_widths.values())
+def test_mtp_widths_fit_the_verification():
+    """One sequence: the resident step's largest row count (the drafter's block, then lookup drafts); batches: the
+    drafter's block at most."""
+    from flash_rt.frontends.torch._inkling2_mtp import MTP_BLOCK, VERIFY_MAX, VERIFY_ROWS, _MTPMixin
+    widths = _MTPMixin.mtp_widths
+    assert widths[1] == VERIFY_MAX == max(VERIFY_ROWS)
+    assert all(2 <= w <= MTP_BLOCK for c, w in widths.items() if c > 1)
+
+
+def test_adaptive_and_lookup_tables_agree():
+    from flash_rt.frontends.torch._inkling2_mtp import MTP_BLOCK, VERIFY_ROWS, _MTPMixin as M
+    assert sorted(M.ADAPT_COST) == sorted(M.ADAPT_COST_Q8) == sorted(VERIFY_ROWS) and MTP_BLOCK in M.ADAPT_COST
+    assert len(M.ADAPT_P) == len(M.ADAPT_A) and len(M.ADAPT_P_DF) == len(M.ADAPT_A_DF)
+    assert len(M.LOOKUP_EDGES) == len(M.LOOKUP_A) and len(M.SOLO_EDGES) == len(M.SOLO_A) == len(M.SOLO_DRAFT)
+    assert M.LOOKUP_EDGES[0] == M.SOLO_EDGES[0] == 0
+    assert all(0.0 < a < 1.0 for a in M.LOOKUP_A + M.SOLO_A)
 
 
 def test_config_is_not_mutated():
