@@ -168,8 +168,13 @@ and roundings), `fast` (the default) sums in its own order: expert products in
 half precision (the codes decoded by shifts and masks into pairs of halves, the
 inputs scaled by a power of two per row so the products of BF16 inputs and
 E2M1 codes are exact halves, sums of 16 in half, FP32 beyond), coalesced
-16-byte code loads with two output rows per lane, and attention by blocks of
-key positions for up to four rows at once. With the fast step a step verifies
+16-byte code loads with two output rows per lane, attention by blocks of key
+positions for up to four rows at once, and beyond 8 rows the BF16 projections,
+output projection and LM head as 8x8 matrix multiply-accumulates (the k order
+inside a 64-wide chunk permuted so a lane's fragment elements are consecutive
+weights and inputs; with Q8_0 the projections up to 12 rows and the LM head
+stay on the Q8_0 copies, whose multi-row products run in 128-row units with the
+fewest staged chunks). With the fast step a step verifies
 2-8 rows: the rows that maximize the expected accepted tokens minus the
 measured tokens per millisecond times the step's cost by rows (the drafts'
 probabilities mapped to measured agreement rates; the cost table scaled by the
@@ -363,8 +368,8 @@ in 5.2 ms (the drafter's three layers over the block from their
 Q8_0 copies 1.4 ms, the Q8_0 LM head for 7 positions 2.2 ms, the 256 candidates
 per position 0.35 ms, the Markov walk, the drafter's attention and context about
 1.2 ms) and verifies its rows: the fast step takes 35 ms for 2 rows, 45 for 4,
-54 for 6, 60-62 for 8, 95 for 12 and 120 for 16 (Q8_0: 29, 39, 49, 57-58, 85 and
-104), the exact step 83-88 ms for 8; one sequence's DSpark step averages 60-61 ms on the first two slices
+54 for 6, 60-62 for 8, 79 for 12 and 92 for 16 (Q8_0: 29, 39, 49, 57-58, 78.5 and
+92), the exact step 83-88 ms for 8; one sequence's DSpark step averages 60-61 ms on the first two slices
 (verification 54-55 ms over 6.4-6.5 rows, the CPU's part 0.5 ms). In the fast 8-row step the
 expert passes take about 33 ms for 32 distinct experts per visit (6.9 GB: 210
 GB/s; the 268 GB/s streaming rate would be 26 ms), the BF16 projections, output
