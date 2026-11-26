@@ -419,9 +419,16 @@ python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --co
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --fixed-rows
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --q8
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --q8
+# one sequence over twelve slices: DSpark, then DFlash 2 (each also with --q8 and with --no-lookup)
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --reps 12
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --reps 12 \
+    --dflash2 /path/to/Inkling-2-Mini-DFlash2
 python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64
 python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --stream
 ```
+
+The twelve-slice rates are the tokens generated in runs 1-12 over their decode
+seconds (run 0 is the warm-up; the driver prints every run and the median).
 
 ## Limitations
 
