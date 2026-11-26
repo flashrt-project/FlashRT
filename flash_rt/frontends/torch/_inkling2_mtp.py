@@ -7,12 +7,13 @@ K / V and the Markov head its recurrent input; the Markov head's ``hidden_out`` 
 (``W_lm @ hidden_out``) so a drafted position's bias is one (vocab x 256) product. Greedy drafting and greedy
 verification: a step drafts after the anchor, the target scores the anchor and the first W - 1 drafts (W by batch
 size, ``mtp_widths``), and the longest agreeing prefix plus the target's next token are committed. Verification of
-one sequence (``mtp_verify``): "fast" (default), a resident step over the rows with its own summation order (half
-code products, position-block attention; within the rounding of the decode step); "resident", a resident step with
-every row the decode step's arithmetic (the output is the greedy decode's bit for bit); "rows", the row programs (also
-for several sequences). With the fast verification of one sequence a step verifies 2-8 rows, chosen from the walk's
-probabilities of the drafts (``mtp_adaptive``); its drafter layers and the LM head of its base logits run from Q8_0
-copies. The Markov walk ranks the 256 largest base logits of a drafted position: drafts only decide how many tokens
+one sequence (``mtp_verify``): "rows" (default), the row programs (also for several sequences); "fast", a resident
+step over the rows with its own summation order (half code products, position-block attention; within the rounding of
+the decode step); "resident", a resident step with every row the decode step's arithmetic (the output is the greedy
+decode's bit for bit). With the fast verification of one sequence a step verifies 2-16 rows, chosen from the walk's
+probabilities of the drafts (``mtp_adaptive``) and lookup drafts from the text (``mtp_lookup``); the drafter layers
+and the LM head of its base logits run from Q8_0 copies. With ``q8`` the speculative steps need the fast
+verification of one sequence (the row programs and the exact step use the BF16 weights). The Markov walk ranks the 256 largest base logits of a drafted position: drafts only decide how many tokens
 a step accepts. A step's commit runs in the next step's draft command buffer.
 
 Mixed into ``Inkling2Runtime`` (programs must be recorded before the plan is sealed).
@@ -175,9 +176,10 @@ class _MTPMixin:
         for name, nbytes in sizes.items():
             self.buf[name] = self.plan.buffer(nbytes)
 
-    # verification program of one sequence: "rows" (the row program's numerics) or "resident" (the resident step:
-    # every row the decode step's arithmetic, so the output is the greedy decode's continuation bit for bit)
-    mtp_verify = "fast"
+    # verification program of one sequence: "rows" (the row program's numerics), "fast" (the resident step in its own
+    # summation order) or "resident" (the resident step: every row the decode step's arithmetic, so the output is the
+    # greedy decode's continuation bit for bit)
+    mtp_verify = "rows"
     # Markov walk over the MTP_CAND largest base logits of each drafted position (0: the whole vocabulary); drafts
     # only decide how many tokens a step accepts, never which
     mtp_draft_candidates = MTP_CAND
@@ -489,6 +491,11 @@ class _MTPMixin:
         C = len(prompts)
         if ("draft", C) not in getattr(self, "mtp_programs", {}):
             raise ValueError(f"no MTP programs for {C} sequences (mtp_batches)")
+        if self.mtp_verify not in ("rows", "fast", "resident"):
+            raise ValueError("mtp_verify must be 'rows', 'fast' or 'resident'")
+        if self.q8 and not (C == 1 and self.mtp_verify == "fast"):
+            raise ValueError("with q8 the speculative steps need one sequence and mtp_verify='fast' (the row programs "
+                             "and the exact step verify from the BF16 weights)")
         if any(not p for p in prompts):
             raise ValueError("prompts must be non-empty")
         # a sequence can pass `limit` by W - 1 tokens and keeps verifying W rows after that

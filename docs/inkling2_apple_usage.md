@@ -50,19 +50,27 @@ ids = fe.tokenizer.encode(fe.apply_chat_template(messages, reasoning_effort="med
 for block in fe.stream(ids, max_new_tokens=256, temperature=1.0, top_p=0.95, top_k=20, seed=7):
     ...
 
-# DSpark speculative decoding: the drafter proposes, the model verifies greedily.
+# DSpark speculative decoding: the drafter proposes, the model verifies greedily (default: the row programs).
 spec = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True)
+# verify="fast": one resident step over 2-16 rows chosen per step (adaptive rows, lookup drafts from the text)
+fast = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="fast")
 # verify="exact": every verified row repeats the decode step's arithmetic (output = greedy decode, bit for bit)
 exact = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="exact")
-# q8=True: attention projections and LM head from Q8_0 copies made at load (faster; not the checkpoint's numerics)
-q8 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, q8=True)
-# adaptive=False: the fast verification always checks 8 rows (default: 2-8 per step from the drafts' probabilities,
-# 12 or 16 with lookup drafts from the text; lookup=False: at most 8)
-fixed = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, adaptive=False)
+# q8=True: attention projections and LM head from Q8_0 copies made at load (faster; not the checkpoint's numerics;
+# with speculative decoding only verify="fast")
+q8 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="fast", q8=True)
+# adaptive=False: the fast verification always checks 8 rows; lookup=False: no lookup drafts (at most 8 rows)
+fixed = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="fast",
+                                 adaptive=False)
 # dflash2=...: draft with the DFlash 2 drafter (block diffusion + candidate selector) instead of DSpark
-df2 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True,
+df2 = Inkling2TorchFrontendMps("/path/to/Inkling-2-Mini", max_seq=8192, speculative=True, verify="fast",
                                dflash2="/path/to/Inkling-2-Mini-DFlash2")
 ```
+
+Options the runtime would not honor are refused when the frontend is
+constructed: `dflash2=` without `speculative=True`; `q8=True` with speculative
+decoding and `verify="rows"` or `"exact"` (they verify from the BF16 weights);
+`adaptive=True` or `lookup=True` without `verify="fast"`.
 
 `stream` stops after an end-of-generation token (`generation_config.json`'s
 `eos_token_id`; `stop_ids=()` disables stopping). Prompts of any length are
@@ -156,15 +164,17 @@ its layers and of the LM head (its base logits), and the Markov head ranks the
 256 largest base logits (with the fold bias) instead of the whole vocabulary.
 
 The model verifies the anchor and up to W - 1 drafts (W = 16 for one
-sequence, 8 for 2-4, 4 for up to 16, 3 beyond). One sequence is verified by a
-resident step: one dispatch over up to 16 rows (40 threadgroups from 4 rows, 36 below; device-scope
+sequence with the fast verification, 8 with the others and for 2-4 sequences,
+4 for up to 16, 3 beyond). By default (`verify="rows"`) the row programs verify,
+as in the previous release. With `verify="fast"` or `"exact"` one sequence is
+verified by a resident step: one dispatch over up to 16 rows (40 threadgroups from 4 rows, 36 below; device-scope
 barriers), the weights read once for all rows, the experts of the rows
 deduplicated (32 distinct experts per visit on average for 8 rows, 15-47) and
 taken by
 threadgroups from a counter, heavy and light experts alternately, each expert's
 down rows as soon as its gate / up rows are done. Two variants share it:
 `exact` gives every row the decode step's arithmetic (its products, lane order
-and roundings), `fast` (the default) sums in its own order: expert products in
+and roundings), `fast` sums in its own order: expert products in
 half precision (the codes decoded by shifts and masks into pairs of halves, the
 inputs scaled by a power of two per row so the products of BF16 inputs and
 E2M1 codes are exact halves, sums of 16 in half, FP32 beyond), coalesced
@@ -320,8 +330,8 @@ mlx-lm runs these concurrency levels on its BatchGenerator (the engine of
 `mlx_lm.server`); at C = 1 its single-sequence `stream_generate` is faster and
 is the comparison given in parentheses. FlashRT's plain decoding is the resident
 step at C = 1 and the batched row program above. DSpark verifies with the fast
-resident step at C = 1 (2-8 rows per step, 6.4-6.5 on average) and the row
-programs above. DSpark's ranges are the two measured prompt slices: the accepted
+resident step at C = 1 (`verify="fast"`; 2-8 rows per step, 6.4-6.5 on average)
+and the row programs above. DSpark's ranges are the two measured prompt slices: the accepted
 length depends on the text and the continuation, which the verification's
 summation order and rows can change (with the exact verification, C = 1 runs
 61.6 tokens/s in 89 ms steps of 8 rows). Over twelve slices the spread is wider
@@ -414,14 +424,15 @@ FlashRT token on the M4 Pro takes 28.3 ms.
 ```bash
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --make-corpus corpus.i32
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64
-python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64 --mtp
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify fast --no-lookup
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 4,16,64 --mtp
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify exact
-python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --fixed-rows
-python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --q8
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify fast --fixed-rows
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify fast --no-lookup --q8
 python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --q8
 # one sequence over twelve slices: DSpark, then DFlash 2 (each also with --q8 and with --no-lookup)
-python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --reps 12
-python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --reps 12 \
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify fast --reps 12
+python examples/apple/inkling2_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1 --mtp --verify fast --reps 12 \
     --dflash2 /path/to/Inkling-2-Mini-DFlash2
 python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --conc 1,4,16,64
 python examples/apple/inkling2_mlx_benchmark.py --model /path/to/Inkling-2-Mini --corpus corpus.i32 --stream
@@ -442,5 +453,6 @@ seconds (run 0 is the warm-up; the driver prints every run and the median).
   rates are measured on the M4 Pro (the cost table is rescaled by the measured
   times at run time); the accepted length depends on the text (the numbers above
   use source code). The resident verification
-  serves one sequence; `verify="exact"` is not available with `q8=True` (it
-  repeats the BF16 decode step).
+  serves one sequence; `q8=True` serves the decode step and the fast
+  verification of one sequence (`verify="rows"` and `"exact"`, prefill and the
+  batched row programs use the BF16 weights).

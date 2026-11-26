@@ -6,16 +6,16 @@ short convolutions and a 128-expert MoE. The released checkpoint is used as is: 
 NVFP4 experts in layers 0-19 and MXFP8 in 20-23, copied byte for byte into one Metal buffer and run by FlashRT's
 own Metal programs: chunked prefill row programs and a resident decode step that produces up to eight tokens per
 dispatch and reproduces mlx-lm's logits bit for bit. With ``speculative=True`` the checkpoint's DSpark drafter
-(``mtp.safetensors``) proposes blocks of tokens that the target verifies in one resident step over the 8 rows
-(greedy): ``verify="fast"`` (default) sums the products in its own order (half-precision code products, results
-within the rounding of the decode step's); ``verify="exact"`` repeats the decode step's arithmetic on every row, so
-the output is the greedy decode's continuation bit for bit; ``verify="rows"`` uses the row programs. With the fast
+(``mtp.safetensors``) proposes blocks of tokens that the target verifies (greedy): ``verify="rows"`` (default) in the
+row programs; ``verify="fast"`` in one resident step that sums the products in its own order (half-precision code
+products, results within the rounding of the decode step's); ``verify="exact"`` in one resident step that repeats the
+decode step's arithmetic on every row, so the output is the greedy decode's continuation bit for bit. With the fast
 verification a step verifies 2-8 rows chosen from the drafts' probabilities, or 12 / 16 with lookup drafts (the
 continuation of an earlier occurrence in the text: after the drafter's block, or alone where the text repeats;
 ``lookup=False``: none; ``adaptive=False``: always 8 rows).
-``dflash2=<directory>`` drafts with the DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2) instead of DSpark.
-``q8=True`` runs the attention projections and the LM head from Q8_0 copies made at load (faster, not the
-checkpoint's numerics).
+``dflash2=<directory>`` (with ``speculative=True``) drafts with the DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2)
+instead of DSpark. ``q8=True`` runs the attention projections and the LM head from Q8_0 copies made at load (faster,
+not the checkpoint's numerics): the decode step and, with ``speculative=True``, ``verify="fast"`` only.
 
     from flash_rt.frontends.torch.inkling2_mps import Inkling2TorchFrontendMps
     fe = Inkling2TorchFrontendMps("<path-to-Inkling-2-Mini>", max_seq=8192)
@@ -40,16 +40,30 @@ PREFILL_CHUNKS = (1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 VERIFY = {"fast": "fast", "exact": "resident", "rows": "rows"}     # speculative verification -> runtime program
 
 
+def check_options(speculative, verify, q8, adaptive, dflash2, lookup) -> None:
+    """Refuse option combinations the runtime would not honor (before anything is loaded)."""
+    if verify not in VERIFY:
+        raise ValueError(f"verify must be one of {sorted(VERIFY)}")
+    if dflash2 and not speculative:
+        raise ValueError("dflash2 is a drafter: it needs speculative=True")
+    if speculative and q8 and verify != "fast":
+        raise ValueError(f"q8 with speculative decoding needs verify='fast' (verify={verify!r} verifies from the "
+                         "BF16 weights)")
+    if adaptive and not (speculative and verify == "fast"):
+        raise ValueError("adaptive rows need speculative=True and verify='fast'")
+    if lookup and not (speculative and verify == "fast"):
+        raise ValueError("lookup drafts need speculative=True and verify='fast'")
+
+
 class Inkling2TorchFrontendMps:
     """Generation over the native inkling2_loop Metal runtime (one sequence)."""
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, speculative: bool = False,
-                 chat_template: Optional[str] = None, library: Optional[str] = None, verify: str = "fast",
-                 q8: bool = False, adaptive: bool = True, dflash2: Optional[str] = None, lookup: bool = True):
-        if verify not in VERIFY:
-            raise ValueError(f"verify must be one of {sorted(VERIFY)}")
-        if q8 and verify == "exact":
-            raise ValueError("verify='exact' repeats the BF16 decode step; it is not available with q8")
+                 chat_template: Optional[str] = None, library: Optional[str] = None, verify: str = "rows",
+                 q8: bool = False, adaptive: Optional[bool] = None, dflash2: Optional[str] = None,
+                 lookup: Optional[bool] = None):
+        check_options(speculative, verify, q8, adaptive, dflash2, lookup)
+        fast = bool(speculative) and verify == "fast"
         shapes = [(c, 1) for c in PREFILL_CHUNKS]
         self.speculative = bool(speculative)
         self.rt = Inkling2Runtime(checkpoint_dir, max_seq=max_seq, library=library, row_capacity=PREFILL_CHUNKS[0],
@@ -58,8 +72,8 @@ class Inkling2TorchFrontendMps:
                                   mtp_prefill=PREFILL_CHUNKS if self.speculative else (), q8=q8,
                                   dflash2=dflash2 if self.speculative else None)
         self.rt.mtp_verify = VERIFY[verify]
-        self.rt.mtp_adaptive = bool(adaptive)
-        self.rt.mtp_lookup = bool(lookup)
+        self.rt.mtp_adaptive = fast and adaptive is not False
+        self.rt.mtp_lookup = fast and lookup is not False
         self.cfg = self.rt.cfg
         self.tokenizer = _JsonTokenizer.from_directory(checkpoint_dir, chat_template=chat_template)
         self.eog = set(self.cfg.eos_token_ids)

@@ -374,9 +374,10 @@ mlx-lm with Inkling 2 support (BatchGenerator; `stream_generate` at C = 1).
 | 16 | 72.6 | **116.3** | **154.3** |
 | 64 | 120.1 | **210.7** | **212.8** |
 
-One sequence, speculative decoding with lookup drafts from the text (2-16
-verified rows per step), all generated tokens over all decode time of twelve
-1024-token prompt slices:
+DSpark at C = 1 above uses `verify="fast"`; the default `verify="rows"` keeps
+the previous release's row programs. One sequence, `verify="fast"` with
+lookup drafts from the text (2-16 verified rows per step), all generated tokens
+over all decode time of twelve 1024-token prompt slices:
 
 | Drafter | Checkpoint precision | `q8=True` (Q8_0 attention projections and LM head) |
 |---|---:|---:|

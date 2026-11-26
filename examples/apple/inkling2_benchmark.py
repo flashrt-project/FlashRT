@@ -10,9 +10,10 @@ Per run: prefill seconds (every prompt to its first token, sequence by sequence:
 decode seconds / tokens per second after every sequence has its first token, aggregate and per sequence. Plain
 decoding: the resident decode step (C = 1, blocks of eight tokens) or the batched row program (one row per
 sequence per step). ``--mtp``: DSpark drafting with greedy verification (verify widths by C, see
-``Inkling2Runtime.mtp_widths``); ``--verify`` picks the verification of one sequence (fast: the resident step with
-its own summation order, exact: the resident step with the decode step's arithmetic, rows: the row programs).
-``--q8``: attention projections and LM head from Q8_0 copies (not the checkpoint's numerics). Run 0 is a warm-up;
+``Inkling2Runtime.mtp_widths``); ``--verify`` picks the verification of one sequence (rows: the row programs, the
+default; fast: the resident step with its own summation order, adaptive rows and lookup drafts; exact: the resident
+step with the decode step's arithmetic). ``--q8``: attention projections and LM head from Q8_0 copies (not the
+checkpoint's numerics; C = 1, with --mtp only --verify fast). Run 0 is a warm-up;
 the median of the others is printed per C.
 """
 from __future__ import annotations
@@ -54,7 +55,7 @@ def main():
     ap.add_argument("--gen", type=int, default=1024)
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--mtp", action="store_true", help="DSpark speculative decoding")
-    ap.add_argument("--verify", choices=("fast", "exact", "rows"), default="fast",
+    ap.add_argument("--verify", choices=("rows", "fast", "exact"), default="rows",
                     help="verification of one sequence with --mtp (C = 1)")
     ap.add_argument("--fixed-rows", action="store_true",
                     help="fast verification of one sequence: always 8 rows (default: 2-16 chosen per step)")
@@ -63,8 +64,10 @@ def main():
     ap.add_argument("--dflash2", default=None, help="DFlash 2 drafter directory (with --mtp, C = 1)")
     ap.add_argument("--q8", action="store_true", help="Q8_0 attention projections and LM head")
     args = ap.parse_args()
-    if args.q8 and args.verify == "exact":
-        ap.error("--verify exact repeats the BF16 decode step; not with --q8")
+    if args.q8 and args.mtp and args.verify != "fast":
+        ap.error("--q8 with --mtp needs --verify fast (the row programs and the exact step use the BF16 weights)")
+    if args.dflash2 and not args.mtp:
+        ap.error("--dflash2 is a drafter: it needs --mtp")
     if args.make_corpus:
         return make_corpus(args)
     if not args.corpus:
@@ -72,6 +75,8 @@ def main():
     from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime
     corpus = np.fromfile(args.corpus, dtype="<i4")
     concs = [int(c) for c in args.conc.split(",")]
+    if args.q8 and concs != [1]:
+        ap.error("--q8 serves one sequence (--conc 1): the batched row programs use the BF16 weights")
     P, G = args.prompt, args.gen
     needed = 7919 * args.reps + max(concs) * P
     if corpus.size < needed:
