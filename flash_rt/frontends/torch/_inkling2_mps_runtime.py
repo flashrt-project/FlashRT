@@ -439,7 +439,7 @@ class Inkling2Runtime(_MTPMixin, _DFlash2Mixin):
 
     # TensorOps tile (rows, columns, SIMD groups) by row count: few rows want narrow column tiles (more
     # threadgroups to stream the weights), many rows one row tile (weights read once).
-    gemm_tiles = {8: (8, 32, 1), 16: (16, 32, 2), 64: (16, 32, 2)}
+    gemm_tiles = {4: (8, 32, 1), 16: (16, 32, 2), 64: (16, 32, 2)}
     # Row-count paths. Up to `gemv_rows` rows: multi-row gemv / per-expert qmv, each row's arithmetic the decode
     # step's (results independent of the batch). Up to `hybrid_limit` rows: experts with at most `hybrid_rows`
     # rows take the qmv kernel, the others TensorOps tiles (a tile pays its weights for up to tile_m rows).

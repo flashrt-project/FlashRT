@@ -233,3 +233,71 @@ def test_chat_template_tojson_matches_transformers():
     fe.tokenizer, fe._template = _Tokenizer(), None
     out = fe.apply_chat_template([{"role": "user", "content": "x"}], tools={"b": 1, "a": "é"})
     assert out == '{"b": 1, "a": "é"}|{"a":"é","b":1}|x'
+
+
+def _frontend(monkeypatch, **options):
+    """The frontend over a stand-in runtime (records its arguments) and no tokenizer: routing only."""
+    import types
+    import flash_rt.frontends.torch.inkling2_mps as fm
+
+    class _Runtime:
+        def __init__(self, checkpoint_dir, **kwargs):
+            self.kwargs = kwargs
+            self.cfg = types.SimpleNamespace(eos_token_ids=[200006])
+
+    monkeypatch.setattr(fm, "Inkling2Runtime", _Runtime)
+    monkeypatch.setattr(fm, "_JsonTokenizer", types.SimpleNamespace(from_directory=lambda *a, **k: None))
+    return fm.Inkling2TorchFrontendMps("checkpoint", **options)
+
+
+def test_speculative_defaults_keep_the_row_programs(monkeypatch):
+    """speculative=True alone verifies in the row programs as in the previous release (no adaptive rows, no lookup
+    drafts); the resident step, adaptive rows and lookup drafts are chosen with verify='fast'."""
+    rt = _frontend(monkeypatch, speculative=True).rt
+    assert (rt.mtp_verify, rt.mtp_adaptive, rt.mtp_lookup) == ("rows", False, False)
+    assert rt.kwargs["dflash2"] is None and not rt.kwargs["q8"]
+    rt = _frontend(monkeypatch, speculative=True, verify="fast").rt
+    assert (rt.mtp_verify, rt.mtp_adaptive, rt.mtp_lookup) == ("fast", True, True)
+    rt = _frontend(monkeypatch, speculative=True, verify="fast", adaptive=False, lookup=False).rt
+    assert (rt.mtp_verify, rt.mtp_adaptive, rt.mtp_lookup) == ("fast", False, False)
+    rt = _frontend(monkeypatch, speculative=True, verify="exact", dflash2="drafter").rt
+    assert (rt.mtp_verify, rt.mtp_adaptive, rt.mtp_lookup, rt.kwargs["dflash2"]) == ("resident", False, False,
+                                                                                     "drafter")
+    rt = _frontend(monkeypatch, q8=True).rt                          # the Q8_0 decode step
+    assert rt.kwargs["q8"] and rt.kwargs["mtp_batches"] == ()
+    from flash_rt.frontends.torch._inkling2_mtp import _MTPMixin
+    assert _MTPMixin.mtp_verify == "rows"
+
+
+@pytest.mark.parametrize("options", [
+    {"verify": "tree"},
+    {"dflash2": "drafter"},                                          # a drafter without speculative decoding
+    {"speculative": True, "q8": True},                               # the row programs verify from BF16 weights
+    {"speculative": True, "q8": True, "verify": "rows"},
+    {"speculative": True, "q8": True, "verify": "exact"},
+    {"speculative": True, "adaptive": True},                         # adaptive rows / lookup drafts: fast only
+    {"speculative": True, "lookup": True, "verify": "exact"},
+    {"adaptive": True},
+    {"lookup": True},
+])
+def test_frontend_refuses_options_it_would_ignore(monkeypatch, options):
+    with pytest.raises(ValueError):
+        _frontend(monkeypatch, **options)
+
+
+def test_q8_speculative_steps_need_the_fast_verification():
+    """Through the runtime: with Q8_0 copies the speculative steps refuse the row programs, the exact step and
+    several sequences (they would verify from the BF16 weights)."""
+    import types
+    from flash_rt.frontends.torch._inkling2_mtp import _MTPMixin
+    for verify, prompts in (("rows", [[1]]), ("resident", [[1]]), ("fast", [[1], [2]])):
+        rt = types.SimpleNamespace(q8=True, mtp_verify=verify,
+                                   mtp_programs={("draft", len(prompts)): None})
+        with pytest.raises(ValueError, match="q8"):
+            next(_MTPMixin.mtp_steps(rt, prompts, 4))
+
+
+def test_row_programs_of_5_to_8_rows_keep_16_row_tiles():
+    """The previous release's TensorOps tiles: 8 x 32 up to 4 rows, 16 x 32 from 5 rows."""
+    from flash_rt.frontends.torch._inkling2_mps_runtime import Inkling2Runtime as R
+    assert [R._pick(R.gemm_tiles, r) for r in (1, 4, 5, 8, 16)] == [(8, 32, 1)] * 2 + [(16, 32, 2)] * 3
