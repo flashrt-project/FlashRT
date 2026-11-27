@@ -12,6 +12,9 @@ FP4 / FP8 tensor-core instructions of SM120) from recorded programs replayed as 
 * ``speculative=True``: the checkpoint's DSpark drafter (``mtp.safetensors``) proposes ``draft_width - 1`` tokens
   per step and the target verifies them in one multi-row forward whose rows run the decode step's arithmetic, so
   the output is exactly the greedy decode output;
+* ``speculative=True, dflash2=<directory>``: the DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2) proposes up to 7
+  tokens per step instead, each step verifying the number of rows with the most expected tokens per unit of time
+  (``adaptive=False``: ``draft_width`` rows), with the same exact verification;
 * ``fp8=True``: decode steps and verification rows read E4M3 copies of the attention / output projections and the
   LM head (the output is then this variant's greedy output, not the BF16 checkpoint's).
 
@@ -70,20 +73,27 @@ def compile_chat_template(source: str):
 class Inkling2TorchFrontendRtx:
     """Greedy generation over the native Inkling 2 runtime (one sequence).
 
-    ``max_seq``: prompt plus generated tokens (KV capacity). ``speculative``: load the DSpark drafter and use it by
-    default (``stream(..., speculative=False)`` still decodes plainly). ``prefill``: ``"fast"`` (tensor-core
-    chunks) or ``"exact"`` (bit-identical to token-by-token decoding). ``check_block`` decode steps or
-    ``check_rounds`` speculative steps run between host reads of the generated tokens (a stop token is found at
-    most that late)."""
+    ``max_seq``: prompt plus generated tokens (KV capacity). ``speculative``: load the drafter (DSpark, or DFlash 2
+    from ``dflash2``) and use it by default (``stream(..., speculative=False)`` still decodes plainly).
+    ``prefill``: ``"fast"`` (tensor-core chunks) or ``"exact"`` (bit-identical to token-by-token decoding).
+    ``check_block`` decode steps or ``check_rounds`` speculative steps run between host reads of the generated
+    tokens (a stop token is found at most that late)."""
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, speculative: bool = False, draft_width: int = 4,
                  prefill: str = "fast", check_block: int = 16, check_rounds: int = 4, device: int = 0,
-                 chat_template: Optional[str] = None, fp8: bool = False):
+                 chat_template: Optional[str] = None, fp8: bool = False, dflash2: Optional[str] = None,
+                 adaptive: bool = True):
         if prefill not in PREFILL_MODES:
             raise ValueError(f"prefill must be one of {PREFILL_MODES}")
         if check_block < 1 or check_rounds < 1:
             raise ValueError("check_block and check_rounds must be positive")
-        if speculative:   # the drafter's configuration and tensors, before any weight is loaded
+        if dflash2 and not speculative:
+            raise ValueError("dflash2 is a drafter: it needs speculative=True")
+        if dflash2:       # the drafter's configuration and tensors, before any weight is loaded
+            from flash_rt.frontends.torch._inkling2_rtx_dflash2 import check_dflash2
+            raw, text = read_config(checkpoint_dir)
+            check_dflash2(dflash2, text, visit_count(text))
+        elif speculative:
             from flash_rt.frontends.torch._inkling2_rtx_mtp import check_mtp_config, expected_mtp_tensors
             raw, text = read_config(checkpoint_dir)
             check_mtp_config(raw, visit_count(text))
@@ -97,7 +107,10 @@ class Inkling2TorchFrontendRtx:
         self.prefill_mode = prefill
         self.check_block, self.check_rounds = int(check_block), int(check_rounds)
         self.drafter = None
-        if speculative:
+        if dflash2:
+            from flash_rt.frontends.torch._inkling2_rtx_dflash2 import Inkling2RtxDFlash2
+            self.drafter = Inkling2RtxDFlash2(self.rt, dflash2, width=draft_width, adaptive=adaptive)
+        elif speculative:
             from flash_rt.frontends.torch._inkling2_rtx_mtp import Inkling2RtxDrafter
             self.drafter = Inkling2RtxDrafter(self.rt, width=draft_width)
         self.speculative = bool(speculative)
@@ -115,12 +128,20 @@ class Inkling2TorchFrontendRtx:
         if self.drafter is not None:
             for _ in self.stream(ids, max_new_tokens=2, stop_ids=(), speculative=False):
                 pass
+        if getattr(self.drafter, "adaptive", False):     # the round of every width the steps may pick
+            self.rt.reset()
+            self.drafter.prefill(ids)
+            for W in self.drafter.widths_all:
+                self.rt.run(self.drafter.add_width(W))
+            torch.cuda.synchronize()
 
     def _margin(self, speculative: bool) -> int:
         """Positions beyond the requested tokens a request may write: speculative steps run past the last read
-        (and verify ``width`` rows ahead); plain decode stops at the requested count."""
+        (and verify up to 8 rows ahead with adaptive widths, else ``width``); plain decode stops at the requested
+        count."""
         if speculative:
-            return (self.check_rounds + 1) * self.drafter.width + 8
+            width = max(self.drafter.widths_all) if getattr(self.drafter, "adaptive", False) else self.drafter.width
+            return (self.check_rounds + 1) * width + 8
         return 1
 
     def stream(self, prompt_ids: Sequence[int], max_new_tokens: int = 256, stop_ids: Optional[Sequence[int]] = None,

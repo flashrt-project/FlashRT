@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 Mini on RTX SM120: one sequence, greedy, plain decode and DSpark speculative decoding interleaved.
+"""Inkling 2 Mini on RTX SM120: one sequence, greedy, plain decode and speculative decoding interleaved.
 
-``--fp8``: the runtime's E4M3 copies of the attention / output projections and the LM head (both modes).
+The drafter is the checkpoint's DSpark, or with ``--dflash2 <directory>`` the DFlash 2 drafter
+(incoai/Inkling-2-Mini-DFlash2; adaptive widths, ``--fixed-width``: ``--width`` rows every step). ``--fp8``: the
+runtime's E4M3 copies of the attention / output projections and the LM head (both modes).
 
-Single-prompt runs (``--reps`` each, median): prefill (prompt -> first token; with DSpark it also writes the
+Single-prompt runs (``--reps`` each, median): prefill (prompt -> first token; speculative runs also write the
 drafter context) and decode tokens/s = (new tokens - 1) / (time from the first token to the last), without stop
-tokens; DSpark's tokens are checked against plain greedy decoding. Prompts:
+tokens; the speculative tokens are checked against plain greedy decoding. Prompts:
 
 * ``--prompt review`` (default): a review task rendered with the checkpoint's chat template
   (``reasoning_effort="none"``), its first 64 and last ``--isl`` - 64 token ids;
@@ -15,8 +17,8 @@ tokens; DSpark's tokens are checked against plain greedy decoding. Prompts:
 * ``--prompt-ids``: a JSON list of token ids.
 
 ``--suite code`` / ``--suite general`` instead runs 16 built-in requests once per mode, each up to ``--new``
-tokens or the checkpoint's end-of-generation token, and reports the aggregate decode rate and DSpark's accepted
-tokens per step (they depend on the text).
+tokens or the checkpoint's end-of-generation token, and reports the aggregate decode rate and the drafter's
+accepted tokens per step (they depend on the text).
 
 Runs are separated by ``--cooldown`` seconds; each timed request follows ``--warm`` seconds of decode steps, so
 that it starts with the GPU at its clocks rather than idle.
@@ -24,6 +26,7 @@ that it starts with the GPU at its clocks rather than idle.
     python examples/inkling2_rtx_benchmark.py --checkpoint <path-to-Inkling-2-Mini> --new 512 --reps 3
     python examples/inkling2_rtx_benchmark.py --checkpoint <path> --prompt code --isl 32768 --max-seq 40960
     python examples/inkling2_rtx_benchmark.py --checkpoint <path> --suite code --cooldown 5
+    python examples/inkling2_rtx_benchmark.py --checkpoint <path> --dflash2 <path-to-Inkling-2-Mini-DFlash2> [--fp8]
 """
 from __future__ import annotations
 
@@ -128,7 +131,9 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--cooldown", type=float, default=30.0, help="seconds before each timed request")
     ap.add_argument("--warm", type=float, default=0.2, help="seconds of decode steps before each timed request")
-    ap.add_argument("--width", type=int, default=4, help="DSpark verified rows per step")
+    ap.add_argument("--width", type=int, default=4, help="verified rows per step (DSpark, DFlash 2 --fixed-width)")
+    ap.add_argument("--dflash2", help="DFlash 2 drafter directory (instead of DSpark)")
+    ap.add_argument("--fixed-width", action="store_true", help="DFlash 2: --width rows every step")
     ap.add_argument("--fp8", action="store_true", help="E4M3 attention / output projections and LM head")
     ap.add_argument("--prefill", choices=("fast", "exact"), default="fast")
     ap.add_argument("--max-seq", type=int, default=4096)
@@ -138,8 +143,10 @@ def main():
     from flash_rt.frontends.torch.inkling2_rtx import Inkling2TorchFrontendRtx
     t0 = time.perf_counter()
     fe = Inkling2TorchFrontendRtx(args.checkpoint, max_seq=args.max_seq, speculative=True, draft_width=args.width,
-                                  prefill=args.prefill, fp8=args.fp8)
+                                  prefill=args.prefill, fp8=args.fp8, dflash2=args.dflash2,
+                                  adaptive=not args.fixed_width)
     rt, dr, sync = fe.rt, fe.drafter, torch.cuda.synchronize
+    spec = "dflash2" if args.dflash2 else "dspark"
     if args.suite:
         prompts = [fe.tokenizer.encode(fe.apply_chat_template([{"role": "user", "content": q}],
                                                               reasoning_effort="none")) for q in SUITES[args.suite]]
@@ -192,7 +199,7 @@ def main():
         c = time.perf_counter()
         return dict(prefill_s=b - a, decode_s=c - b, tokens=len(out)), out
 
-    def dspark(ids):
+    def speculative(ids):
         warm()
         rt.reset()
         sync()
@@ -211,38 +218,39 @@ def main():
         return dict(prefill_s=b - a, decode_s=c - b, tokens=len(out), steps=dr.rounds,
                     accepted=int(dr.log_count.item()) - 1), out
 
-    runs = {"plain": [], "dspark": []}
+    runs = {"plain": [], spec: []}
     if args.suite:
         for i, ids in enumerate(prompts):
             time.sleep(args.cooldown)
             rp, ref = plain(ids)
             time.sleep(args.cooldown)
-            rd, out = dspark(ids)
+            rd, out = speculative(ids)
             rd["identical_to_greedy"] = out == ref
-            for mode, r in (("plain", rp), ("dspark", rd)):
+            for mode, r in (("plain", rp), (spec, rd)):
                 r["prompt_tokens"] = len(ids)
                 runs[mode].append(r)
-            print(i, len(ids), json.dumps(dict(plain_tok_s=round((rp["tokens"] - 1) / rp["decode_s"], 1),
-                                               dspark_tok_s=round((rd["tokens"] - 1) / rd["decode_s"], 1),
-                                               tokens=rp["tokens"], tokens_per_step=round(rd["accepted"] / rd["steps"], 2),
-                                               identical=rd["identical_to_greedy"])), flush=True)
+            print(i, len(ids), json.dumps({"plain_tok_s": round((rp["tokens"] - 1) / rp["decode_s"], 1),
+                                           f"{spec}_tok_s": round((rd["tokens"] - 1) / rd["decode_s"], 1),
+                                           "tokens": rp["tokens"],
+                                           "tokens_per_step": round(rd["accepted"] / rd["steps"], 2),
+                                           "identical": rd["identical_to_greedy"]}), flush=True)
         summary = {m: {"decode_tok_s": sum(r["tokens"] - 1 for r in rs) / sum(r["decode_s"] for r in rs),
                        "prefill_ms_median": 1e3 * statistics.median(r["prefill_s"] for r in rs),
                        "tokens": sum(r["tokens"] for r in rs)} for m, rs in runs.items()}
-        rs = runs["dspark"]
-        summary["dspark"]["tokens_per_step"] = sum(r["accepted"] for r in rs) / sum(r["steps"] for r in rs)
-        summary["dspark"]["tokens_per_step_range"] = [round(min(r["accepted"] / r["steps"] for r in rs), 2),
-                                                      round(max(r["accepted"] / r["steps"] for r in rs), 2)]
-        summary["dspark"]["identical_to_greedy"] = all(r["identical_to_greedy"] for r in rs)
+        rs = runs[spec]
+        summary[spec]["tokens_per_step"] = sum(r["accepted"] for r in rs) / sum(r["steps"] for r in rs)
+        summary[spec]["tokens_per_step_range"] = [round(min(r["accepted"] / r["steps"] for r in rs), 2),
+                                                  round(max(r["accepted"] / r["steps"] for r in rs), 2)]
+        summary[spec]["identical_to_greedy"] = all(r["identical_to_greedy"] for r in rs)
     else:
         ids = prompts[0]
         _, ref = plain(ids)
         for rep in range(args.reps):
-            for mode, fn in (("plain", plain), ("dspark", dspark)):
+            for mode, fn in (("plain", plain), (spec, speculative)):
                 time.sleep(args.cooldown)
                 r, out = fn(ids)
                 r["tok_s"] = (r["tokens"] - 1) / r["decode_s"]
-                if mode == "dspark":
+                if mode == spec:
                     r["identical_to_greedy"] = out == ref
                     r["tokens_per_step"] = r["accepted"] / r["steps"]
                 r["gpu_c"] = gpu_temperature()
@@ -252,8 +260,8 @@ def main():
         summary = {m: {"decode_tok_s_median": statistics.median(r["tok_s"] for r in rs),
                        "prefill_ms_median": 1e3 * statistics.median(r["prefill_s"] for r in rs)}
                    for m, rs in runs.items()}
-        summary["dspark"]["tokens_per_step_median"] = statistics.median(r["tokens_per_step"] for r in runs["dspark"])
-        summary["dspark"]["identical_to_greedy"] = all(r["identical_to_greedy"] for r in runs["dspark"])
+        summary[spec]["tokens_per_step_median"] = statistics.median(r["tokens_per_step"] for r in runs[spec])
+        summary[spec]["identical_to_greedy"] = all(r["identical_to_greedy"] for r in runs[spec])
         summary["prompt_tokens"] = len(ids)
     summary["torch_peak_gib"] = round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)
     print(json.dumps(summary, indent=1))

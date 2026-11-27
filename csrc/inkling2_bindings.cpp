@@ -420,6 +420,74 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   MTP_DEF(mtp_pick)
 #undef MTP_DEF
   m.attr("MTP_PICK_BLOCKS") = ik::mtp_pick_blocks();
+  auto df = [](const py::dict& d) {
+    ik::DfParams p = {};
+    p.pos = dptr<const int>(d, "pos");
+    p.anchor = dptr<const int>(d, "anchor");
+    p.layer = dint(d, "layer");
+    p.cap = dint(d, "cap");
+    p.theta = dflt(d, "theta");
+    p.window = dint(d, "window");
+    p.kv = dptr<uint16_t>(d, "kv");
+    p.dh = dptr<float>(d, "dh");
+    p.x = dptr<uint16_t>(d, "x");
+    p.norm_w = dptr<const uint16_t>(d, "norm_w");
+    p.eps = dflt(d, "eps");
+    p.eps2 = dflt(d, "eps2");
+    p.embed = dptr<const uint16_t>(d, "embed");
+    p.embed_norm = dptr<const uint16_t>(d, "embed_norm");
+    p.mask_row = dptr<const uint16_t>(d, "mask_row");
+    p.src = dptr<const uint16_t>(d, "src");
+    p.src_f32 = dptr<const float>(d, "src_f32");
+    p.dst = dptr<uint16_t>(d, "dst");
+    p.coef = dptr<const uint16_t>(d, "coef");
+    p.coef_part = dint(d, "coef_part");
+    p.base = dptr<const uint16_t>(d, "base");
+    p.qkv = dptr<const uint16_t>(d, "qkv");
+    p.q_norm = dptr<const uint16_t>(d, "q_norm");
+    p.k_norm = dptr<const uint16_t>(d, "k_norm");
+    p.q_out = dptr<uint16_t>(d, "q_out");
+    p.attn_out = dptr<uint16_t>(d, "attn_out");
+    p.gu = dptr<const uint16_t>(d, "gu");
+    p.act = dptr<uint16_t>(d, "act");
+    p.inter = dint(d, "inter");
+    p.kvc = dptr<const float>(d, "kvc");
+    p.layers = dint(d, "layers");
+    p.rows = dint(d, "rows");
+    p.count = dptr<const int>(d, "count");
+    p.count_add = dint(d, "count_add");
+    if (d.contains("k_norm_l")) {
+      const auto v = d["k_norm_l"].cast<std::vector<uintptr_t>>();
+      if (v.size() > size_t(ik::kDfMaxLayers)) throw std::invalid_argument("df: too many layers");
+      for (size_t i = 0; i < v.size(); ++i) p.k_norm_l[i] = ptr<const uint16_t>(v[i]);
+    }
+    p.cand = dptr<const long long>(d, "cand");
+    p.vals = dptr<const float>(d, "vals");
+    p.hp = dptr<const uint16_t>(d, "hp");
+    p.pred_cb = dptr<const uint16_t>(d, "pred_cb");
+    p.succ_cb = dptr<const uint16_t>(d, "succ_cb");
+    p.softcap = dflt(d, "softcap");
+    p.drafts = dptr<int>(d, "drafts");
+    p.logits = dptr<const float>(d, "logits");
+    p.vocab = dint(d, "vocab");
+    p.top_vals = dptr<float>(d, "top_vals");
+    p.top_ids = dptr<long long>(d, "top_ids");
+    p.top_prob = dptr<float>(d, "top_prob");
+    p.top_part = dptr<float>(d, "top_part");
+    return p;
+  };
+#define DF_DEF(name) \
+  m.def(#name, [df](const py::dict& d, uintptr_t stream) { ik::name(df(d), to_stream(stream)); });
+  DF_DEF(df_embed)
+  DF_DEF(df_conv)
+  DF_DEF(df_conv_add_norm)
+  DF_DEF(df_qk)
+  DF_DEF(df_attention)
+  DF_DEF(df_silu)
+  DF_DEF(df_ctx_write)
+  DF_DEF(df_select)
+  DF_DEF(df_topk)
+#undef DF_DEF
 
   // C [m][n] = A [m][k] B [n][k]^T: a, b BF16, c BF16 (out_f32 = 0) or FP32; lda / ldb / ldc row strides in elements
   m.attr("GEMM_WORKSPACE_BYTES") = ik::kGemmWorkspaceBytes;

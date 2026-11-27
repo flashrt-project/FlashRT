@@ -380,6 +380,72 @@ struct MtpParams {
   int* pick_index;
   int* pick_counter;                // zero between launches
 };
+// DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2) of one sequence: block of kDfBlock rows, see inkling2_dflash2.cu.
+constexpr int kDfBlock = 8;
+constexpr int kDfQHeads = 32;
+constexpr int kDfKvHeads = 8;
+constexpr int kDfRank = 256;
+constexpr int kDfTopK = 16;
+constexpr int kDfMaxLayers = 8;
+struct DfParams {
+  const int* pos;                   // the block start (the anchor's position); context: target position after a step
+  const int* anchor;                // the anchor token
+  int layer, cap;                   // the layer of block kernels; KV capacity (positions)
+  float theta;
+  int window;                       // keys left of a query
+  uint16_t* kv;                     // [layers][2][8][cap][128]
+  float* dh;                        // [8][kHidden] residual stream (BF16 values)
+  uint16_t* x;                      // [8][kHidden] normalized rows
+  const uint16_t* norm_w;
+  float eps, eps2;                  // the drafter's RMSNorm epsilon; the target's (embed_norm)
+  const uint16_t* embed;
+  const uint16_t* embed_norm;
+  const uint16_t* mask_row;         // the mask token's normalized embedding
+  const uint16_t* src;              // conv input rows [8][kHidden]
+  const float* src_f32;             // or FP32 rows [8][kHidden] (src null)
+  uint16_t* dst;
+  const uint16_t* coef;             // [8][2][taps][groups] conv coefficients
+  int coef_part;                    // 0: the input convolution's, 1: the output convolution's
+  const uint16_t* base;             // [taps][kHidden]
+  const uint16_t* qkv;              // [8][(32 + 16) * 128]
+  const uint16_t* q_norm;
+  const uint16_t* k_norm;
+  uint16_t* q_out;                  // [8][32 * 128]
+  uint16_t* attn_out;
+  const uint16_t* gu;               // [8][2 * inter]
+  uint16_t* act;                    // [8][inter]
+  int inter;
+  const float* kvc;                 // context: [layers][rows][2][1024] projections (FP32)
+  int layers, rows;
+  const int* count;                 // context rows at pos - *count - count_add + j
+  int count_add;
+  const uint16_t* k_norm_l[kDfMaxLayers];
+  const long long* cand;            // [7][16] candidate ids (descending logits)
+  const float* vals;                // [7][16] their logits
+  const uint16_t* hp;               // [7][256] projected mask rows
+  const uint16_t* pred_cb;          // [vocab][256]
+  const uint16_t* succ_cb;
+  float softcap;
+  int* drafts;                      // [7]
+  // df_topk: logits [rows][vocab] -> per row the 16 largest values (top_vals, descending) and their ids (top_ids), the
+  // largest softmax probability (top_prob); top_part [rows][64][34] the blocks' partials
+  const float* logits;
+  int vocab;
+  float* top_vals;
+  long long* top_ids;
+  float* top_prob;
+  float* top_part;
+};
+void df_topk(const DfParams& p, cudaStream_t stream);
+void df_embed(const DfParams& p, cudaStream_t stream);
+void df_conv(const DfParams& p, cudaStream_t stream);
+void df_conv_add_norm(const DfParams& p, cudaStream_t stream);
+void df_qk(const DfParams& p, cudaStream_t stream);
+// attention of the block rows over the window and the block, each KV head's keys read once (partials in dh)
+void df_attention(const DfParams& p, cudaStream_t stream);
+void df_silu(const DfParams& p, cudaStream_t stream);
+void df_ctx_write(const DfParams& p, cudaStream_t stream);
+void df_select(const DfParams& p, cudaStream_t stream);
 void mtp_context_mix(const MtpParams& p, cudaStream_t stream);
 void mtp_context_write(const MtpParams& p, cudaStream_t stream);
 void mtp_block_embed(const MtpParams& p, cudaStream_t stream);

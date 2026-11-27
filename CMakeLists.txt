@@ -1920,6 +1920,7 @@ if(FLASHRT_ENABLE_INKLING2)
     csrc/kernels/inkling2/inkling2_lmhead.cu
     csrc/kernels/inkling2/inkling2_spec.cu
     csrc/kernels/inkling2/inkling2_mtp.cu
+    csrc/kernels/inkling2/inkling2_dflash2.cu
     csrc/kernels/inkling2/inkling2_gemm.cu)
   set_target_properties(flash_rt_inkling2 PROPERTIES
     CUDA_STANDARD 17
