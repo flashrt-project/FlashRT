@@ -52,6 +52,25 @@ __global__ void __launch_bounds__(kThreads) gemv_multi_kernel(const __grid_const
   const uint4* w = reinterpret_cast<const uint4*>(task.w) + (live ? size_t(row) * (k / 8) : 0);
   if (kRowPrefetch && lane == 0 && live) prefetch_l2(w, uint32_t(k) * 2u);
   prefetch_share(p.prefetch);
+  // the first round of this warp's weights into registers before the wait (static data)
+  constexpr int kUnroll = 9;
+  const int k8 = k / 8;
+  uint4 v0[kUnroll];
+  const bool early = live && lane + 32 * (kUnroll - 1) < k8;
+  if (early) {
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) v0[u] = ldg_stream(w + lane + 32 * u);
+  }
+  // the norm weight (static) before the wait: uint4 t and t + 256 (k <= 4096)
+  uint4 nwp[2];
+  const bool nwpre = task.prologue == kGemvNorm && k / 8 <= 2 * kThreads;
+  if (nwpre) {
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+      const int i = threadIdx.x + m * kThreads;
+      nwp[m] = i < k / 8 ? static_cast<const uint4*>(task.aux)[i] : uint4{};
+    }
+  }
   pdl_wait();
   pdl_launch();
   const void* xin = after_wait(task.x);
@@ -82,14 +101,22 @@ __global__ void __launch_bounds__(kThreads) gemv_multi_kernel(const __grid_const
     const float inv = 1.0f / sqrtf(tot / float(k) + 1e-6f);
     const uint4* nw = static_cast<const uint4*>(task.aux);
     __syncthreads();
-    for (int i = threadIdx.x; i < k / 8; i += kThreads) {
-      const uint4 v = nw[i];
+    auto apply = [&](int i, const uint4& v) {
       const uint32_t ww[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         xs[8 * i + 2 * j] = round_bf16(xs[8 * i + 2 * j] * inv * bf16lo(ww[j]));
         xs[8 * i + 2 * j + 1] = round_bf16(xs[8 * i + 2 * j + 1] * inv * bf16hi(ww[j]));
       }
+    };
+    if (nwpre) {
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        const int i = threadIdx.x + m * kThreads;
+        if (i < k / 8) apply(i, nwp[m]);
+      }
+    } else {
+      for (int i = threadIdx.x; i < k / 8; i += kThreads) apply(i, nw[i]);
     }
     __syncthreads();
   } else if (task.prologue == kGemvGate) {
@@ -107,13 +134,18 @@ __global__ void __launch_bounds__(kThreads) gemv_multi_kernel(const __grid_const
   }
   if (!live) return;
   float acc = 0.0f;
-  const int k8 = k / 8;
-  constexpr int kUnroll = 9;
   int i = lane;
+  bool first = early;
   for (; i + 32 * (kUnroll - 1) < k8; i += 32 * kUnroll) {
     uint4 v[kUnroll];
+    if (first) {
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u) v[u] = ldg_stream(w + i + 32 * u);
+      for (int u = 0; u < kUnroll; ++u) v[u] = v0[u];
+      first = false;
+    } else {
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) v[u] = ldg_stream(w + i + 32 * u);
+    }
 #pragma unroll
     for (int u = 0; u < kUnroll; ++u) acc += dot8(v[u], xs + 8 * (i + 32 * u));
   }
@@ -132,6 +164,8 @@ __global__ void __launch_bounds__(kThreads) gemv_multi_kernel(const __grid_const
 // kernel.
 constexpr int kRowsWarps = 8;               // 16 measured slower (one block per SM either way)
 constexpr int kRowsThreads = kRowsWarps * 32;
+// RT: the largest row count of the launch (RT accumulators per lane)
+template <int RT>
 __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_constant__ GemvParams p) {
   extern __shared__ __align__(16) uint16_t xb[];
   int t = 0;
@@ -144,18 +178,27 @@ __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_co
   const bool live = row < task.n;
   const uint4* w = reinterpret_cast<const uint4*>(task.w) + (live ? size_t(row) * (k / 8) : 0);
   prefetch_share(p.prefetch);
+  // the first round of this warp's weights into registers before the wait (static data)
+  constexpr int kUnrollR = 9;
+  uint4 v0[kUnrollR];
+  // (up to 4 rows; beyond, the accumulators and the early round spill)
+  const bool early = RT <= 4 && live && lane + 32 * (kUnrollR - 1) < k / 8;
+  if (early) {
+#pragma unroll
+    for (int u = 0; u < kUnrollR; ++u) v0[u] = ldg_stream(w + lane + 32 * u);
+  }
   pdl_wait();
   pdl_launch();
   const void* xin = after_wait(task.x);
   // all rows at once: each thread visits the elements t, t + 256, ... of every row in the one-row order
   if (task.prologue == kGemvNorm) {
-    __shared__ float rp[kRows][kMaxRows];
-    float ss[kMaxRows];
+    __shared__ float rp[kRows][RT];
+    float ss[RT];
 #pragma unroll
-    for (int r = 0; r < kMaxRows; ++r) ss[r] = 0.0f;
+    for (int r = 0; r < RT; ++r) ss[r] = 0.0f;
     for (int i = threadIdx.x; threadIdx.x < kThreads && i < k; i += kThreads) {
 #pragma unroll
-      for (int r = 0; r < kMaxRows; ++r) {
+      for (int r = 0; r < RT; ++r) {
         if (r >= R) break;
         const float v = task.x_f32 ? static_cast<const float*>(xin)[r * xs + i]
                                    : bf16_to_f32(static_cast<const uint16_t*>(xin)[r * xs + i]);
@@ -163,15 +206,15 @@ __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_co
       }
     }
 #pragma unroll
-    for (int r = 0; r < kMaxRows; ++r) {
+    for (int r = 0; r < RT; ++r) {
       if (r >= R) break;
       const float s = warp_sum(ss[r]);
       if ((threadIdx.x & 31) == 0 && threadIdx.x < kThreads) rp[threadIdx.x >> 5][r] = s;
     }
     __syncthreads();
-    float inv[kMaxRows];
+    float inv[RT];
 #pragma unroll
-    for (int r = 0; r < kMaxRows; ++r) {
+    for (int r = 0; r < RT; ++r) {
       float tot = 0.0f;
 #pragma unroll
       for (int i = 0; i < kRows; ++i) tot += r < R ? rp[i][r] : 0.0f;
@@ -181,7 +224,7 @@ __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_co
     for (int i = threadIdx.x; i < k; i += kRowsThreads) {
       const float wv = bf16_to_f32(nw[i]);
 #pragma unroll
-      for (int r = 0; r < kMaxRows; ++r) {
+      for (int r = 0; r < RT; ++r) {
         if (r >= R) break;
         const float v = task.x_f32 ? static_cast<const float*>(xin)[r * xs + i]
                                    : bf16_to_f32(static_cast<const uint16_t*>(xin)[r * xs + i]);
@@ -192,7 +235,7 @@ __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_co
     const uint16_t* gate = static_cast<const uint16_t*>(after_wait(task.aux));
     for (int i = threadIdx.x; i < k; i += kRowsThreads)
 #pragma unroll
-      for (int r = 0; r < kMaxRows; ++r) {
+      for (int r = 0; r < RT; ++r) {
         if (r >= R) break;
         const float x = bf16_to_f32(static_cast<const uint16_t*>(xin)[r * xs + i]);
         xb[r * k + i] = f32_to_bf16_bits(x * (1.0f / (1.0f + expf(-bf16_to_f32(gate[size_t(r) * k + i])))));
@@ -216,22 +259,28 @@ __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_co
   }
   __syncthreads();
   if (!live) return;
-  float acc[kMaxRows];
+  float acc[RT];
 #pragma unroll
-  for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.0f;
+  for (int r = 0; r < RT; ++r) acc[r] = 0.0f;
   const int k8 = k / 8;
+  // every one of the RT rows each step (rows past R compute on stale staging and are not stored): the rows' chains
+  // interleave (with a break after each row the compiler serializes them)
   auto step = [&](const uint4& v, int i) {
 #pragma unroll
-    for (int r = 0; r < kMaxRows; ++r) {
-      if (r >= R) break;
+    for (int r = 0; r < RT; ++r) {
       const uint4 xv = reinterpret_cast<const uint4*>(xb + r * k)[i];
       const float xf[8] = {bf16lo(xv.x), bf16hi(xv.x), bf16lo(xv.y), bf16hi(xv.y),
                            bf16lo(xv.z), bf16hi(xv.z), bf16lo(xv.w), bf16hi(xv.w)};
       acc[r] += dot8(v, xf);
     }
   };
-  constexpr int kUnroll = 9;
+  constexpr int kUnroll = kUnrollR;
   int i = lane;
+  if (early) {        // the rounds loaded before the wait, in the loop's order
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) step(v0[u], i + 32 * u);
+    i += 32 * kUnroll;
+  }
   for (; i + 32 * (kUnroll - 1) < k8; i += 32 * kUnroll) {
     uint4 v[kUnroll];
 #pragma unroll
@@ -242,7 +291,7 @@ __global__ void __launch_bounds__(kRowsThreads) gemv_rows_kernel(const __grid_co
   for (; i < k8; i += 32) step(ldg_stream(w + i), i);
   void* y = after_wait(task.y);
 #pragma unroll
-  for (int r = 0; r < kMaxRows; ++r) {
+  for (int r = 0; r < RT; ++r) {
     if (r >= R) break;
     const float s = warp_sum(acc[r]);
     if (lane == 0) {
@@ -268,13 +317,24 @@ __global__ void __launch_bounds__(kThreads) norm_rows_kernel(const __grid_consta
   const int r = int(blockIdx.x) - p.block_start[t];
   const int k = task.k;
   const size_t stride = task.x_stride ? task.x_stride : k;
+  // the norm weight (static) into registers before the wait: elements t, t + 256, .. (k <= 9 x 256)
+  constexpr int kNW = 9;
+  float wv[kNW];
+  const bool wpre = k <= kNW * kThreads;
+  if (wpre) {
+#pragma unroll
+    for (int m = 0; m < kNW; ++m) {
+      const int i = threadIdx.x + m * kThreads;
+      wv[m] = i < k ? bf16_to_f32(task.w[i]) : 0.0f;
+    }
+  }
   pdl_wait();
-  pdl_launch();
   const void* xin = after_wait(task.x);
   for (int i = threadIdx.x; i < k; i += kThreads)
     xs[i] = task.x_f32 ? static_cast<const float*>(xin)[r * stride + i]
                        : bf16_to_f32(static_cast<const uint16_t*>(xin)[r * stride + i]);
   __syncthreads();
+  pdl_launch();                // (once the rows are loaded: the dependents' early weight loads would delay them)
   float ss = 0.0f;
   for (int i = threadIdx.x; i < k; i += kThreads) ss = fmaf(xs[i], xs[i], ss);
   ss = warp_sum(ss);
@@ -285,7 +345,15 @@ __global__ void __launch_bounds__(kThreads) norm_rows_kernel(const __grid_consta
   for (int i = 0; i < kRows; ++i) tot += part[i];
   const float inv = 1.0f / sqrtf(tot / float(k) + 1e-6f);
   uint16_t* out = after_wait(task.out) + size_t(r) * k;
-  for (int i = threadIdx.x; i < k; i += kThreads) out[i] = f32_to_bf16_bits(xs[i] * inv * bf16_to_f32(task.w[i]));
+  if (wpre) {
+#pragma unroll
+    for (int m = 0; m < kNW; ++m) {
+      const int i = threadIdx.x + m * kThreads;
+      if (i < k) out[i] = f32_to_bf16_bits(xs[i] * inv * wv[m]);
+    }
+  } else {
+    for (int i = threadIdx.x; i < k; i += kThreads) out[i] = f32_to_bf16_bits(xs[i] * inv * bf16_to_f32(task.w[i]));
+  }
 }
 
 }  // namespace
@@ -345,9 +413,28 @@ void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cuda
       if (task.x_f32 && task.prologue != kGemvNorm) throw std::invalid_argument("gemv_multi: FP32 rows need the norm");
       smem = smem > size_t(r) * task.k * 2 ? smem : size_t(r) * task.k * 2;
     }
-    check_cuda(cudaFuncSetAttribute(gemv_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
-               "gemv_rows smem");
-    launch_pdl(gemv_rows_kernel, dim3(blocks), dim3(kRowsThreads), smem, stream, p);
+    {      // every one of the kernel's RT rows is read: the staging sized for RT rows of the largest k
+      int rmax = 1, kmax = 0;
+      for (int t = 0; t < count; ++t) {
+        rmax = tasks[t].rows > rmax ? tasks[t].rows : rmax;
+        kmax = tasks[t].k > kmax ? tasks[t].k : kmax;
+      }
+      smem = smem > size_t(rmax) * kmax * 2 ? smem : size_t(rmax) * kmax * 2;
+    }
+    // the kernel for the largest row count (RT accumulators per lane)
+    auto run = [&](auto kernel) {
+      check_cuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)), "gemv_rows smem");
+      launch_pdl(kernel, dim3(blocks), dim3(kRowsThreads), smem, stream, p);
+    };
+    switch (max_rows) {
+      case 2: run(gemv_rows_kernel<2>); break;
+      case 3: run(gemv_rows_kernel<3>); break;
+      case 4: run(gemv_rows_kernel<4>); break;
+      case 5: run(gemv_rows_kernel<5>); break;
+      case 6: run(gemv_rows_kernel<6>); break;
+      case 7: run(gemv_rows_kernel<7>); break;
+      default: run(gemv_rows_kernel<8>); break;
+    }
     return;
   }
   const size_t smem = size_t(p.max_k) * sizeof(float);

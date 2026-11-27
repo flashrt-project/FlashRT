@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <utility>
 
@@ -50,13 +51,29 @@ __device__ __forceinline__ uint4 ldg_stream(const void* p) {
   return r;
 }
 
+__device__ __forceinline__ uint2 ldg_stream2(const void* p) {
+  uint2 r;
+  asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+  return r;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Programmatic dependent launch. A kernel launched with launch_pdl may start while the previous kernel of the
-// stream still runs: before pdl_wait() it touches only static data (weights) and writes nothing to global memory.
-// Pointers to data produced by earlier grids go through after_wait() so no load is hoisted above the wait.
+// stream still runs. Before pdl_wait() it reads only static data (weights) and data written two or more launches
+// back (final once the previous kernel has started), and writes only memory that the previous kernel neither reads
+// nor writes (work counters and scratch reset two or more launches back). Pointers to data produced by the previous
+// grid go through after_wait() so no load is hoisted above the wait.
 // ---------------------------------------------------------------------------------------------------------------
 // L2 prefetches of more than ~64 KiB per instruction are mostly dropped on SM120 (measured: a 40 MB GEMV after
 // 1 MiB prefetches runs at the cold rate, after <= 64 KiB prefetches at the L2 rate); ranges go out in 64 KiB pieces.
+// Per-device host setup (kernel attributes): true on the first call on the current device for the caller's flag word
+// (one bit per device ordinal below 64).
+inline bool first_use_on_device(std::atomic<unsigned long long>& done) {
+  int dev = 0;
+  check_cuda(cudaGetDevice(&dev), "device");
+  const unsigned long long bit = 1ull << (dev & 63);
+  return (done.fetch_or(bit) & bit) == 0;
+}
 constexpr uint32_t kPrefetchChunk = 64u << 10;
 __device__ __forceinline__ void prefetch_l2(const void* p, uint32_t bytes) {
   asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");

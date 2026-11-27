@@ -24,7 +24,7 @@ import torch
 
 from flash_rt.frontends.torch._inkling2_rtx_runtime import (
     BF16, F32, I32, D, HD, HKV, Inkling2ConfigError, Inkling2RtxRuntime, P, _require_module, check_tensors,
-    gemm_call, safetensors_header)
+    e4m3_rows, gemm_call, safetensors_header)
 
 MTP_GEOMETRY = {
     "hidden_size": 2304, "num_hidden_layers": 3, "num_attention_heads": 24, "num_key_value_heads": 8,
@@ -117,8 +117,8 @@ class Inkling2RtxDrafter:
             self.fold_b[s:s + n] = acc_b[:n, 0].to(BF16)
         del acc_w, acc_b
         if fp8:
-            self.head8, self.head_scale = self._e4m3_rows(head)
-            self.fold8, self.fold_scale = self._e4m3_rows(self.fold_w)
+            self.head8, self.head_scale = e4m3_rows(head)
+            self.fold8, self.fold_scale = e4m3_rows(self.fold_w)
         self.vocab = rt.vocab
         self.cap = rt.max_seq + 2 * BLOCK
         self.kv = z(LAYERS, 2, HKV, self.cap, HD)
@@ -151,19 +151,6 @@ class Inkling2RtxDrafter:
         rt.programs["ctx_exact"] = self._context(rt.accepted, 1)
         self.round = self.add_width(self.width)
         rt.drafter = self
-
-    @staticmethod
-    def _e4m3_rows(w, chunk=16384):
-        """E4M3 codes [rows][cols] (uint8) and FP32 scales [rows] = amax / 448 per row."""
-        codes = torch.empty(w.shape, device=w.device, dtype=torch.uint8)
-        scale = torch.empty(w.shape[0], device=w.device, dtype=F32)
-        with torch.no_grad():
-            for s in range(0, w.shape[0], chunk):
-                x = w[s:s + chunk].float()
-                sc = (x.abs().amax(1) / 448.0).clamp_min(1e-30)
-                codes[s:s + chunk] = (x / sc[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
-                scale[s:s + chunk] = sc
-        return codes, scale
 
     # ------------------------------------------------------------------------------------------- programs
     def _context(self, count, count_add, rows=BLOCK):
