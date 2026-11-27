@@ -340,7 +340,7 @@ class Inkling2RtxRuntime:
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
         self.use_graphs = True
         self._gemm_ready = False
-        self.drafter = None                 # the DSpark drafter recorded into this runtime (at most one)
+        self.drafter = None                 # the drafter recorded into this runtime (at most one)
         self.programs["decode"] = self._record(1, verify=False)
 
     @property
@@ -862,6 +862,8 @@ class Inkling2RtxRuntime:
                 call[1][0].copy_(call[1][1])
             elif fn == "zero":
                 call[1].zero_()
+            elif fn == "call":                      # device work issued by a Python function (graph-capturable)
+                call[1]()
             elif fn == "all":                       # a prompt chunk: every row accepted
                 self.accepted.fill_(call[1] - 1)
                 self.next_pos.copy_(self.pos)

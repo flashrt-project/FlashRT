@@ -181,7 +181,7 @@ def test_safetensors_header(tmp_path):
 def test_runtime_reads_no_torch_matmul_setting():
     """The products run on the module's cuBLAS handle; the runtime never reads or sets torch.backends."""
     from pathlib import Path
-    for name in ("_inkling2_rtx_runtime.py", "_inkling2_rtx_mtp.py", "inkling2_rtx.py"):
+    for name in ("_inkling2_rtx_runtime.py", "_inkling2_rtx_mtp.py", "_inkling2_rtx_dflash2.py", "inkling2_rtx.py"):
         assert "torch.backends" not in (Path(rtm.__file__).parent / name).read_text()
 
 
@@ -189,3 +189,51 @@ def test_missing_extension_names_the_build_flag(monkeypatch):
     monkeypatch.setattr(rtm, "_ik", None)
     with pytest.raises(RuntimeError, match="FLASHRT_ENABLE_INKLING2"):
         rtm.Inkling2RtxRuntime("/nonexistent")
+
+
+def _dflash2_dir(tmp_path, cfg=None, tensors=None):
+    """A drafter directory: config.json and a safetensors file with the header only (the check reads no data)."""
+    from flash_rt.frontends.torch._inkling2_rtx_dflash2 import DF_CONFIG, DF_GEOMETRY, expected_dflash2_tensors
+    if cfg is None:
+        cfg = dict(DF_GEOMETRY, rms_norm_eps=1e-6, rope_parameters={"rope_theta": 1e4},
+                   dflash_config=dict(DF_CONFIG, mask_token_id=200056, final_logit_softcapping=30.0,
+                                      target_layer_ids=[5, 23, 41, 48]))
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    t = expected_dflash2_tensors(201024) if tensors is None else tensors
+    header = {k: {"dtype": dt, "shape": list(shape), "data_offsets": [0, 0]} for k, (dt, shape) in t.items()}
+    raw = json.dumps(header).encode()
+    (tmp_path / "model.safetensors").write_bytes(len(raw).to_bytes(8, "little") + raw)
+    return cfg
+
+
+def test_dflash2_drafter_is_checked(tmp_path):
+    from flash_rt.frontends.torch._inkling2_rtx_dflash2 import check_dflash2, expected_dflash2_tensors
+    text = {"vocab_size": 201024}
+    cfg = _dflash2_dir(tmp_path)
+    assert check_dflash2(tmp_path, text, 48)["num_hidden_layers"] == 5
+    t = expected_dflash2_tensors(201024)
+    assert t["fc.weight"] == ("BF16", (2304, 9216))
+    assert t["layers.4.attention_conv.kernel_projection.weight"] == ("BF16", (576, 2304))
+    for key, value, match in (("head_dim", 64, "head_dim"), ("sliding_window", 4096, "sliding_window")):
+        _dflash2_dir(tmp_path, dict(cfg, **{key: value}))
+        with pytest.raises(rtm.Inkling2ConfigError, match=match):
+            check_dflash2(tmp_path, text, 48)
+    for key, value in (("target_layer_ids", [5, 23, 41, 47]), ("block_size", 16), ("mask_token_id", 201024)):
+        _dflash2_dir(tmp_path, dict(cfg, dflash_config=dict(cfg["dflash_config"], **{key: value})))
+        with pytest.raises(rtm.Inkling2ConfigError, match=key):
+            check_dflash2(tmp_path, text, 48)
+    _dflash2_dir(tmp_path, dict(cfg, rope_parameters={}))
+    with pytest.raises(rtm.Inkling2ConfigError, match="rope_theta"):
+        check_dflash2(tmp_path, text, 48)
+    _dflash2_dir(tmp_path, {k: v for k, v in cfg.items() if k != "dflash_config"})
+    with pytest.raises(rtm.Inkling2ConfigError, match="dflash_config"):
+        check_dflash2(tmp_path, text, 48)
+    _dflash2_dir(tmp_path, cfg, dict(t, **{"layers.2.self_attn.k_proj.weight": ("BF16", (512, 2304))}))
+    with pytest.raises(rtm.Inkling2ConfigError, match="k_proj"):
+        check_dflash2(tmp_path, text, 48)
+
+
+def test_dflash2_needs_speculative(tmp_path):
+    from flash_rt.frontends.torch.inkling2_rtx import Inkling2TorchFrontendRtx
+    with pytest.raises(ValueError, match="speculative=True"):
+        Inkling2TorchFrontendRtx(str(tmp_path), dflash2=str(tmp_path))
