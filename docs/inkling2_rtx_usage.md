@@ -201,7 +201,8 @@ python -m pytest tests/test_inkling2_rtx_contracts.py
 # SM120 GPU, module built: GEMV rows against one-row launches (bit for bit), MMA gate tiles, the GEMM
 python -m pytest tests/test_inkling2_rtx_kernels.py
 # SM120 GPU + checkpoint
-FLASHRT_INKLING2_DIR=/path/to/Inkling-2-Mini python -m pytest tests/test_inkling2_rtx_pipeline.py
+FLASHRT_INKLING2_DIR=/path/to/Inkling-2-Mini python -m pytest tests/test_inkling2_rtx_pipeline.py \
+    tests/test_inkling2_rtx_experts.py tests/test_inkling2_rtx_row_attention.py
 # SM120 GPU + checkpoint + DFlash 2 drafter (BF16 and fp8=True)
 FLASHRT_INKLING2_DIR=/path/to/Inkling-2-Mini FLASHRT_INKLING2_DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2 \
     python -m pytest tests/test_inkling2_rtx_dflash2.py
@@ -223,7 +224,13 @@ against the flat passes, that a prefill gives the same logits whatever
 PyTorch's matmul settings are and leaves them unchanged, that a checkpoint
 with a tensor of another dtype or shape is refused before loading, speculative
 against plain greedy decoding (both prefill modes, widths 2, 4 and 8), stop
-tokens and lengths, input checks and the chat path. The DFlash 2 file checks,
+tokens and lengths, input checks and the chat path. The experts file checks
+the verification rows' fused expert kernel against the split passes
+(activations, routing and outputs of 2..8 rows bit for bit, an NVFP4 and an
+MXFP8 layer) and that it completes with the whole GPU's output on a green
+context of 16 SMs (most of its blocks waiting for an SM); the row-attention
+file prompt chunks on the per-row attention kernels (`flash_prefill=False`)
+across runs and against exact prefill. The DFlash 2 file checks,
 for BF16 and `fp8=True`, verification rows against decode steps (widths 2, 5,
 8), speculative against plain greedy decoding (adaptive and fixed widths, both
 prefill modes, stop tokens), and the kernels' drafter context against the
@@ -320,10 +327,10 @@ python examples/inkling2_rtx_benchmark.py --checkpoint /path/to/Inkling-2-Mini -
 - Text only, greedy, one sequence per runtime (no sampling, no batching).
 - SM120 only; the kernels are written for this checkpoint's geometry (and the
   DFlash 2 drafter's).
-- Verification runs w13 and w2 in one kernel whose w2 phase waits on counts
-  that other blocks' w13 phases complete: it needs one resident block per SM
-  of the whole GPU (no SM partition such as MPS thread limits or green
-  contexts) and at least 64 SMs.
+- The flat expert passes of verification need a GPU of at least 64 SMs. Their
+  w13 + w2 kernel waits only on w13 chunks that running blocks have claimed,
+  so it also completes under an SM partition (MPS limits, green contexts),
+  more slowly.
 - Fast prefill is equivalent rather than bit-identical (see *Numerics*); use
   `prefill="exact"` (about 0.55 s for 512 tokens) when the continuation must
   match token-by-token decoding.

@@ -1099,6 +1099,7 @@ __device__ __forceinline__ void flat_share(int total, int warp, int& b0, int& b1
 // w13 over the flat (group, gate/up pair) items; the staged rows of all rows in shared memory.
 // Fused (expert_flat_fused): the table in Tx (kept for the w2 phase), block 0 writes the routing (ids_out /
 // weights_out), and every finished chunk's activations are stored and counted into done[group] (fence first).
+// Every fused chunk comes from the counter (a block's first ones in one claim), none is tied to a block index.
 struct W2Homes;
 __device__ void w2_homes_fwd(const ExpertParams& q, const GroupTable& T, W2Homes& H);
 template <bool MX, bool Fused = false>
@@ -1112,6 +1113,10 @@ __device__ void expert_w13_flat_body(const ExpertParams& p, GroupTable* Tx = nul
   GroupTable& T = Fused ? *Tx : Town;
   __shared__ float xamax[kMaxRows];
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31, l = lane & 15;
+  // fused: the block's first chunks (one per warp) claimed before the ranking, which hides the atomic's latency
+  __shared__ int first;
+  int claim = 0;
+  if (Fused && t == 0) claim = atomicAdd(p.work, kFlatWarps * kW13Chunk);
   // the routing: ranked here from the router pass's logits (fused: warp_top8, one row per warp; block 0 writes ids_out
   // / weights_out for w2 and the combination) or the route pass's ids
   static_assert(kMaxRows <= kFlatWarps, "one warp per row ranks");
@@ -1135,6 +1140,7 @@ __device__ void expert_w13_flat_body(const ExpertParams& p, GroupTable* Tx = nul
       }
       if (lane < kTopK) rid[warp * kTopK + lane] = id;
     }
+    if (t == 0) first = claim;
     __syncthreads();
     make_table_warp(rid, rows * kTopK, T);
   } else {
@@ -1172,7 +1178,8 @@ __device__ void expert_w13_flat_body(const ExpertParams& p, GroupTable* Tx = nul
     if (t < rows) av = after_wait(p.xq_amax)[t];
   }
   {
-    const int qf = (blockIdx.x * kFlatWarps + warp) * kW13Chunk;   // the warp's first (static) chunk
+    // the warp's first chunk: static (by block), fused from the block's claim
+    const int qf = Fused ? first + warp * kW13Chunk : (blockIdx.x * kFlatWarps + warp) * kW13Chunk;
     if (qf < T.count * kInter) load(buf, qf);
   }
   using D = Decoded<NB, 16, MX>;
@@ -1229,12 +1236,14 @@ __device__ void expert_w13_flat_body(const ExpertParams& p, GroupTable* Tx = nul
     }
   };
   {
-    // dynamic chunks: the warp's first chunk static (its first load already issued above), then chunks from the
-    // counter (offset past the static ones), each next one claimed a chunk ahead so the atomic's latency hides
+    // dynamic chunks: the warp's first chunk (its first load already issued above), then chunks from the counter
+    // (split pass: offset past the static ones), each next one claimed a chunk ahead so the atomic's latency hides.
+    // Fused: a block reaches its w2 waits only once its warps have finished every chunk they claimed, and no chunk
+    // is left to a block that has not started, so the waits complete with any number of blocks resident at once.
     constexpr int C = kW13Chunk;
     const int NW = gridDim.x * kFlatWarps, gw = blockIdx.x * kFlatWarps + warp;
     const int total = T.count * kInter;
-    int q = gw * C;
+    int q = Fused ? first + warp * C : gw * C;
     if (q < total) {
       int qend = min(total, q + C);
       int pend = lane == 0 ? atomicAdd(p.work, C) : 0;
@@ -1242,7 +1251,7 @@ __device__ void expert_w13_flat_body(const ExpertParams& p, GroupTable* Tx = nul
         int qn = q + 1;
         const bool chunk_end = qn >= qend;
         if (qn >= qend) {
-          qn = NW * C + __shfl_sync(0xffffffffu, pend, 0);
+          qn = (Fused ? 0 : NW * C) + __shfl_sync(0xffffffffu, pend, 0);
           if (qn < total) {
             qend = min(total, qn + C);
             pend = lane == 0 ? atomicAdd(p.work, C) : 0;
@@ -1579,7 +1588,8 @@ __global__ void __launch_bounds__(kFlatThreads, 1) expert_w2_flat_kernel(const _
 
 // w13 and w2 in one pass: the w13 phase (dynamic chunks, each chunk's activations counted per group), then in the
 // same blocks the w2 phase on the same table, each block's groups awaited by their counts (no kernel boundary).
-// Dependents launch once every block is past the w13 phase (all blocks resident: the waits cannot block).
+// The waits only need blocks that are running (see expert_w13_flat_body): under an SM partition (MPS limits, green
+// contexts) or beside other kernels the pass completes, slower. Dependents launch once every block is past w13.
 template <bool MX>
 __global__ void __launch_bounds__(kFlatThreads, 1)
     expert_flat_fused_kernel(const __grid_constant__ ExpertParams p, const __grid_constant__ ExpertParams q) {
@@ -1704,8 +1714,7 @@ void expert_flat_fused(const ExpertParams& p, const ExpertParams& q, cudaStream_
   const size_t s13 = size_t(rows) * (kHidden * 2 + (kHidden / 16) * 4);
   const size_t smem = s13 > kW2StagedBytes ? s13 : kW2StagedBytes;
   const auto kernel = p.mxfp8 ? expert_flat_fused_kernel<true> : expert_flat_fused_kernel<false>;
-  // the w2 phase waits on counts that other blocks' w13 phases complete: one block per SM, all resident at once
-  // (the whole GPU: not under an SM partition such as MPS limits or green contexts)
+  // one block per SM (the grid); its waits do not need the blocks resident at once
   int per_sm = 0;
   check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kFlatThreads, smem), "fused occupancy");
   if (per_sm < 1) throw std::runtime_error("expert_flat_fused: one block per SM does not fit");
