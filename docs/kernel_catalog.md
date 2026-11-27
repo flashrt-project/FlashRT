@@ -322,18 +322,20 @@ precision (BF16 attention, NVFP4 / MXFP8 experts with NVFP4 / MXFP8 inputs);
 nothing builds into `flash_rt_kernels`. Shapes are the checkpoint's (hidden
 2304, 24/8 heads of 128, 128 experts top-8, 48 layer visits); every entry takes
 a dict of device pointers and a stream, and the launchers reject row counts
-outside `1..MAX_ROWS` (per-row programs) or `1..MAX_CHUNK` (prompt chunks). See
-`docs/inkling2_rtx_usage.md`.
+outside `1..MAX_ROWS` (per-row programs), `1..MAX_MMA_ROWS` (tensor-core GEMVs)
+or `1..MAX_CHUNK` (prompt chunks). See `docs/inkling2_rtx_usage.md`.
 
 | Group | Symbols | What it is |
 |---|---|---|
 | Products | `gemv_multi`, `norm_rows`, `gemm` | Several BF16 GEMVs per launch over 1-8 rows (RMSNorm / gate prologues, BF16 or FP32 out, per-row arithmetic independent of the row count); RMSNorm of up to 512 rows; `C = A B^T` for prompt chunks on a cuBLAS handle of the module (BF16 inputs, FP32 accumulation, reduced-precision reductions disallowed, caller's workspace), independent of PyTorch's matmul settings |
-| Layer visit | `visit_boundary`, `post_attention`, `gate_mix` | Depth attention over the block residuals with the previous visit's expert combine, message gates between passes of the looped layers (per-row kernel, MMA tiles above 8 rows), post-attention convolution and residual |
-| Attention | `kv_rows`, `attn_decode`, `attn_flash` | K / V convolutions, L2 clips, V norm and staged KV rows; split-key decode / verification attention with relative bias, sinks and the output gate; tensor-core prompt attention (BF16 Q K, bias from MMA tables, P V in two FP16 parts) |
-| Experts, per row | `expert_w13`, `expert_w2`, `expert_route`, `expert_w13_flat`, `expert_act_quant`, `expert_w2_flat` | Routing (sigmoid + bias top-8), NVFP4 (`fouroversix_mae`) / MXFP8 input quantization, exact FP4 / FP8 block products: fused for one row, flat passes over the distinct experts of up to 8 rows |
+| Tensor-core GEMVs | `gemv_mma`, `gemv_fp8`, `gemv_fp4w` | Several GEMVs per launch over 1-16 rows on `mma.sync` m16n8k16 (FP32 accumulation), a row's result independent of the others: BF16 weights; E4M3 copies with an FP32 scale per row (FP16 MMA; one row may take the RMSNorm prologue); weight-only NVFP4 copies (E2M1, E4M3 scale per 16, FP32 per row) |
+| Layer visit | `visit_boundary`, `post_attention`, `gate_mix`, `msg_gate` | Depth attention over the block residuals with the previous visit's expert combine (verification rows: also the attention inputs' RMSNorm), message gates between passes of the looped layers (per-row kernel, MMA tiles above 8 rows; up to 8 rows the controllers' down projections, mixing and input norms in one cluster kernel with the three kernels' arithmetic), post-attention convolution and residual |
+| Attention | `kv_rows`, `attn_decode`, `attn_flash` | K / V convolutions, L2 clips, V norm and staged KV rows; split-key decode / verification attention with relative bias, sinks and the output gate (up to 8 rows computing the new rows' K / V itself); tensor-core prompt attention (BF16 Q K, bias from MMA tables, P V in two FP16 parts) |
+| Experts, per row | `expert_w13`, `expert_w2`, `expert_route`, `expert_router_route`, `expert_flat_fused`, `expert_w13_flat`, `expert_act_quant`, `expert_w2_flat` | Routing (sigmoid + bias top-8), NVFP4 (`fouroversix_mae`) / MXFP8 input quantization, exact FP4 / FP8 block products: fused for one row; flat passes over the distinct experts of up to 8 rows, with the router GEMV in the routing pass and w13 + w2 in one kernel (per-group counts of finished w13 items instead of a kernel boundary; one resident block per SM) |
 | Experts, prompt chunks | `expert_sort`, `expert_mma_w13`, `expert_mma_w2` | Slots sorted by expert, grouped `mma.sync` `kind::mxf4nvf4` m16n8k64 (NVFP4) / `kind::mxf8f6f4` m16n8k32 (MXFP8) tiles on the checkpoint's codes and scale rows |
 | Head and speculation | `lm_head`, `accept`, `commit` | Final norm + LM head + greedy argmax over up to 8 rows (optional E4M3 weight copy), acceptance of drafts against the targets, commit of the accepted rows' KV / convolution states |
 | DSpark drafter | `mtp_context_mix`, `mtp_context_write`, `mtp_block_embed`, `mtp_norm`, `mtp_qk`, `mtp_attention`, `mtp_silu`, `mtp_rnn_in`, `mtp_gates`, `mtp_pick` | Context rows from the target features, the 8-position block over three layers, the Markov RNN head and the folded vocabulary pick |
+| DFlash 2 drafter | `df_embed`, `df_conv`, `df_conv_add_norm`, `df_qk`, `df_attention`, `df_silu`, `df_ctx_write`, `df_topk`, `df_select` | `incoai/Inkling-2-Mini-DFlash2`: the block of the anchor and 7 mask rows, two-tap grouped convolutions with the residual and norm, q / k head norm + RoPE, attention over a 2047-key window and the block (each KV head's keys read once, a cluster of 4 blocks per head), SwiGLU, context K / V writes, the mask rows' 16 largest logits and largest probability, the candidate selector's greedy path; the products on `gemv_fp8` / `gemv_fp4w` |
 
 ## Re-use decision tree
 
