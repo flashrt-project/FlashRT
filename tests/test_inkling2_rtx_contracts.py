@@ -237,3 +237,74 @@ def test_dflash2_needs_speculative(tmp_path):
     from flash_rt.frontends.torch.inkling2_rtx import Inkling2TorchFrontendRtx
     with pytest.raises(ValueError, match="speculative=True"):
         Inkling2TorchFrontendRtx(str(tmp_path), dflash2=str(tmp_path))
+
+
+class _Positions:
+    """A runtime that only tracks positions: a decode step writes one row, a round of W rows writes W rows and
+    accepts every draft (the farthest a round can move)."""
+
+    def __init__(self, max_seq):
+        import torch
+        self.max_seq, self.reached, self.prefills, self.rounds = max_seq, 0, [], []
+        self.pos = torch.zeros(1, dtype=torch.int32)
+        self.history = torch.zeros(max_seq + 1, dtype=torch.int32)
+
+    def reset(self):
+        self.pos.zero_()
+
+    def prefill(self, ids, exact=False):
+        self.prefills.append(exact)
+        self.pos.fill_(len(ids))
+        return 0
+
+    def run(self, name):
+        rows = int(name[len("df_round"):]) if name.startswith("df_round") else 1
+        if rows > 1:
+            self.rounds.append((rows, int(self.drafter.log_count)))
+        end = int(self.pos) + rows
+        assert end <= self.max_seq, f"{name} writes position {end - 1} of max_seq {self.max_seq}"
+        self.reached = max(self.reached, end)
+        self.pos.fill_(end)
+
+
+class _AdaptiveDrafter:
+    adaptive, width, widths_all = True, 4, (2, 3, 4, 5, 6, 7, 8)
+
+    def __init__(self, rt):
+        import torch
+        self.rt, self.log_count = rt, torch.zeros(1, dtype=torch.int32)
+        rt.drafter = self
+
+    def prefill(self, ids, exact=False):
+        return self.rt.prefill(ids, exact=exact)
+
+    def add_width(self, W):
+        return f"df_round{W}"
+
+    def steps(self, first, max_new_tokens, check_every=4):      # a request: rounds of 8 rows until the tokens
+        self.log_count.fill_(1)
+        done = 1
+        while done < max_new_tokens:
+            self.rt.run(self.add_width(8))
+            done += 8
+        yield [first] * max_new_tokens
+
+
+@pytest.mark.parametrize("mode", ["fast", "exact"])
+def test_adaptive_warmup_stays_inside_max_seq(monkeypatch, mode):
+    """Warmup's round of every width starts from the position after the prompt, in the frontend's prefill mode."""
+    import torch
+    from flash_rt.frontends.torch.inkling2_rtx import Inkling2TorchFrontendRtx
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    fe = object.__new__(Inkling2TorchFrontendRtx)
+    fe.rt = _Positions(2048)
+    fe.drafter = _AdaptiveDrafter(fe.rt)
+    fe.prefill_mode, fe.check_block, fe.check_rounds, fe.speculative = mode, 16, 1, True
+    fe.vocab, fe.eog = 200064, set()
+    fe.warmup(2022)                     # the longest prompt admitted: 2022 + 2 new + (1 + 1) * 8 + 8 = 2048
+    assert {W for W, _ in fe.rt.rounds} == set(_AdaptiveDrafter.widths_all)
+    assert all(log == 1 for _, log in fe.rt.rounds)           # each round's accepted tokens from the log's start
+    assert fe.rt.reached <= 2048
+    assert fe.rt.prefills and all(e == (mode == "exact") for e in fe.rt.prefills)
+    with pytest.raises(ValueError, match="exceeds max_seq"):
+        fe.warmup(2023)

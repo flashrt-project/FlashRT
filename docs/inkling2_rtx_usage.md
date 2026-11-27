@@ -235,7 +235,8 @@ for BF16 and `fp8=True`, verification rows against decode steps (widths 2, 5,
 8), speculative against plain greedy decoding (adaptive and fixed widths, both
 prefill modes, stop tokens), and the kernels' drafter context against the
 PyTorch reference path; the contracts file the drafter's configuration and
-tensors.
+tensors, and that warmup's round of every width stays inside `max_seq` in the
+frontend's prefill mode.
 
 ## RTX 5090 results
 
