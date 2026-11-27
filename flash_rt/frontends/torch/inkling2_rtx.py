@@ -120,20 +120,27 @@ class Inkling2TorchFrontendRtx:
         self._template = None
 
     def warmup(self, prompt_len: int = 512):
-        """Record and capture the programs a prompt of ``prompt_len`` tokens and the decode loop use, so the first
-        request does not pay for graph capture."""
+        """Record and capture the programs a prompt of ``prompt_len`` tokens (in the frontend's prefill mode) and the
+        decode loop use, so the first request does not pay for graph capture."""
         ids = [0] * max(1, int(prompt_len))
-        for _ in self.stream(ids, max_new_tokens=2, stop_ids=()):
-            pass
-        if self.drafter is not None:
-            for _ in self.stream(ids, max_new_tokens=2, stop_ids=(), speculative=False):
-                pass
-        if getattr(self.drafter, "adaptive", False):     # the round of every width the steps may pick
-            self.rt.reset()
-            self.drafter.prefill(ids)
+        if getattr(self.drafter, "adaptive", False):
+            # the round of every width the steps may pick, each from the position after the prompt: a round writes
+            # at most 8 rows past it, inside the margin a request with this prompt reserves
+            self._check_room(len(ids), 2, True)
+            rt = self.rt
+            rt.reset()
+            self.drafter.prefill(ids, exact=self.prefill_mode == "exact")
+            start = rt.pos.clone()
             for W in self.drafter.widths_all:
-                self.rt.run(self.drafter.add_width(W))
+                rt.pos.copy_(start)
+                self.drafter.log_count.fill_(1)
+                rt.run(self.drafter.add_width(W))
             torch.cuda.synchronize()
+        elif self.drafter is not None:
+            for _ in self.stream(ids, max_new_tokens=2, stop_ids=()):
+                pass
+        for _ in self.stream(ids, max_new_tokens=2, stop_ids=(), speculative=False):
+            pass
 
     def _margin(self, speculative: bool) -> int:
         """Positions beyond the requested tokens a request may write: speculative steps run past the last read
@@ -143,6 +150,11 @@ class Inkling2TorchFrontendRtx:
             width = max(self.drafter.widths_all) if getattr(self.drafter, "adaptive", False) else self.drafter.width
             return (self.check_rounds + 1) * width + 8
         return 1
+
+    def _check_room(self, n: int, max_new_tokens: int, speculative: bool):
+        margin = self._margin(speculative)
+        if n + max_new_tokens + margin > self.rt.max_seq:
+            raise ValueError(f"prompt {n} + {max_new_tokens} new tokens (+{margin}) exceeds max_seq {self.rt.max_seq}")
 
     def stream(self, prompt_ids: Sequence[int], max_new_tokens: int = 256, stop_ids: Optional[Sequence[int]] = None,
                speculative: Optional[bool] = None, prefill: Optional[str] = None) -> Iterator[List[int]]:
@@ -162,9 +174,7 @@ class Inkling2TorchFrontendRtx:
         if mode not in PREFILL_MODES:
             raise ValueError(f"prefill must be one of {PREFILL_MODES}")
         n = len(prompt_ids)
-        margin = self._margin(spec)
-        if n + max_new_tokens + margin > self.rt.max_seq:
-            raise ValueError(f"prompt {n} + {max_new_tokens} new tokens (+{margin}) exceeds max_seq {self.rt.max_seq}")
+        self._check_room(n, max_new_tokens, spec)
         stop = self.eog if stop_ids is None else set(stop_ids)
         rt = self.rt
         rt.reset()
