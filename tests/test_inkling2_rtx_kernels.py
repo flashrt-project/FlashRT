@@ -178,3 +178,117 @@ def test_gemm_call_keeps_its_operands_alive():
     out = call[1]["_keep"][2]
     assert out.data_ptr() == call[1]["c"]
     assert torch.allclose(out, (a.float() @ b.float().t()), rtol=1e-3, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------------- tensor-core GEMVs
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def _mma_weights(kind, n, k):
+    """(w, aux, aux2) of a tensor-core GEMV and the weights it represents (FP64)."""
+    from flash_rt.frontends.torch._inkling2_rtx_runtime import e4m3_rows, nvfp4_rows
+    W = (torch.randn(n, k, device="cuda") * 0.02).bfloat16()
+    if kind == "gemv_mma":
+        return (W, 0, 0), W.double()
+    if kind == "gemv_fp8":
+        codes, scale = e4m3_rows(W)
+        return (codes, scale, 0), codes.view(torch.float8_e4m3fn).double() * scale.double()[:, None]
+    codes, gs, rs = nvfp4_rows(W)
+    nib = torch.stack([codes & 15, codes >> 4], -1).view(n, k).long()
+    vals = torch.tensor(_E2M1, device="cuda", dtype=torch.float64)[nib]
+    g = gs.view(torch.float8_e4m3fn).double().repeat_interleave(16, 1)
+    return (codes, rs, gs), vals * g * rs.double()[:, None]
+
+
+def _mma_task(w, x, y, n, k, rows, yf=0):
+    w, aux, aux2 = w
+    t = (P(w), P(x), P(y), n, k, 0, yf, ik.GEMV_PLAIN, P(aux) if torch.is_tensor(aux) else 0, rows, 0)
+    return t + ((P(aux2),) if torch.is_tensor(aux2) else ())
+
+
+@pytest.mark.parametrize("kind", ["gemv_mma", "gemv_fp8", "gemv_fp4w"])
+@pytest.mark.parametrize("yf", [0, 1])
+def test_tensor_core_gemv_rows_are_independent(kind, yf):
+    """Every row of a multi-row launch bit-equal to a one-row launch on that row (verification rows equal decode
+    steps), whatever the row count; FP32 sums close to the represented weights' product."""
+    torch.manual_seed(0)
+    n, k, s = 2304, 4608, torch.cuda.current_stream().cuda_stream
+    w, ref_w = _mma_weights(kind, n, k)
+    fn = getattr(ik, kind)
+    x = torch.randn(ik.MAX_MMA_ROWS, k, device="cuda").bfloat16()
+    yd = torch.float32 if yf else torch.bfloat16
+    outs = {}
+    for R in (ik.MAX_MMA_ROWS, 7, 1):
+        y = torch.empty(R, n, device="cuda", dtype=yd)
+        fn([_mma_task(w, x, y, n, k, R, yf)], [], s)
+        outs[R] = y
+    torch.cuda.synchronize()
+    assert torch.equal(outs[7], outs[ik.MAX_MMA_ROWS][:7]) and torch.equal(outs[1], outs[7][:1])
+    ref = x.double() @ ref_w.t()
+    err = (outs[ik.MAX_MMA_ROWS].double() - ref).norm() / ref.norm()
+    assert err < (3e-3 if yf == 0 else 1e-5)          # BF16 outputs: their rounding; FP32: the sums' order
+
+
+def test_fp8_gemv_norm_prologue_equals_norm_rows():
+    """One row with the norm in the prologue (decode) equals norm_rows then the plain product (verification rows),
+    FP32 input rows at a stride."""
+    from flash_rt.frontends.torch._inkling2_rtx_runtime import e4m3_rows
+    torch.manual_seed(0)
+    n, s = 3072, torch.cuda.current_stream().cuda_stream
+    codes, scale = e4m3_rows((torch.randn(n, D, device="cuda") * 0.02).bfloat16())
+    nw = (torch.rand(D, device="cuda") + 0.5).bfloat16()
+    x = torch.randn(1, 3, D, device="cuda") * 3
+    for g in range(3):
+        xg = P(x) + g * D * 4
+        a = torch.empty(n, device="cuda", dtype=torch.bfloat16)
+        ik.gemv_fp8([(P(codes), xg, P(a), n, D, 1, 0, ik.GEMV_NORM, P(scale), 1, 3 * D, P(nw))], [], s)
+        xn = torch.empty(1, D, device="cuda", dtype=torch.bfloat16)
+        ik.norm_rows([(xg, 1, 3 * D, P(nw), P(xn), 1, D)], s)
+        b = torch.empty(n, device="cuda", dtype=torch.bfloat16)
+        ik.gemv_fp8([(P(codes), P(xn), P(b), n, D, 0, 0, ik.GEMV_PLAIN, P(scale), 1, 0)], [], s)
+        torch.cuda.synchronize()
+        assert torch.equal(a, b), f"query {g}"
+
+
+# ---------------------------------------------------------------------------------- message gates
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("gates", [3, 1])
+def test_msg_gate_equals_the_three_kernels(rows, gates):
+    """The cluster kernel (controllers' down projections, gate_mix, input norms) bit-equal to gemv_multi, gate_mix
+    and norm_rows: the attention side (three gates, FP32 inputs at a row stride of 3 D, normalized rows) and the
+    MLP side (one gate, no norm)."""
+    torch.manual_seed(0)
+    R, s, G = rows, torch.cuda.current_stream().cuda_stream, gates
+    hs = 3 * D if G == 3 else D
+    down = [(torch.randn(64, 2 * D, device="cuda") * 0.02).bfloat16() for _ in range(G)]
+    gin = [torch.randn(R, 2 * D, device="cuda").bfloat16() for _ in range(G)]
+    F = [(torch.randn(D, 64, device="cuda") * 0.05).bfloat16() for _ in range(G)]
+    Gn = [(torch.randn(D, 64, device="cuda") * 0.05).bfloat16() for _ in range(G)]
+    nw = [(torch.rand(D, device="cuda") + 0.5).bfloat16() for _ in range(G)]
+    h, m = torch.randn(R, hs, device="cuda"), torch.randn(R, 4, D, device="cuda")
+    hp = [P(h) + g * D * 4 for g in range(G)]
+    mp = [P(m) + g * D * 4 for g in range(G)]
+    common = dict(rows=R, h_stride=hs, m_stride=4 * D, out_stride=D, forget=[P(f) for f in F],
+                  gain=[P(g) for g in Gn], h=hp, m=mp)
+
+    def bufs():
+        return ([torch.zeros(R, 64, device="cuda", dtype=torch.bfloat16) for _ in range(G)],
+                [torch.zeros(R, D, device="cuda") for _ in range(G)],
+                [torch.zeros(R, D, device="cuda", dtype=torch.bfloat16) for _ in range(G)])
+
+    st_a, mx_a, nr_a = bufs()
+    ik.gemv_multi([(P(down[g]), P(gin[g]), P(st_a[g]), 64, 2 * D, 0, 0, ik.GEMV_PLAIN, 0, R) for g in range(G)],
+                  [], s)
+    ik.gate_mix(dict(common, states=[P(t) for t in st_a], out=[P(t) for t in mx_a]), s)
+    if G == 3:
+        ik.norm_rows([(P(mx_a[g]), 1, 0, P(nw[g]), P(nr_a[g]), R, D) for g in range(G)], s)
+    st_b, mx_b, nr_b = bufs()
+    norm = dict(norm_w=[P(t) for t in nw], norm_out=[P(t) for t in nr_b]) if G == 3 else {}
+    ik.msg_gate(dict(common, gin_stride=2 * D, down=[P(t) for t in down], gin=[P(t) for t in gin],
+                     states=[P(t) for t in st_b], out=[P(t) for t in mx_b], **norm), s)
+    torch.cuda.synchronize()
+    for g in range(G):
+        assert torch.equal(st_a[g], st_b[g]) and torch.equal(mx_a[g], mx_b[g]), f"gate {g}"
+        if G == 3:
+            assert torch.equal(nr_a[g], nr_b[g]), f"norm {g}"
+

@@ -21,7 +21,7 @@ inline void check_cuda(cudaError_t status, const char* operation) {
 // blocks: multi-block kernels share them out; the one-block vector kernels launch kPrefetchBlocks extra blocks
 // that only issue prefetches (while the DRAM is otherwise idle) and exit.
 constexpr int kMaxPrefetch = 8;
-constexpr int kPrefetchBlocks = 64;
+constexpr int kPrefetchBlocks = 32;
 struct Prefetch {
   const void* ptr[kMaxPrefetch];
   uint64_t bytes[kMaxPrefetch];
@@ -50,8 +50,19 @@ struct GemvTask {
   int prologue;
   int rows;          // 0 or 1: one row
   int x_stride;      // elements between input rows (0: k)
+  const void* aux2;  // gemv_fp8 with kGemvNorm (one row): the BF16 norm weight (aux holds the row scales);
+                     // gemv_fp4w: the E4M3 scales per 16 weights [n][k / 16]
 };
 void gemv_multi(const GemvTask* tasks, int count, const Prefetch& prefetch, cudaStream_t stream);
+// The same tasks (BF16 inputs, no prologue, k a multiple of 64, up to kMaxMmaRows rows) on tensor cores
+// (inkling2_gemv_mma.cu): FP32 accumulation in another order than gemv_multi; rows independent of each other.
+constexpr int kMaxMmaRows = 16;
+void gemv_mma(const GemvTask* tasks, int count, const Prefetch& prefetch, cudaStream_t stream);
+// E4M3 copies of the weights (w: codes [n][k], aux: FP32 scale per row), BF16 inputs taken as FP16, FP16 tensor cores;
+// one row may take the kGemvNorm prologue (norm weight in aux2)
+void gemv_fp8(const GemvTask* tasks, int count, const Prefetch& prefetch, cudaStream_t stream);
+// weight-only NVFP4 (E2M1 codes [n][k / 2], E4M3 scale per 16 weights in aux2, FP32 row scale in aux), as gemv_fp8
+void gemv_fp4w(const GemvTask* tasks, int count, const Prefetch& prefetch, cudaStream_t stream);
 
 // The kGemvNorm prologue computed once per row: out [rows][k] = bf16(rms_norm(x) * w) in the one-row GEMV's order
 // (a kGemvPlain task on out equals a kGemvNorm task on x). One block per (task, row).
@@ -103,12 +114,19 @@ struct BoundaryParams {
   int nq;
   float* att_in;                    // [max(nq, 1)][kHidden]
   int messages;                     // loop passes 2 and 3
+  int msg_early;                    // the bank written two or more launches back: the messages before the wait
   const float* bank_block;
   const float* bank_state;
   const float* message_query;       // [4][kHidden]
   float* messages_out;              // [4][kHidden]
   uint16_t* gate_in;                // [3][2 kHidden] BF16: concat(rms(h_g), rms(m_g)) for q, k, v
   unsigned long long* timing;       // debug: globaltimer at the phase boundaries (null: off)
+  // verification rows: the attention inputs normalized here as norm_rows does (its thread order on 256 threads),
+  // norm u of att_in query norm_src[u] (query 0 with nq 1) with weight norm_w[u] into norm_out[u] [rows][kHidden]
+  int norm_n;
+  const uint16_t* norm_w[3];
+  uint16_t* norm_out[3];
+  int norm_src[3];
 };
 void visit_boundary(const BoundaryParams& p, cudaStream_t stream);
 
@@ -141,8 +159,20 @@ struct GateMixParams {
   const float* h[3];
   const float* m[3];
   float* out[3];
+  // msg_gate: the controllers' down projections folded in (states then outputs): down [64][2 kHidden] BF16 per gate,
+  // gin the inputs [rows][2 kHidden] BF16 at gin_stride; optionally the mixed rows normalized as norm_rows does
+  // (bf16(rms_norm(out) * norm_w) into norm_out, rows of kHidden)
+  const uint16_t* down[3];
+  const uint16_t* gin[3];
+  uint16_t* states_out[3];          // msg_gate: the down projections' outputs (the states above)
+  int gin_stride;
+  const uint16_t* norm_w[3];
+  uint16_t* norm_out[3];
 };
 void gate_mix(const GateMixParams& p, cudaStream_t stream);
+// The message visits' controllers: down projection, gate_mix and norm_rows in one kernel (clusters of 8 blocks per
+// gate and pair of rows; the three kernels' arithmetic)
+void msg_gate(const GateMixParams& p, cudaStream_t stream);
 
 // ---- attention (inkling2_attention.cu)
 struct AttnDecodeParams {
@@ -175,6 +205,9 @@ struct AttnDecodeParams {
   int* counters;                    // [8][rows], zero between launches
   float* q_pre;                     // verification: the prepared queries and relative queries per row and KV head
                                     // ([rows][8][3 * 128 + 3 * 16], written by kv_rows, read by the split blocks)
+  int pf_late;                      // the prefetch issued after the block's split (1) instead of at the start (0)
+  int fuse_kv;                      // verification (rows <= kMaxRows) without kv_rows: each block computes the new
+                                    // rows' K / V it attends to (kv_rows' arithmetic); row r's own block writes them
   int max_splits;
   uint16_t* out;                    // [rows][24 * 128] BF16
   const uint16_t* gate;             // optional [rows][24 * 128]: out = bf16(bf16(attention) * sigmoid(gate)), the
@@ -224,8 +257,27 @@ struct ExpertParams {
   int* offset;
   int* tile_off;
   int max_tiles;                    // grid of the MMA passes: at most rows * 8 / expert_mma_tile_slots() + 128
+  // fused decode w13 (w2_l2 set): the w2 weights of the block's expert (the rows its w2 block reads) into L2 once
+  // the block's first warp is done
+  const void* w2_codes;
+  const void* w2_scales;
+  int w2_l2;
+  // flat passes: work counters zeroed by the route pass (work_reset, 1 + 2 x 64 ints): w13 its dynamic chunks' counter
+  // (work), w2 per-group counters (work + 1; null: static shares), the fused pass's per-group finished w13 items
+  // (w2 params: done = work_reset + 65)
+  int* work;
+  int* work_reset;
+  int* done;
+  const uint16_t* router_w;         // expert_router_route: router [128][2304] BF16
+  float* logits_out;                // expert_router_route: the router logits [rows][128] (FP32)
 };
 void expert_w13(const ExpertParams& p, cudaStream_t stream);
+// w13 (p) and w2 (q) flat passes in one kernel: per-group readiness counters (q.done) instead of the kernel boundary
+void expert_flat_fused(const ExpertParams& p, const ExpertParams& q, cudaStream_t stream);
+// The router GEMV of the flat passes: grid (9, rows); blocks 0-7 of a row write 16 router logits each (one per warp,
+// the GEMV's norm-prologue arithmetic), block 8 stages the row's w13 input (expert_route's norm and quantization).
+// The flat passes rank the logits themselves (logits, bias, ids_out, weights_out set on w13).
+void expert_router_route(const ExpertParams& p, cudaStream_t stream);
 void expert_w2(const ExpertParams& p, cudaStream_t stream);
 // The same experts as passes over all rows of a step: routing + input quantization once per row, w13 over the flat
 // (group, pair) items, the activations quantized once per slot, w2 over the flat (group, rows) items.
@@ -248,7 +300,8 @@ struct LmHeadParams {
   const float* in;                  // final depth-attention output (FP32)
   const uint16_t* norm_w;           // final norm
   const uint16_t* weight;           // [vocab rows][kHidden]
-  const uint8_t* weight_fp8;        // or E4M3 codes [vocab rows][kHidden] with weight_scale [vocab rows] (drafter)
+  const uint8_t* weight_fp8;        // or E4M3 codes [vocab rows][kHidden] with weight_scale [vocab rows] (the DSpark
+                                    // drafter's head; the target's with fp8)
   const float* weight_scale;
   int vocab;                        // unpadded vocabulary
   float softcap;                    // 0: none

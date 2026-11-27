@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 Mini on RTX SM120: one sequence, greedy, plain decode and DSpark speculative decoding interleaved.
 
+``--fp8``: the runtime's E4M3 copies of the attention / output projections and the LM head (both modes).
+
 Single-prompt runs (``--reps`` each, median): prefill (prompt -> first token; with DSpark it also writes the
 drafter context) and decode tokens/s = (new tokens - 1) / (time from the first token to the last), without stop
 tokens; DSpark's tokens are checked against plain greedy decoding. Prompts:
@@ -127,6 +129,7 @@ def main():
     ap.add_argument("--cooldown", type=float, default=30.0, help="seconds before each timed request")
     ap.add_argument("--warm", type=float, default=0.2, help="seconds of decode steps before each timed request")
     ap.add_argument("--width", type=int, default=4, help="DSpark verified rows per step")
+    ap.add_argument("--fp8", action="store_true", help="E4M3 attention / output projections and LM head")
     ap.add_argument("--prefill", choices=("fast", "exact"), default="fast")
     ap.add_argument("--max-seq", type=int, default=4096)
     ap.add_argument("--out", help="write the runs and the summary to this JSON file")
@@ -135,7 +138,7 @@ def main():
     from flash_rt.frontends.torch.inkling2_rtx import Inkling2TorchFrontendRtx
     t0 = time.perf_counter()
     fe = Inkling2TorchFrontendRtx(args.checkpoint, max_seq=args.max_seq, speculative=True, draft_width=args.width,
-                                  prefill=args.prefill)
+                                  prefill=args.prefill, fp8=args.fp8)
     rt, dr, sync = fe.rt, fe.drafter, torch.cuda.synchronize
     if args.suite:
         prompts = [fe.tokenizer.encode(fe.apply_chat_template([{"role": "user", "content": q}],

@@ -69,6 +69,33 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
   m.attr("GEMV_PLAIN") = int(ik::kGemvPlain);
   m.attr("GEMV_NORM") = int(ik::kGemvNorm);
   m.attr("GEMV_GATE") = int(ik::kGemvGate);
+  // tensor-core GEMVs, tasks: (w, x, y, n, k, x_f32, y_f32, prologue, aux[, rows[, x_stride[, aux2]]])
+  using GemvFn = void (*)(const ik::GemvTask*, int, const ik::Prefetch&, cudaStream_t);
+  auto def_mma_gemv = [&m](const char* name, GemvFn fn) {
+    m.def(name,
+          [name, fn](const std::vector<py::tuple>& tasks,
+                     const std::vector<std::tuple<uintptr_t, uint64_t>>& prefetch, uintptr_t stream) {
+            if (tasks.empty() || tasks.size() > ik::kMaxGemvTasks)
+              throw std::invalid_argument(std::string(name) + ": 1 to MAX_GEMV_TASKS tasks");
+            ik::GemvTask t[ik::kMaxGemvTasks] = {};
+            for (size_t i = 0; i < tasks.size(); ++i) {
+              const py::tuple& a = tasks[i];
+              if (a.size() < 9 || a.size() > 12)
+                throw std::invalid_argument(std::string(name) + ": task of 9 to 12 fields");
+              t[i] = {ptr<const void>(a[0].cast<uintptr_t>()), ptr<const void>(a[1].cast<uintptr_t>()),
+                      ptr<void>(a[2].cast<uintptr_t>()), ptr<const void>(a[8].cast<uintptr_t>()), a[3].cast<int>(),
+                      a[4].cast<int>(), a[5].cast<int>(), a[6].cast<int>(), a[7].cast<int>(),
+                      a.size() >= 10 ? a[9].cast<int>() : 1, a.size() >= 11 ? a[10].cast<int>() : 0,
+                      a.size() == 12 ? ptr<const void>(a[11].cast<uintptr_t>()) : nullptr};
+            }
+            fn(t, int(tasks.size()), to_prefetch(prefetch), to_stream(stream));
+          },
+          py::arg("tasks"), py::arg("prefetch"), py::arg("stream"));
+  };
+  def_mma_gemv("gemv_mma", ik::gemv_mma);
+  def_mma_gemv("gemv_fp8", ik::gemv_fp8);
+  def_mma_gemv("gemv_fp4w", ik::gemv_fp4w);
+  m.attr("MAX_MMA_ROWS") = ik::kMaxMmaRows;
   // tasks: (w, x, y, n, k, x_f32, y_f32, prologue, aux[, rows]); prefetch: (ptr, bytes)
   m.def("gemv_multi",
         [](const std::vector<py::tuple>& tasks, const std::vector<std::tuple<uintptr_t, uint64_t>>& prefetch,
@@ -131,6 +158,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.nq = dint(d, "nq");
     p.att_in = dptr<float>(d, "att_in");
     p.messages = dint(d, "messages");
+    p.msg_early = dint(d, "msg_early");
     p.bank_block = dptr<const float>(d, "bank_block");
     p.bank_state = dptr<const float>(d, "bank_state");
     p.message_query = dptr<const float>(d, "message_query");
@@ -138,6 +166,16 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.gate_in = dptr<uint16_t>(d, "gate_in");
     p.prefetch = dprefetch(d);
     p.timing = dptr<unsigned long long>(d, "timing");
+    p.norm_n = dlist(d, "norm_w", p.norm_w);
+    if (dlist(d, "norm_out", p.norm_out) != p.norm_n) throw std::invalid_argument("visit_boundary: norm_w / norm_out");
+    if (p.norm_n) {
+      const auto v = d["norm_src"].cast<std::vector<int>>();
+      if (int(v.size()) != p.norm_n) throw std::invalid_argument("visit_boundary: norm_src");
+      for (int i = 0; i < p.norm_n; ++i) {
+        if (v[i] < 0 || v[i] > 2) throw std::invalid_argument("visit_boundary: norm_src in 0..2");
+        p.norm_src[i] = v[i];
+      }
+    }
     ik::visit_boundary(p, to_stream(stream));
   });
   m.def("post_attention", [](const py::dict& d, uintptr_t stream) {
@@ -170,11 +208,30 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
       throw std::invalid_argument("gate_mix: lists of equal length");
     ik::gate_mix(p, to_stream(stream));
   });
+  m.def("msg_gate", [](const py::dict& d, uintptr_t stream) {
+    ik::GateMixParams p = {};
+    p.rows = dint(d, "rows", 1);
+    p.h_stride = dint(d, "h_stride", ik::kHidden);
+    p.m_stride = dint(d, "m_stride", ik::kHidden);
+    p.out_stride = dint(d, "out_stride", ik::kHidden);
+    p.gin_stride = dint(d, "gin_stride", 2 * ik::kHidden);
+    p.count = dlist(d, "forget", p.forget);
+    if (dlist(d, "gain", p.gain) != p.count || dlist(d, "states", p.states) != p.count ||
+        dlist(d, "h", p.h) != p.count || dlist(d, "m", p.m) != p.count || dlist(d, "out", p.out) != p.count ||
+        dlist(d, "down", p.down) != p.count || dlist(d, "gin", p.gin) != p.count)
+      throw std::invalid_argument("msg_gate: lists of equal length");
+    if (d.contains("norm_w") && (dlist(d, "norm_w", p.norm_w) != p.count || dlist(d, "norm_out", p.norm_out) != p.count))
+      throw std::invalid_argument("msg_gate: norm_w / norm_out per gate");
+    dlist(d, "states", p.states_out);              // written here (gate_mix reads them)
+    ik::msg_gate(p, to_stream(stream));
+  });
   auto attn_params = [](const py::dict& d) {
     ik::AttnDecodeParams p = {};
     p.rows = dint(d, "rows", 1);
     p.stage_kv = dptr<uint16_t>(d, "stage_kv");
     p.stage_in = dptr<uint16_t>(d, "stage_in");
+    p.fuse_kv = dint(d, "fuse_kv");
+    p.pf_late = dint(d, "pf_late");
     p.sliding = dint(d, "sliding");
     p.pos = dptr<const int>(d, "pos");
     p.q_lin = dptr<const uint16_t>(d, "q_lin");
@@ -231,8 +288,7 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.norm_w = dptr<const uint16_t>(d, "norm_w");
     p.ids_out = dptr<int>(d, "ids_out");
     p.weights_out = dptr<float>(d, "weights_out");
-    if (p.logits && (!p.bias || !p.x_in || !p.norm_w || !p.ids_out || !p.weights_out))
-      throw std::invalid_argument("expert: folded routing needs bias, x_in, norm_w, ids_out, weights_out");
+    if (p.logits && !p.bias) throw std::invalid_argument("expert: the router logits need the bias");
     p.prefetch = dprefetch(d);
     p.xq = dptr<void>(d, "xq");
     p.xq_scale = dptr<float>(d, "xq_scale");
@@ -243,11 +299,26 @@ PYBIND11_MODULE(flash_rt_inkling2, m) {
     p.offset = dptr<int>(d, "offset");
     p.tile_off = dptr<int>(d, "tile_off");
     p.max_tiles = dint(d, "max_tiles");
+    p.w2_codes = dptr<const void>(d, "w2_codes");
+    p.w2_scales = dptr<const void>(d, "w2_scales");
+    p.w2_l2 = dint(d, "w2_l2");
+    p.work = dptr<int>(d, "work");
+    p.work_reset = dptr<int>(d, "work_reset");
+    p.done = dptr<int>(d, "done");
+    p.router_w = dptr<const uint16_t>(d, "router_w");
+    p.logits_out = dptr<float>(d, "logits_out");
     return p;
   };
   m.def("expert_w13", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13(expert(d), to_stream(stream)); });
   m.def("expert_w2", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w2(expert(d), to_stream(stream)); });
   m.def("expert_route", [expert](const py::dict& d, uintptr_t stream) { ik::expert_route(expert(d), to_stream(stream)); });
+  m.def("expert_router_route", [expert](const py::dict& d, uintptr_t stream) {
+    ik::expert_router_route(expert(d), to_stream(stream));
+  });
+  m.def("expert_flat_fused", [expert](const py::dict& d, uintptr_t stream) {
+    if (!d.contains("w2")) throw std::invalid_argument("expert_flat_fused: the w2 pass's parameters under 'w2'");
+    ik::expert_flat_fused(expert(d), expert(d["w2"].cast<py::dict>()), to_stream(stream));
+  });
   m.def("expert_w13_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w13_flat(expert(d), to_stream(stream)); });
   m.def("expert_act_quant", [expert](const py::dict& d, uintptr_t stream) { ik::expert_act_quant(expert(d), to_stream(stream)); });
   m.def("expert_w2_flat", [expert](const py::dict& d, uintptr_t stream) { ik::expert_w2_flat(expert(d), to_stream(stream)); });

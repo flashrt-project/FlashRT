@@ -11,7 +11,9 @@ FP4 / FP8 tensor-core instructions of SM120) from recorded programs replayed as 
   bit-identical to decoding the prompt token by token (``prefill="exact"``);
 * ``speculative=True``: the checkpoint's DSpark drafter (``mtp.safetensors``) proposes ``draft_width - 1`` tokens
   per step and the target verifies them in one multi-row forward whose rows run the decode step's arithmetic, so
-  the output is exactly the greedy decode output.
+  the output is exactly the greedy decode output;
+* ``fp8=True``: decode steps and verification rows read E4M3 copies of the attention / output projections and the
+  LM head (the output is then this variant's greedy output, not the BF16 checkpoint's).
 
     from flash_rt.frontends.torch.inkling2_rtx import Inkling2TorchFrontendRtx
     fe = Inkling2TorchFrontendRtx("<path-to-Inkling-2-Mini>", max_seq=8192, speculative=True)
@@ -76,7 +78,7 @@ class Inkling2TorchFrontendRtx:
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, speculative: bool = False, draft_width: int = 4,
                  prefill: str = "fast", check_block: int = 16, check_rounds: int = 4, device: int = 0,
-                 chat_template: Optional[str] = None):
+                 chat_template: Optional[str] = None, fp8: bool = False):
         if prefill not in PREFILL_MODES:
             raise ValueError(f"prefill must be one of {PREFILL_MODES}")
         if check_block < 1 or check_rounds < 1:
@@ -89,7 +91,7 @@ class Inkling2TorchFrontendRtx:
             if not mtp.is_file():
                 raise FileNotFoundError(f"{mtp} not found (the DSpark drafter)")
             check_tensors(safetensors_header(mtp), expected_mtp_tensors(text["vocab_size"]), "drafter weights")
-        self.rt = Inkling2RtxRuntime(checkpoint_dir, max_seq=max_seq, device=device)
+        self.rt = Inkling2RtxRuntime(checkpoint_dir, max_seq=max_seq, device=device, fp8=fp8)
         self.cfg = self.rt.c
         self.vocab = self.rt.vocab
         self.prefill_mode = prefill
@@ -204,8 +206,13 @@ class Inkling2TorchFrontendRtx:
         return self.tokenizer.decode(ids, skip_special=skip_special)
 
     def close(self):
-        """Release the CUDA graphs, buffers and weights."""
+        """Release the CUDA graphs, buffers and weights (the runtime and its drafter refer to each other: collected
+        before the cache is emptied)."""
+        import gc
         self.rt.graphs.clear()
+        self.rt.programs.clear()
+        self.rt.drafter = None
         self.drafter = None
         self.rt = None
+        gc.collect()
         torch.cuda.empty_cache()

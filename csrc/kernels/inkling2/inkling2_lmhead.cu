@@ -33,64 +33,103 @@ __device__ __forceinline__ void e4m3x8_to_f32(uint2 q, float (&f)[8]) {
   }
 }
 
-template <bool FP8>
+// RT >= rows: every step runs all RT rows (rows past R repeat row R - 1 and are not stored), so the rows' FMA chains
+// interleave (a break after each row serialized them); each row's chain is the one-row order.
+template <bool FP8, int RT>
 __global__ void __launch_bounds__(kThreads) lm_head_kernel(const __grid_constant__ LmHeadParams p) {
   extern __shared__ __align__(16) uint16_t xb[];            // [rows][kHidden] the normalized rows (BF16 values)
-  __shared__ float scratch[8];
   __shared__ float bv[8][kMaxRows];
   __shared__ int bi[8][kMaxRows];
   __shared__ int last;
   const int R = p.rows < 1 ? 1 : p.rows;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int warps = gridDim.x * 8;
+  const int gw = blockIdx.x * 8 + warp;
+  // the warp's first vocabulary row and the norm weight before the wait (static data)
+  constexpr int kU = kHidden / 8 / 32;
+  uint4 w0[FP8 ? 1 : kU];
+  uint2 q0[FP8 ? kU : 1];
+  if (gw < p.vocab) {
+    if (FP8) {
+      const uint2* w = reinterpret_cast<const uint2*>(p.weight_fp8) + size_t(gw) * (kHidden / 8);
+#pragma unroll
+      for (int u = 0; u < kU; ++u) q0[FP8 ? u : 0] = w[lane + 32 * u];
+    } else {
+      const uint4* w = reinterpret_cast<const uint4*>(p.weight) + size_t(gw) * (kHidden / 8);
+#pragma unroll
+      for (int u = 0; u < kU; ++u) w0[FP8 ? 0 : u] = ldg_stream(w + lane + 32 * u);
+    }
+  }
+  constexpr int kM = kHidden / kThreads;
+  static_assert(kM * kThreads == kHidden, "norm elements per thread");
+  float nw[kM];
+#pragma unroll
+  for (int m = 0; m < kM; ++m) nw[m] = bf16_to_f32(p.norm_w[threadIdx.x + kThreads * m]);
   prefetch_share(p.prefetch);
   pdl_wait();
   pdl_launch();
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  for (int r = 0; r < R; ++r) {
-    const float* in = after_wait(p.in) + size_t(r) * p.in_stride;
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < kHidden; i += kThreads) ss = fmaf(in[i], in[i], ss);
-    ss = warp_sum(ss);
-    if (lane == 0) scratch[warp] = ss;
-    __syncthreads();
-    float tot = 0.0f;
+  // every row's norm in one pass (per row the one-row order: elements t + 256 m, warp sums, the 8 partials in order)
+  {
+    __shared__ float part[8][RT];
+    float xv[RT][kM], ss[RT];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) tot += scratch[i];
-    const float inv = 1.0f / sqrtf(tot / float(kHidden) + 1e-6f);
+    for (int r = 0; r < RT; ++r) {
+      const float* in = after_wait(p.in) + size_t(r < R ? r : R - 1) * p.in_stride;
+      ss[r] = 0.0f;
+#pragma unroll
+      for (int m = 0; m < kM; ++m) xv[r][m] = in[threadIdx.x + kThreads * m];
+    }
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+#pragma unroll
+      for (int m = 0; m < kM; ++m) ss[r] = fmaf(xv[r][m], xv[r][m], ss[r]);
+      ss[r] = warp_sum(ss[r]);
+      if (lane == 0) part[warp][r] = ss[r];
+    }
     __syncthreads();
-    for (int i = threadIdx.x; i < kHidden; i += kThreads) xb[r * kHidden + i] = f32_to_bf16_bits(in[i] * inv * bf16_to_f32(p.norm_w[i]));
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+      if (r >= R) break;
+      float tot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) tot += part[i][r];
+      const float inv = 1.0f / sqrtf(tot / float(kHidden) + 1e-6f);
+#pragma unroll
+      for (int m = 0; m < kM; ++m)
+        xb[r * kHidden + threadIdx.x + kThreads * m] = f32_to_bf16_bits(xv[r][m] * inv * nw[m]);
+    }
   }
   __syncthreads();
   if (p.normed_out && blockIdx.x == 0) {
     uint4* o = reinterpret_cast<uint4*>(after_wait(p.normed_out));
     for (int i = threadIdx.x; i < R * kHidden / 8; i += kThreads) o[i] = reinterpret_cast<const uint4*>(xb)[i];
   }
-  float best[kMaxRows];
-  int bidx[kMaxRows];
+  float best[RT];
+  int bidx[RT];
 #pragma unroll
-  for (int r = 0; r < kMaxRows; ++r) { best[r] = -INFINITY; bidx[r] = 1 << 30; }
-  const int warps = gridDim.x * 8;
-  const int gw = blockIdx.x * 8 + warp;
+  for (int r = 0; r < RT; ++r) { best[r] = -INFINITY; bidx[r] = 1 << 30; }
   float* out = p.logits ? after_wait(p.logits) : nullptr;
   for (int v = gw; v < p.vocab; v += warps) {
     uint4 wv[kHidden / 8 / 32];
     if (FP8) {
-      // the drafter's copy: E4M3 codes with a per-row scale, 8 codes per lane and unit as the BF16 path
+      // the E4M3 copy (the DSpark drafter's head, the target's with fp8): codes with a per-row scale, 8 codes per lane
+      // and unit as the BF16 path
       const uint2* w = reinterpret_cast<const uint2*>(p.weight_fp8) + size_t(v) * (kHidden / 8);
       uint2 q[kHidden / 8 / 32];
 #pragma unroll
-      for (int u = 0; u < kHidden / 8 / 32; ++u) q[u] = *reinterpret_cast<const uint2*>(w + lane + 32 * u);
-      float acc[kMaxRows];
+      for (int u = 0; u < kHidden / 8 / 32; ++u)
+        q[u] = v == gw ? q0[FP8 ? u : 0] : *reinterpret_cast<const uint2*>(w + lane + 32 * u);
+      float acc[RT];
 #pragma unroll
-      for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.0f;
+      for (int r = 0; r < RT; ++r) acc[r] = 0.0f;
 #pragma unroll
       for (int u = 0; u < kHidden / 8 / 32; ++u) {
         float f[8];
         e4m3x8_to_f32(q[u], f);
         const int i = lane + 32 * u;
 #pragma unroll
-        for (int r = 0; r < kMaxRows; ++r) {
-          if (r >= R) break;
-          const uint4 xv = reinterpret_cast<const uint4*>(xb + r * kHidden)[i];
+        for (int r = 0; r < RT; ++r) {
+          const uint4 xv = reinterpret_cast<const uint4*>(xb + (r < R ? r : R - 1) * kHidden)[i];
           const uint32_t xx[4] = {xv.x, xv.y, xv.z, xv.w};
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
@@ -100,10 +139,13 @@ __global__ void __launch_bounds__(kThreads) lm_head_kernel(const __grid_constant
         }
       }
       const float sc = p.weight_scale[v];
+      float sr[RT];
 #pragma unroll
-      for (int r = 0; r < kMaxRows; ++r) {
+      for (int r = 0; r < RT; ++r) sr[r] = warp_sum(acc[r]);
+#pragma unroll
+      for (int r = 0; r < RT; ++r) {
         if (r >= R) break;
-        const float a = warp_sum(acc[r]) * sc;
+        const float a = sr[r] * sc;
         const float c = p.softcap > 0.0f ? tanhf(a / p.softcap) * p.softcap : a;
         if (lane == 0) {
           if (out) out[size_t(r) * p.vocab + v] = c;
@@ -114,33 +156,42 @@ __global__ void __launch_bounds__(kThreads) lm_head_kernel(const __grid_constant
     }
     const uint4* w = reinterpret_cast<const uint4*>(p.weight) + size_t(v) * (kHidden / 8);
 #pragma unroll
-    for (int u = 0; u < kHidden / 8 / 32; ++u) wv[u] = ldg_stream(w + lane + 32 * u);
+    for (int u = 0; u < kHidden / 8 / 32; ++u) wv[u] = v == gw ? w0[FP8 ? 0 : u] : ldg_stream(w + lane + 32 * u);
+    float acc[RT];
 #pragma unroll
-    for (int r = 0; r < kMaxRows; ++r) {
-      if (r >= R) break;
-      float acc = 0.0f;
+    for (int r = 0; r < RT; ++r) acc[r] = 0.0f;
 #pragma unroll
-      for (int u = 0; u < kHidden / 8 / 32; ++u) {
-        const int i = lane + 32 * u;
-        const uint4 xv = reinterpret_cast<const uint4*>(xb + r * kHidden)[i];
-        const uint32_t ww[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+    for (int u = 0; u < kHidden / 8 / 32; ++u) {
+      const int i = lane + 32 * u;
+      const uint32_t ww[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+#pragma unroll
+      for (int r = 0; r < RT; ++r) {
+        const uint4 xv = reinterpret_cast<const uint4*>(xb + (r < R ? r : R - 1) * kHidden)[i];
         const uint32_t xx[4] = {xv.x, xv.y, xv.z, xv.w};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          acc = fmaf(bf16lo(ww[j]), bf16lo(xx[j]), acc);
-          acc = fmaf(bf16hi(ww[j]), bf16hi(xx[j]), acc);
+          acc[r] = fmaf(bf16lo(ww[j]), bf16lo(xx[j]), acc[r]);
+          acc[r] = fmaf(bf16hi(ww[j]), bf16hi(xx[j]), acc[r]);
         }
       }
-      acc = warp_sum(acc);
-      const float c = p.softcap > 0.0f ? tanhf(acc / p.softcap) * p.softcap : acc;
+    }
+#pragma unroll
+    for (int r = 0; r < RT; ++r) acc[r] = warp_sum(acc[r]);
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+      if (r >= R) break;
+      const float c = p.softcap > 0.0f ? tanhf(acc[r] / p.softcap) * p.softcap : acc[r];
       if (lane == 0) {
         if (out) out[size_t(r) * p.vocab + v] = c;
         if (c > best[r] || (c == best[r] && v < bidx[r])) { best[r] = c; bidx[r] = v; }
       }
     }
   }
-  if (lane == 0)
-    for (int r = 0; r < R; ++r) { bv[warp][r] = best[r]; bi[warp][r] = bidx[r]; }
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+      if (r < R) { bv[warp][r] = best[r]; bi[warp][r] = bidx[r]; }
+  }
   __syncthreads();
   float* gv = after_wait(p.block_best);
   int* gi = after_wait(p.block_index);
@@ -184,18 +235,17 @@ void lm_head(const LmHeadParams& p, cudaStream_t stream) {
   const int R = p.rows < 1 ? 1 : p.rows;
   if (p.blocks < 1 || R > kMaxRows) throw std::invalid_argument("lm_head: blocks >= 1, at most 8 rows");
   const size_t smem = size_t(R) * kHidden * 2;
-  if (p.weight_fp8) {
-    if (!p.weight_scale) throw std::invalid_argument("lm_head: FP8 weights need weight_scale");
+  if (p.weight_fp8 && !p.weight_scale) throw std::invalid_argument("lm_head: FP8 weights need weight_scale");
+  auto run = [&](auto kernel) {
     if (smem > 48 * 1024)
-      check_cuda(cudaFuncSetAttribute(lm_head_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
-                 "lm_head smem");
-    launch_pdl(lm_head_kernel<true>, dim3(p.blocks), dim3(kThreads), smem, stream, p);
-    return;
-  }
-  if (smem > 48 * 1024)
-    check_cuda(cudaFuncSetAttribute(lm_head_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)),
-               "lm_head smem");
-  launch_pdl(lm_head_kernel<false>, dim3(p.blocks), dim3(kThreads), smem, stream, p);
+      check_cuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)), "lm_head smem");
+    launch_pdl(kernel, dim3(p.blocks), dim3(kThreads), smem, stream, p);
+  };
+  const bool f8 = p.weight_fp8 != nullptr;
+  if (R == 1) run(f8 ? lm_head_kernel<true, 1> : lm_head_kernel<false, 1>);
+  else if (R == 2) run(f8 ? lm_head_kernel<true, 2> : lm_head_kernel<false, 2>);
+  else if (R <= 4) run(f8 ? lm_head_kernel<true, 4> : lm_head_kernel<false, 4>);
+  else run(f8 ? lm_head_kernel<true, 8> : lm_head_kernel<false, 8>);
 }
 
 }  // namespace inkling2

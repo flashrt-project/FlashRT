@@ -39,35 +39,48 @@ __global__ void accept_kernel(const __grid_constant__ AcceptParams p) {
 
 // grid (visits, ceil(rows / kCommitRows)): table rows of kCommitFields pointers per visit; the blocks of a visit copy
 // kCommitRows ring rows each, the first also shifts the conv states.
+// one conv's channels c = t, t + 256, ..: every load of a thread issued before its stores
+template <int C>
+__device__ __forceinline__ void commit_conv(uint16_t* st, const uint16_t* in, int in_stride, int n) {
+  constexpr int kM = (C + 255) / 256;
+  uint16_t v[kM][3];
+#pragma unroll
+  for (int m = 0; m < kM; ++m) {
+    const int c = threadIdx.x + m * 256;
+    if (c >= C) break;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      const int i = n + j;                         // item index in [state, inputs]
+      v[m][j] = i < 3 ? st[i * C + c] : in[size_t(i - 3) * in_stride + c];
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < kM; ++m) {
+    const int c = threadIdx.x + m * 256;
+    if (c >= C) break;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) st[j * C + c] = v[m][j];
+  }
+}
+
 __global__ void __launch_bounds__(256) commit_kernel(const __grid_constant__ CommitParams p) {
+  // the visit's table (static pointers) and the position (written many launches back) before the wait
+  const uint64_t* rowp = p.table + size_t(blockIdx.x) * kCommitFields;
+  uint64_t row[kCommitFields];
+#pragma unroll
+  for (int f = 0; f < kCommitFields; ++f) row[f] = rowp[f];
+  const int pos = *p.pos;
   pdl_wait();
   pdl_launch();
-  const uint64_t* row = after_wait(p.table) + size_t(blockIdx.x) * kCommitFields;
   const int n = *after_wait(p.accepted) + 1;                     // rows to commit
-  const int pos = *after_wait(p.pos);
   const int j0 = blockIdx.y * kCommitRows, j1 = min(n, j0 + kCommitRows);
   if (j0 >= n) return;
   if (blockIdx.y == 0) {
-  // conv states: last 3 of [state (3 rows), inputs of rows 0 .. n - 1]
-  struct Conv { int field_state, field_in, channels, in_stride, in_offset; };
-  const Conv convs[4] = {{0, 4, kKv, 2 * kKv, 0}, {1, 4, kKv, 2 * kKv, kKv},
-                         {2, 5, kHidden, kHidden, 0}, {3, 6, kHidden, kHidden, 0}};
-#pragma unroll
-  for (int ci = 0; ci < 4; ++ci) {
-    uint16_t* st = reinterpret_cast<uint16_t*>(row[convs[ci].field_state]);
-    const uint16_t* in = reinterpret_cast<const uint16_t*>(row[convs[ci].field_in]) + convs[ci].in_offset;
-    const int C = convs[ci].channels;
-    for (int c = threadIdx.x; c < C; c += 256) {
-      uint16_t v[3];
-#pragma unroll
-      for (int j = 0; j < 3; ++j) {
-        const int i = n + j;                       // item index in [state, inputs]
-        v[j] = i < 3 ? st[i * C + c] : in[size_t(i - 3) * convs[ci].in_stride + c];
-      }
-#pragma unroll
-      for (int j = 0; j < 3; ++j) st[j * C + c] = v[j];
-    }
-  }
+    // conv states: last 3 of [state (3 rows), inputs of rows 0 .. n - 1]
+    commit_conv<kKv>(reinterpret_cast<uint16_t*>(row[0]), reinterpret_cast<const uint16_t*>(row[4]), 2 * kKv, n);
+    commit_conv<kKv>(reinterpret_cast<uint16_t*>(row[1]), reinterpret_cast<const uint16_t*>(row[4]) + kKv, 2 * kKv, n);
+    commit_conv<kHidden>(reinterpret_cast<uint16_t*>(row[2]), reinterpret_cast<const uint16_t*>(row[5]), kHidden, n);
+    commit_conv<kHidden>(reinterpret_cast<uint16_t*>(row[3]), reinterpret_cast<const uint16_t*>(row[6]), kHidden, n);
   }
   // sliding rings: rows j0 .. j1 - 1 of this block, 16-byte pieces
   if (row[10]) {

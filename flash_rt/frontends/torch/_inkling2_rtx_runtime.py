@@ -46,6 +46,7 @@ LOOP = {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64, "is_v
 D, H, HKV, HD, E, I, TOPK = 2304, 24, 8, 128, 128, 1152, 8
 WINDOW, BLOCK_LAYERS, GATE_RANK, REL = 1024, 6, 64, 16
 TARGET_ROWS = 8          # rows of the LM-head / target buffers (verification of at most 8 rows)
+FUSE_KV_ROWS = 4         # staged rows up to this many: the attention kernel writes the new rows' K / V itself
 LM_BLOCKS = 680          # vocabulary blocks of the LM head's argmax
 
 
@@ -226,6 +227,43 @@ def P(t: torch.Tensor) -> int:
     return t.data_ptr()
 
 
+def e4m3_rows(w: torch.Tensor, chunk: int = 16384) -> Tuple[torch.Tensor, torch.Tensor]:
+    """E4M3 codes [rows][cols] (uint8) and FP32 scales [rows] = amax / 448 per row."""
+    codes = torch.empty(w.shape, device=w.device, dtype=U8)
+    scale = torch.empty(w.shape[0], device=w.device, dtype=F32)
+    with torch.no_grad():
+        for s in range(0, w.shape[0], chunk):
+            x = w[s:s + chunk].float()
+            sc = (x.abs().amax(1) / 448.0).clamp_min(1e-30)
+            codes[s:s + chunk] = (x / sc[:, None]).to(torch.float8_e4m3fn).view(U8)
+            scale[s:s + chunk] = sc
+    return codes, scale
+
+
+def nvfp4_rows(w: torch.Tensor, chunk: int = 8192) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NVFP4 copy of w [rows][cols]: E2M1 codes [rows][cols / 2] (element 2 i in the low nibble), E4M3 scales
+    per 16 [rows][cols / 16] (uint8) and FP32 scales per row (amax / (6 * 448))."""
+    rows, cols = w.shape
+    codes = torch.empty(rows, cols // 2, device=w.device, dtype=U8)
+    gs = torch.empty(rows, cols // 16, device=w.device, dtype=U8)
+    rs = torch.empty(rows, device=w.device, dtype=F32)
+    bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=w.device)
+    with torch.no_grad():
+        for s in range(0, rows, chunk):
+            x = w[s:s + chunk].float().view(-1, cols // 16, 16)
+            gmax = x.abs().amax(-1)
+            r = (gmax.amax(-1) / (6.0 * 448.0)).clamp_min(1e-30)
+            g8 = (gmax / 6.0 / r[:, None]).to(torch.float8_e4m3fn)
+            gf = g8.float()
+            y = x / torch.where(gf > 0, gf * r[:, None], torch.ones_like(gf))[..., None]
+            nib = torch.bucketize(y.abs().clamp_max(6.0), bounds).to(U8) | ((y < 0).to(U8) << 3)
+            nib = nib.view(nib.shape[0], cols)
+            codes[s:s + chunk] = nib[:, 0::2] | (nib[:, 1::2] << 4)
+            gs[s:s + chunk] = g8.view(U8)
+            rs[s:s + chunk] = r
+    return codes, gs, rs
+
+
 def nbytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
 
@@ -238,12 +276,15 @@ class Inkling2RtxRuntime:
     ``exact_rows``: rows of the bit-exact prefill chunks and of the largest verification.
     ``mma_experts`` (grouped MMA experts in prompt chunks, else flat passes) applies to programs recorded after it is
     set; ``flash_prefill`` (tensor-core attention in prompt chunks) also sizes buffers and is fixed at construction.
+    ``fp8``: decode steps and verification rows read E4M3 copies (FP32 scale per row) of the attention projections,
+    the output projections and the LM head; prompt chunks keep the BF16 weights. The tokens are then the greedy
+    tokens of this variant (verification rows still equal its decode steps), not of the BF16 checkpoint.
     The runtime makes ``device`` the current CUDA device and launches on its current stream.
     """
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 8192, device: int = 0, prefill_rows: int = 512,
                  chunk_rows: Sequence[int] = (512, 256, 128, 64, 32, 16), exact_rows: int = 8, prefetch: bool = True,
-                 mma_experts: bool = True, flash_prefill: bool = True):
+                 mma_experts: bool = True, flash_prefill: bool = True, fp8: bool = False):
         ik = _require_module()
         if not torch.cuda.is_available():
             raise RuntimeError("Inkling 2 on RTX needs a CUDA device")
@@ -283,6 +324,16 @@ class Inkling2RtxRuntime:
         self.query_f32 = {k: v.float().contiguous() for k, v in w.items() if k.startswith("attn_res.")}
         # tensor-core chunks: the relative projection transposed (the MMA bias tables)
         self.rel_t = {k: v.t().contiguous() for k, v in w.items() if k.endswith("rel_logits_proj.proj")}
+        # fp8: E4M3 copies of the attention projections, the output projections and the LM head
+        self.fp8 = bool(fp8)
+        self.w8 = {}
+        if self.fp8:
+            for k, v in w.items():
+                if k.startswith("layers.") and ".attn." in k and (
+                        k.endswith(("wq_du.weight", "wr_du.weight", "gate_attn.weight", "attn_sink_proj.weight",
+                                    "wk_dv.weight", "wv_dv.weight", "wo_ud.weight", "weight_proj"))):
+                    self.w8[k] = e4m3_rows(v)
+            self.w8["unembed.weight"] = e4m3_rows(w["unembed.weight"])
         self.RC = max(exact_rows, prefill_rows)
         self._buffers()
         self.programs: Dict[str, list] = {}
@@ -365,6 +416,9 @@ class Inkling2RtxRuntime:
         self.xq_rows_raw = z(RC, D, dt=U8); self.xq_rows_sc8 = z(RC, D // 16, dt=U8)
         self.xq_act_raw = z(RC * TOPK, I, dt=U8); self.xq_act_sc8 = z(RC * TOPK, I // 16, dt=U8)
         self.slot_order = z(RC * TOPK, dt=I32); self.slot_offset = z(E + 1, dt=I32); self.tile_off = z(E + 1, dt=I32)
+        # flat passes (zeroed by the routing pass): w13's chunk counter, then per expert group (at most 64) w2's chunk
+        # counters and the fused pass's finished w13 items
+        self.flat_work = z(1 + 2 * TARGET_ROWS * TOPK, dt=I32)
         self.att_final = z(RC, D)
         self.feat_final = z(RC, D, dt=BF16)              # the final normalized rows (drafter feature)
         self.lm_blocks = LM_BLOCKS
@@ -441,13 +495,16 @@ class Inkling2RtxRuntime:
         start = n0 + (min(p, self.passes) - 1) * n1
         return blocks + [self.normed[u] for u in range(start, v) if self.visits[u] % BLOCK_LAYERS == 0]
 
-    def _proj_ranges(self, v):
+    def _proj_ranges(self, v, fp8=False):
         layer = self.visits[v]
         a = f"layers.{layer}.attn."
-        ts = [self.w[a + n + ".weight"] for n in ("wq_du", "wr_du", "gate_attn", "attn_sink_proj", "wk_dv", "wv_dv")]
+        keys = [a + n + ".weight" for n in ("wq_du", "wr_du", "gate_attn", "attn_sink_proj", "wk_dv", "wv_dv")]
         if layer not in self.local:
-            ts += [self.w[a + "k_sconv.weight_proj"], self.w[a + "v_sconv.weight_proj"]]
-        return [(P(t), nbytes(t)) for t in ts]
+            keys += [a + "k_sconv.weight_proj", a + "v_sconv.weight_proj"]
+        if fp8:                 # the E4M3 copies the decode / verification products read (codes first)
+            return ([(P(self.w8[k][0]), nbytes(self.w8[k][0])) for k in keys] +
+                    [(P(self.w8[k][1]), nbytes(self.w8[k][1])) for k in keys])[:8]
+        return [(P(self.w[k]), nbytes(self.w[k])) for k in keys]
 
     def _finish(self, v, verify):
         p = f"layers.{self.visits[v]}."
@@ -507,21 +564,32 @@ class Inkling2RtxRuntime:
             if loop_msg:
                 bd.update(messages=1, bank_block=P(self.normed[n0 + (ps - 2) * n1 + BLOCK_LAYERS]),
                           bank_state=P(self.bank_state[ps - 2]), message_query=P(self.message_query[ci]),
-                          messages_out=P(self.msgs), gate_in=P(gate_in))
+                          messages_out=P(self.msgs), gate_in=P(gate_in), msg_early=int("bank_partial" not in bd))
             if self.prefetch:
-                bd["prefetch"] = self._proj_ranges(v)
+                bd["prefetch"] = self._proj_ranges(v, fp8=self.fp8 and not big)
             calls.append((ik.visit_boundary, bd))
             nq = 0 if layer == 0 else (1 if sliding else 3)
-            if loop_msg:
-                names = ("attn", "k", "v")
-                if big:
-                    calls += [gemm_call(gate_in[g], w[p + f"controllers.{n}.down_weight"], states[g], self.gemm_ws)
-                              for g, n in enumerate(names)]
-                else:
-                    calls.append(("gemv", [(P(w[p + f"controllers.{n}.down_weight"]), P(gate_in[g]), P(states[g]),
-                                            GATE_RANK, 2 * D, 0, 0, ik.GEMV_PLAIN, 0, R)
-                                           for g, n in enumerate(names)], []))
-                hptr = [P(self.att_in)] * 3 if nq == 1 else [P(self.att_in) + g * D * 4 for g in range(3)]
+            norms = [w[p + "attn_norm.weight"]] * 3 if sliding else [w[p + f"{n}_input_norm.weight"] for n in "qkv"]
+            # loop visits up to MAX_ROWS rows: the controllers' down projections, gate_mix and the input norms in one
+            # cluster kernel (the three kernels' arithmetic), the projections plain on its normalized rows
+            mg = loop_msg and not big
+            names = ("attn", "k", "v")
+            hptr = [P(self.att_in)] * 3 if nq == 1 else [P(self.att_in) + g * D * 4 for g in range(3)]
+            if mg:
+                calls.append((ik.msg_gate, dict(rows=R, h_stride=3 * D, m_stride=4 * D, out_stride=D, gin_stride=2 * D,
+                                                down=[P(w[p + f"controllers.{n}.down_weight"]) for n in names],
+                                                gin=[P(gate_in[g]) for g in range(3)],
+                                                forget=[P(w[p + f"controllers.{n}.forget_weight"]) for n in names],
+                                                gain=[P(w[p + f"controllers.{n}.gain_weight"]) for n in names],
+                                                states=[P(states[g]) for g in range(3)], h=hptr,
+                                                m=[P(self.msgs) + g * D * 4 for g in range(3)],
+                                                out=[P(mixed[g]) for g in range(3)],
+                                                norm_w=[P(t) for t in norms],
+                                                norm_out=[P(self.nrm[g]) for g in range(3)])))
+                xin = [(P(self.nrm[g]), 0) for g in range(3)]
+            elif loop_msg:
+                calls += [gemm_call(gate_in[g], w[p + f"controllers.{n}.down_weight"], states[g], self.gemm_ws)
+                          for g, n in enumerate(names)]
                 calls.append((ik.gate_mix, dict(rows=R, h_stride=3 * D, m_stride=4 * D, out_stride=D,
                                                 forget=[P(w[p + f"controllers.{n}.forget_weight"]) for n in names],
                                                 gain=[P(w[p + f"controllers.{n}.gain_weight"]) for n in names],
@@ -534,7 +602,6 @@ class Inkling2RtxRuntime:
             else:
                 # attention inputs: att_in rows [R][3][D] (row stride 3 D), query 0 or the q / k / v queries
                 xin = [(P(self.att_in) + (g * D * 4 if nq == 3 else 0), 1) for g in range(3)]
-            norms = [w[p + "attn_norm.weight"]] * 3 if sliding else [w[p + f"{n}_input_norm.weight"] for n in "qkv"]
             groups = ([("wq_du", self.q_lin, H * HD), ("wr_du", self.r_lin, H * REL),
                        ("gate_attn", self.g_lin, H * HD), ("attn_sink_proj", self.s_lin, H)],
                       [("wk_dv", self.k_lin, HKV * HD)] +
@@ -543,7 +610,8 @@ class Inkling2RtxRuntime:
                       ([] if sliding else [("v_sconv.weight_proj", self.v_dyn, 32)]))
             xs = 3 * D if (layer > 0 and not loop_msg) else 0
             src = [0, 1, 2]
-            if R > 1:
+            f8 = self.fp8 and not big
+            if R > 1 and not mg:
                 # the norm once per (input, weight) and row, the projections plain on the normalized rows
                 uniq, src = [], []
                 for g in range(3):
@@ -551,21 +619,38 @@ class Inkling2RtxRuntime:
                     if key not in uniq:
                         uniq.append(key)
                     src.append(uniq.index(key))
-                calls.append(("norm", [(xin[g][0], xin[g][1], xs, P(norms[g]), P(self.nrm[src[g]]), R, D)
-                                       for g in [src.index(u) for u in range(len(uniq))]]))
+                firsts = [src.index(u) for u in range(len(uniq))]
+                if not loop_msg and layer > 0:
+                    # the boundary block of each row normalizes its attention inputs (norm_rows' arithmetic)
+                    bd.update(norm_w=[P(norms[g]) for g in firsts], norm_out=[P(self.nrm[u]) for u in range(len(uniq))],
+                              norm_src=list(firsts))
+                else:
+                    calls.append(("norm", [(xin[g][0], xin[g][1], xs, P(norms[g]), P(self.nrm[src[g]]), R, D)
+                                           for g in firsts]))
                 xin = [(P(self.nrm[src[g]]), 0) for g in range(3)]
-            tasks = []
+            plain = R > 1 or mg             # on normalized rows; else one row with the norm in the GEMV prologue
+            tasks, tasks8 = [], []
             for g, items in enumerate(groups):
                 for name, y, n in items:
-                    wt = w[a + name] if name.endswith("weight_proj") else w[a + name + ".weight"]
+                    key = a + name if name.endswith("weight_proj") else a + name + ".weight"
+                    wt = w[key]
                     if big:
                         calls.append(gemm_call(self.nrm[src[g]][:R], wt, y[:R], self.gemm_ws))
-                    elif R > 1:
+                    elif f8:
+                        c8, s8 = self.w8[key]
+                        if plain:
+                            tasks8.append((P(c8), xin[g][0], P(y), n, D, 0, 0, ik.GEMV_PLAIN, P(s8), R, 0))
+                        else:
+                            tasks8.append((P(c8), xin[g][0], P(y), n, D, xin[g][1], 0, ik.GEMV_NORM, P(s8), 1, xs,
+                                           P(norms[g])))
+                    elif plain:
                         tasks.append((P(wt), xin[g][0], P(y), n, D, 0, 0, ik.GEMV_PLAIN, 0, R, 0))
                     else:
                         tasks.append((P(wt), xin[g][0], P(y), n, D, xin[g][1], 0, ik.GEMV_NORM, P(norms[g]), R, xs))
             if tasks:
                 calls.append(("gemv", tasks, []))
+            if tasks8:
+                calls.append(("gemv_fp8", tasks8, []))
             kc, vc = self.kv[v]
             kcs, vcs, acs, mcs = self.conv[v]
             att = dict(rows=R, sliding=int(sliding), pos=P(self.pos), q_lin=P(self.q_lin), r_lin=P(self.r_lin),
@@ -582,18 +667,27 @@ class Inkling2RtxRuntime:
             else:
                 att.update(k_conv_w=P(w[a + "k_sconv.static_w"]), v_conv_w=P(w[a + "v_sconv.static_w"]),
                            k_dyn=P(self.k_dyn), v_dyn=P(self.v_dyn))
-            if staged:
+            if staged and R <= FUSE_KV_ROWS:  # the attention blocks compute the new rows' K / V and queries themselves
+                att.update(stage_in=P(self.st_kvin[v]), stage_kv=P(self.st_kv[v]), fuse_kv=1)
+            elif staged:
                 att.update(stage_in=P(self.st_kvin[v]), stage_kv=P(self.st_kv[v]), q_pre=P(self.q_pre))
                 calls.append((ik.kv_rows, dict(att)))
             if self.prefetch:
                 wo = w[a + "wo_ud.weight"]
-                att["prefetch"] = [(P(wo), nbytes(wo))]
+                att["prefetch"] = ([(P(t), nbytes(t)) for t in self.w8[a + "wo_ud.weight"]] if self.fp8 and not big
+                                   else [(P(wo), nbytes(wo))])
             if big and self.flash_prefill:
                 calls.append((ik.attn_flash, dict(att, rel_t=P(self.rel_t[a + "rel_logits_proj.proj"]))))
             else:
+                if R > 1:       # verification rows: the output-projection prefetch after the split's keys
+                    att["pf_late"] = 1
                 calls.append((ik.attn_decode, att))
             if big:
                 calls.append(gemm_call(self.attn_out[:R], w[a + "wo_ud.weight"], self.o_out[:R], self.gemm_ws))
+            elif self.fp8:
+                c8, s8 = self.w8[a + "wo_ud.weight"]
+                calls.append(("gemv_fp8", [(P(c8), P(self.attn_out), P(self.o_out), D, H * HD, 0, 0, ik.GEMV_PLAIN,
+                                            P(s8), R)], []))
             else:
                 calls.append(("gemv", [(P(w[a + "wo_ud.weight"]), P(self.attn_out), P(self.o_out), D, H * HD, 0, 0,
                                         ik.GEMV_PLAIN, 0, R)], []))
@@ -607,19 +701,28 @@ class Inkling2RtxRuntime:
                 post["stage"] = P(self.st_attn[v])
             if loop_msg:
                 post.update(message=P(self.msgs) + 3 * D * 4, gate_in=P(self.gate_in_mlp))
+            # rows up to MAX_ROWS: the router GEMV folded into the routing pass (which loads the router weights itself)
+            rfuse = 1 < R and not big
             if self.prefetch:
-                post["prefetch"] = [(P(t), nbytes(t)) for t in [w[p + "mlp.gate.weight"]] + (
+                post["prefetch"] = [(P(t), nbytes(t)) for t in ([] if rfuse else [w[p + "mlp.gate.weight"]]) + (
                     [w[p + "controllers.mlp.down_weight"], w[p + "controllers.mlp.forget_weight"],
                      w[p + "controllers.mlp.gain_weight"]] if loop_msg else [])]
+                if not post["prefetch"]:
+                    del post["prefetch"]
             calls.append((ik.post_attention, post))
             router_in = self.mlp_in
-            if loop_msg:
-                if big:
-                    calls.append(gemm_call(self.gate_in_mlp[:R], w[p + "controllers.mlp.down_weight"],
-                                           self.states_mlp[:R], self.gemm_ws))
-                else:
-                    calls.append(("gemv", [(P(w[p + "controllers.mlp.down_weight"]), P(self.gate_in_mlp),
-                                            P(self.states_mlp), GATE_RANK, 2 * D, 0, 0, ik.GEMV_PLAIN, 0, R)], []))
+            if loop_msg and not big:    # the controllers' down projection and gate_mix in one cluster kernel
+                calls.append((ik.msg_gate, dict(rows=R, h_stride=D, m_stride=4 * D, out_stride=D, gin_stride=2 * D,
+                                                down=[P(w[p + "controllers.mlp.down_weight"])],
+                                                gin=[P(self.gate_in_mlp)],
+                                                forget=[P(w[p + "controllers.mlp.forget_weight"])],
+                                                gain=[P(w[p + "controllers.mlp.gain_weight"])],
+                                                states=[P(self.states_mlp)], h=[P(self.mlp_in)],
+                                                m=[P(self.msgs) + 3 * D * 4], out=[P(self.mixed_mlp)])))
+                router_in = self.mixed_mlp
+            elif loop_msg:
+                calls.append(gemm_call(self.gate_in_mlp[:R], w[p + "controllers.mlp.down_weight"],
+                                       self.states_mlp[:R], self.gemm_ws))
                 calls.append((ik.gate_mix, dict(rows=R, h_stride=D, m_stride=4 * D, out_stride=D,
                                                 forget=[P(w[p + "controllers.mlp.forget_weight"])],
                                                 gain=[P(w[p + "controllers.mlp.gain_weight"])],
@@ -627,18 +730,14 @@ class Inkling2RtxRuntime:
                                                 m=[P(self.msgs) + 3 * D * 4], out=[P(self.mixed_mlp)])))
                 router_in = self.mixed_mlp
             m = p + "mlp."
-            if R > 1:
+            if big:
                 calls.append(("norm", [(P(router_in), 1, 0, P(w[p + "mlp_norm.weight"]), P(self.nrm_mlp), R, D)]))
-                if big:
-                    # router logits: BF16 products summed and written in FP32
-                    calls.append(gemm_call(self.nrm_mlp[:R], w[m + "gate.weight"], self.logits_r[:R], self.gemm_ws))
-                else:
-                    calls.append(("gemv", [(P(w[m + "gate.weight"]), P(self.nrm_mlp), P(self.logits_r), E, D, 0, 1,
-                                            ik.GEMV_PLAIN, 0, R)], []))
-            else:
+                # router logits: BF16 products summed and written in FP32
+                calls.append(gemm_call(self.nrm_mlp[:R], w[m + "gate.weight"], self.logits_r[:R], self.gemm_ws))
+            elif not rfuse:
                 calls.append(("gemv", [(P(w[m + "gate.weight"]), P(router_in), P(self.logits_r), E, D, 1, 1,
                                         ik.GEMV_NORM, P(w[p + "mlp_norm.weight"]), R)], []))
-            calls += self._experts(p, R, mx, router_in, big)
+            calls += self._experts(p, R, mx, router_in, big, router_w=P(w[m + "gate.weight"]) if rfuse else 0)
         last = nv - 1
         fin = dict(self._finish(last, staged), rows=R, next_hidden=P(self.hid[last]), normed_res=P(self.att_final),
                    blocks=[P(b) for b in self._blocks_before(last)],
@@ -647,6 +746,8 @@ class Inkling2RtxRuntime:
         head = dict(norm_w=P(w["norm.weight"]), weight=P(w["unembed.weight"]), vocab=self.vocab, softcap=softcap,
                     blocks=self.lm_blocks, logits=P(self.logits), block_best=P(self.lm_best),
                     block_index=P(self.lm_index), counter=P(self.lm_counter), in_stride=3 * D)
+        if self.fp8 and not big:
+            head.update(weight_fp8=P(self.w8["unembed.weight"][0]), weight_scale=P(self.w8["unembed.weight"][1]))
         if prefill is not None:
             # the final-norm rows (the LM head's normalization, the drafter's last feature), all rows committed
             calls.append(("norm", [(P(self.att_in), 1, 3 * D, P(w["norm.weight"]), P(self.feat_final), R, D)]))
@@ -671,9 +772,10 @@ class Inkling2RtxRuntime:
             calls.append(("advance", None))
         return calls
 
-    def _experts(self, p, R, mx, router_in, big):
+    def _experts(self, p, R, mx, router_in, big, router_w=0):
         """Routing and the routed experts of one visit: fused per-row kernels (one row), flat passes over slices of
-        at most MAX_ROWS rows, or grouped block-scaled MMAs over the slots sorted by expert (tensor-core chunks)."""
+        at most MAX_ROWS rows, or grouped block-scaled MMAs over the slots sorted by expert (tensor-core chunks).
+        ``router_w`` (rows up to MAX_ROWS): the router GEMV runs in the routing pass and w13 + w2 in one kernel."""
         ik, w, c = _ik, self.w, self.c
         m, ex = p + "mlp.", p + "mlp.experts."
         caps = dict(gate_cap=float(c["mlp_gate_softcap"]), up_cap=float(c["mlp_up_softcap"]))
@@ -688,11 +790,14 @@ class Inkling2RtxRuntime:
                     w[ex + f"{which}_weight_outer_scale_denominator"].float().reshape(-1)[0]))
         calls = []
         if R == 1:
-            calls.append((ik.expert_w13, dict(wq["w13"], rows=R, ids=P(self.ids), act=P(self.act),
+            # w13 pulls its expert's w2 rows into L2 once its rows are done; w2 redoes the routing from the logits so
+            # that its first weight loads start under the w13 pass (w13 writes ids / route_w)
+            calls.append((ik.expert_w13, dict(wq["w13"], w2_l2=1, w2_codes=wq["w2"]["codes"],
+                                              w2_scales=wq["w2"]["scales"], rows=R, ids=P(self.ids), act=P(self.act),
                                               out=P(self.expert_out), logits=P(self.logits_r), x_in=P(router_in),
                                               ids_out=P(self.ids), weights_out=P(self.route_w), **caps, **route)))
             calls.append((ik.expert_w2, dict(wq["w2"], rows=R, ids=P(self.ids), act=P(self.act),
-                                             out=P(self.expert_out), **caps)))
+                                             out=P(self.expert_out), **caps, **route, logits=P(self.logits_r))))
             return calls
         if big and self.mma_experts:
             srt = dict(rows=R, ids=P(self.ids), order=P(self.slot_order), offset=P(self.slot_offset),
@@ -709,22 +814,29 @@ class Inkling2RtxRuntime:
             calls.append((ik.expert_act_quant, dict(rows=R, mxfp8=int(mx), act=P(self.act), **act_q)))
             calls.append((ik.expert_mma_w2, dict(wq["w2"], **srt, out=P(self.expert_out), **act_q)))
             return calls
-        # flat passes over slices of at most MAX_ROWS rows (pointers offset by the slice's rows)
+        # flat passes over slices of at most MAX_ROWS rows (pointers offset by the slice's rows): w13 in dynamic chunks,
+        # w2 quantizing its slots' activations itself, in per-group dynamic chunks (counters in flat_work)
+        work = P(self.flat_work)
         for s0 in range(0, R, ik.MAX_ROWS):
             r = min(ik.MAX_ROWS, R - s0)
             o_ids, o_slot = s0 * TOPK * 4, s0 * TOPK
             rows_q = dict(xq=P(self.xq_rows) + s0 * D * 2, xq_scale=P(self.xq_rows_s) + s0 * (D // 16) * 4,
                           xq_amax=P(self.xq_rows_a) + s0 * 4)
-            act_q = dict(xq=P(self.xq_act) + o_slot * I * 2, xq_scale=P(self.xq_act_s) + o_slot * (I // 16) * 4,
-                         xq_amax=P(self.xq_act_a) + o_slot * 4)
             ids, act = P(self.ids) + o_ids, P(self.act) + o_slot * I * 2
-            calls.append((ik.expert_route, dict(route, rows=r, mxfp8=int(mx), logits=P(self.logits_r) + s0 * E * 4,
-                                                x_in=P(router_in) + s0 * D * 4, ids_out=ids,
-                                                weights_out=P(self.route_w) + o_ids, **rows_q)))
-            calls.append((ik.expert_w13_flat, dict(wq["w13"], rows=r, ids=ids, act=act, **caps, **rows_q)))
-            calls.append((ik.expert_act_quant, dict(rows=r, mxfp8=int(mx), act=act, **act_q)))
-            calls.append((ik.expert_w2_flat, dict(wq["w2"], rows=r, ids=ids, out=P(self.expert_out) + o_slot * D * 2,
-                                                  **act_q)))
+            rank = dict(route, logits=P(self.logits_r) + s0 * E * 4, x_in=P(router_in) + s0 * D * 4, ids_out=ids,
+                        weights_out=P(self.route_w) + o_ids)
+            w2d = dict(wq["w2"], rows=r, ids=ids, out=P(self.expert_out) + o_slot * D * 2, act=act, work=work + 4)
+            if router_w:            # (one slice): the router pass writes the logits, the flat passes rank them
+                calls.append((ik.expert_router_route, dict(rows=r, mxfp8=int(mx), x_in=rank["x_in"],
+                                                           norm_w=rank["norm_w"], logits_out=rank["logits"],
+                                                           **rows_q, router_w=router_w, work_reset=work)))
+                w13d = dict(wq["w13"], **rank, rows=r, ids=ids, act=act, **caps, **rows_q, work=work)
+                # one kernel: the w2 phase in the same blocks, each block's groups awaited by their w13 counts
+                calls.append((ik.expert_flat_fused, dict(w13d, w2=dict(w2d, done=work + (1 + TARGET_ROWS * TOPK) * 4))))
+                continue
+            calls.append((ik.expert_route, dict(rank, rows=r, mxfp8=int(mx), **rows_q, work_reset=work)))
+            calls.append((ik.expert_w13_flat, dict(wq["w13"], rows=r, ids=ids, act=act, **caps, **rows_q, work=work)))
+            calls.append((ik.expert_w2_flat, w2d))
         return calls
 
     # --------------------------------------------------------------------------------------------- run
@@ -735,6 +847,12 @@ class Inkling2RtxRuntime:
             fn = call[0]
             if fn == "gemv":
                 ik.gemv_multi(call[1], call[2], s)
+            elif fn == "gemv_mma":
+                ik.gemv_mma(call[1], call[2], s)
+            elif fn == "gemv_fp8":
+                ik.gemv_fp8(call[1], call[2], s)
+            elif fn == "gemv_fp4w":
+                ik.gemv_fp4w(call[1], call[2], s)
             elif fn == "norm":
                 ik.norm_rows(call[1], s)
             elif fn == "advance":
