@@ -298,20 +298,25 @@ llama.cpp F16 KV. [Protocol, accuracy and reproduction](docs/flint_usage.md).
 Native SM120 kernels for the text decoder of `thinkingmachines/Inkling-2-Mini`
 at the checkpoint's precision (BF16 attention, NVFP4 / MXFP8 experts with the
 activation quantization the checkpoint declares), with the checkpoint's DSpark
-drafter for speculative decoding. Verification rows run the decode step's
-arithmetic, so DSpark returns exactly the greedy tokens. Batch 1, greedy, 512
-new tokens; contexts up to 128K tokens on the 32 GB card.
+drafter or the DFlash 2 drafter
+([incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2))
+for speculative decoding. Verification rows run the decode step's arithmetic,
+so both return exactly the greedy tokens. Batch 1, greedy, 512 new tokens;
+contexts up to 128K tokens on the 32 GB card.
 [Protocol, numerics and reproduction](docs/inkling2_rtx_usage.md).
 
-| Prompt | Prefill | Decode, tok/s | DSpark, tok/s (tokens / step) |
-|---|---:|---:|---:|
-| 512 tokens | **41.5 ms** | **179.3** | **214.3** (2.11) |
-| 4K tokens | **392 ms** | **172.4** | **230.2** (2.42) |
-| 32K tokens | **4.57 s** | **136.3** | **176.1** (2.88) |
-| 128K tokens | **37.0 s** | **71.9** | **73.2** (2.51) |
+| Prompt | Prefill | Decode, tok/s | DSpark, tok/s (tokens / step) | DFlash 2, tok/s (tokens / step) |
+|---|---:|---:|---:|---:|
+| 512 tokens | **40.1 ms** | **219.6** | **274.3** (2.11) | **381.2** (2.86) |
+| 4K tokens | **382 ms** | **207.9** | **287.0** (2.42) | **345.7** (2.80) |
+| 32K tokens | **4.48 s** | **157.7** | **203.6** (2.88) | **254.9** (3.03) |
+| 128K tokens | **36.8 s** | **78.2** | **78.0** (2.51) | **100.4** (2.38) |
 
-On sixteen short code requests DSpark decodes at 273.2 tok/s (2.62 tokens per
-step), on sixteen general ones at 215.4 (2.05), against 181.3 and 179.5 plain.
+On sixteen short code requests DFlash 2 decodes at 518.5 tok/s (3.96 tokens per
+step) and DSpark at 352.4 (2.62), on sixteen general ones at 397.2 (2.80) and
+278.3 (2.05), against 218.7 and 216.2 plain. The opt-in `fp8=True` (E4M3
+attention / output projections and LM head; its own greedy output) decodes the
+512-token prompt at 266.2 tok/s, 415.8 with DFlash 2.
 
 ### Flint (MLX int4, Apple Silicon)
 
@@ -1051,7 +1056,7 @@ have been built and tested, and the dispatch map that selects them.
 | Hardware | Architecture | Status | Validated paths / notes |
 |---|---:|---|---|
 | Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6 and N1.7, Pi0-FAST, LingBot-VLA, Hy-Embodied-0.5-VLA, Alpamayo 1.5 (full request and FlashDrive streaming), Cosmos3-Edge AV / Reasoner, Qwen3.6, and Qwen3-VL BF16 with opt-in W8/W4 decode; reproduction guides for [π0.5](docs/thor/pi05.md) and [GR00T N1.7](docs/thor/groot-n17.md). |
-| RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). Inkling 2 Mini (NVFP4 / MXFP8) with DSpark speculative decoding; see [Inkling 2 Mini on RTX 5090](docs/inkling2_rtx_usage.md). |
+| RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). Inkling 2 Mini (NVFP4 / MXFP8) with DSpark or DFlash 2 speculative decoding; see [Inkling 2 Mini on RTX 5090](docs/inkling2_rtx_usage.md). |
 | AMD Instinct MI350X | gfx950 (CDNA4) | Supported | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Uses the gfx950 source set, checked at build and runtime. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300X | gfx942 (CDNA3) | Supported | Architecture-specific BF16/FP8 FNUZ kernels and HIP graphs. See [AMD deployment](docs/deployment_amd.md), [π0.5](docs/deployment_amd_pi05.md), and [GR00T N1.7](docs/deployment_amd_groot_n17.md). |
 | Ascend 910B4 | Ascend NPU | Supported | Pi0.5 and GR00T N1.7 backend with native AscendC kernels and NPU graphs. See [π0.5 deployment](docs/deployment_npu.md) and [GR00T N1.7 deployment](docs/deployment_npu_groot_n17.md). |
